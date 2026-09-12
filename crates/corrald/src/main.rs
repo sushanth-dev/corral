@@ -1,1 +1,3 @@
+mod pty;
+
 fn main() {}
