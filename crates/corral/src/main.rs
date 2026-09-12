@@ -47,8 +47,31 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+fn pane_command() -> (String, Vec<String>) {
+    // CORRAL_SHELL wins over SHELL so a non-login-shell choice (fish) can
+    // be set per-machine without changing the login shell.
+    let shell = std::env::var("CORRAL_SHELL")
+        .or_else(|_| std::env::var("SHELL"))
+        .unwrap_or_else(|_| "/bin/sh".into());
+    (shell, vec!["-l".into()])
+}
+
 fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     send_msg(writer, &ClientMsg::Attach)?;
+    // Size the daemon to the real terminal and spawn the first shell; the
+    // daemon starts at 80x24 and never resizes until told.
+    let (cols, rows) = crossterm::terminal::size()?;
+    let (shell, args) = pane_command();
+    let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+    send_msg(writer, &ClientMsg::Resize { cols, rows })?;
+    send_msg(
+        writer,
+        &ClientMsg::CreatePane {
+            cmd: shell,
+            args,
+            cwd,
+        },
+    )?;
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut leader_armed = false;
@@ -91,16 +114,9 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     send_msg(writer, &ClientMsg::Focus { dir })?;
                 }
                 Some(input::Action::Split(_)) => {
-                    let cmd = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+                    let (cmd, args) = pane_command();
                     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
-                    send_msg(
-                        writer,
-                        &ClientMsg::CreatePane {
-                            cmd,
-                            args: vec!["-l".into()],
-                            cwd,
-                        },
-                    )?;
+                    send_msg(writer, &ClientMsg::CreatePane { cmd, args, cwd })?;
                 }
                 Some(input::Action::Send(bytes)) => {
                     send_msg(writer, &ClientMsg::Key { bytes })?;

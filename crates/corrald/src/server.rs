@@ -53,7 +53,18 @@ impl Daemon {
         // line; bytes stay in this buffer until a newline completes them.
         let mut buf = String::new();
         loop {
-            self.drain_and_push(&mut writer)?;
+            // A frame write to a departed client reports BrokenPipe; that
+            // is a clean disconnect, not a daemon error.
+            if let Err(e) = self.drain_and_push(&mut writer) {
+                let broken = e
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe);
+                if broken {
+                    break;
+                }
+                return Err(e);
+            }
             match reader.read_line(&mut buf) {
                 Ok(0) => break,
                 Ok(_) => {}
@@ -93,11 +104,15 @@ impl Daemon {
                 if self.ptys.len() == 1 {
                     self.root = Node::leaf(id);
                 } else {
-                    // Split the focused pane: vertical when it is taller
-                    // than wide, horizontal otherwise (plan geometry rule).
+                    // Split the focused pane in place: vertical when it is
+                    // taller than wide, horizontal otherwise (plan geometry
+                    // rule). The new pane takes the sibling half.
                     let dir = self.split_dir();
-                    let old = std::mem::replace(&mut self.root, Node::leaf(0));
-                    self.root = Node::split(dir, 0.5, Box::new(old), Box::new(Node::leaf(id)));
+                    let focused = Node::leaf(self.focused);
+                    self.root.replace(
+                        self.focused,
+                        Node::split(dir, 0.5, Box::new(focused), Box::new(Node::leaf(id))),
+                    );
                 }
                 self.focused = id;
             }
@@ -647,6 +662,100 @@ mod tests {
         assert!(big_panes.iter().all(|(_, r, _)| r.w > 20));
         drop(reader);
         let _ = handle.join();
+    }
+
+    #[test]
+    fn second_pane_splits_the_focused_pane_not_the_screen() {
+        // Split-in-place: pane 2 must take half of pane 1's rect, leaving
+        // a nested layout, not two half-screen panes.
+        let (_sock, handle) = start_daemon("split");
+        let mut client = UnixStream::connect(&_sock).unwrap();
+        send(&mut client, &ClientMsg::Attach);
+        send(
+            &mut client,
+            &ClientMsg::Resize {
+                cols: 100,
+                rows: 40,
+            },
+        );
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "printf one; cat".into()],
+                cwd: "/tmp".into(),
+            },
+        );
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        wait_for_msg(&mut reader, |m| {
+            matches!(m, ServerMsg::Frame { panes, .. } if panes.iter().any(|(_, _, t)| t.contains("one")))
+        })
+        .expect("first pane");
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "printf two; cat".into()],
+                cwd: "/tmp".into(),
+            },
+        );
+        let frame = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => {
+                panes.len() == 2 && panes.iter().any(|(_, _, t)| t.contains("two"))
+            }
+            _ => false,
+        })
+        .expect("split frame");
+        let ServerMsg::Frame { panes, .. } = frame else {
+            unreachable!()
+        };
+        // At 100x40 the first pane is 40 tall (h > w? no: 100 wide, 40 tall
+        // -> taller than wide is false -> Horizontal split, left/right).
+        // Each half must be about 50 wide, not 100: split of the focused
+        // pane, not of the full screen.
+        assert_eq!(panes.len(), 2, "two panes after split");
+        for (_, r, _) in &panes {
+            assert!(
+                r.w <= 51 && r.w >= 49,
+                "pane rect {r:?} should be half of 100 wide, not full width"
+            );
+        }
+        drop(reader);
+        drop(client);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn client_disconnect_is_a_clean_exit_not_a_broken_pipe_error() {
+        // The daemon pushes frames every sweep; when the client vanishes
+        // mid-frame, the write fails with BrokenPipe. serve must return
+        // Ok (thread join without panic proves the clean exit), not Ok(())
+        // wrapped in an error that unwraps into a panic.
+        let (_sock, handle) = start_daemon("brokepipe");
+        let mut client = UnixStream::connect(&_sock).unwrap();
+        send(&mut client, &ClientMsg::Attach);
+        send(&mut client, &ClientMsg::Resize { cols: 80, rows: 24 });
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "while :; do printf x; sleep 1; done".into()],
+                cwd: "/tmp".into(),
+            },
+        );
+        // Give the daemon time to enter its push loop, then vanish.
+        std::thread::sleep(Duration::from_millis(500));
+        drop(client);
+        // join() panics if the thread ended in Err; poll for exit, then
+        // join so a broken-pipe error surfaces as a failed join.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(handle.is_finished(), "daemon never noticed the disconnect");
+        handle
+            .join()
+            .expect("daemon exited cleanly, not with BrokenPipe");
     }
 
     #[test]

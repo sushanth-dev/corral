@@ -8,5 +8,7 @@ fn main() -> anyhow::Result<()> {
     let path = server::socket_path();
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
-    server::Daemon::serve(listener)
+    let result = server::Daemon::serve(listener);
+    let _ = std::fs::remove_file(&path);
+    result
 }
