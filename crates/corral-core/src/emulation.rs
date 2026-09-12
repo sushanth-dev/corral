@@ -1,11 +1,21 @@
 use anyhow::Result;
 use libghostty_vt::render::{CellIterator, RowIterator};
+use libghostty_vt::terminal::{
+    ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
+    PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
+};
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// One pane's terminal state. `Terminal` is !Send: Emulator must be
 /// created and used on a single thread (the daemon core thread in v0.1).
 pub struct Emulator {
     terminal: Terminal<'static, 'static>,
+    /// Reply bytes the emulator wants written back to the pane's PTY
+    /// (terminal query responses such as DA1). The on_pty_write callback
+    /// appends here; the daemon drains via take_pty_writes.
+    pty_writes: Rc<RefCell<Vec<Vec<u8>>>>,
 }
 
 impl Emulator {
@@ -15,8 +25,34 @@ impl Emulator {
             rows,
             max_scrollback: 10_000,
         };
+        let mut terminal = Terminal::new(opts)?;
+        // Programs query the terminal on startup (fish waits up to ten
+        // seconds for a DA1 answer). Claim a VT220 with color so shells
+        // proceed immediately; libghostty composes the reply bytes.
+        terminal.on_device_attributes(move |_term| {
+            Some(DeviceAttributes {
+                primary: PrimaryDeviceAttributes::new(
+                    ConformanceLevel::VT220,
+                    &[DeviceAttributeFeature::ANSI_COLOR],
+                ),
+                secondary: SecondaryDeviceAttributes {
+                    device_type: DeviceType::VT220,
+                    firmware_version: 1,
+                    rom_cartridge: 0,
+                },
+                tertiary: TertiaryDeviceAttributes { unit_id: 0 },
+            })
+        })?;
+        // Every terminal-query response the core generates (DA1, DECRQM,
+        // DSR) flows through this callback; collect it for the daemon.
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&pty_writes);
+        terminal.on_pty_write(move |_term, data| {
+            sink.borrow_mut().push(data.to_vec());
+        })?;
         Ok(Self {
-            terminal: Terminal::new(opts)?,
+            terminal,
+            pty_writes,
         })
     }
 
@@ -25,10 +61,26 @@ impl Emulator {
         self.terminal.vt_write(data);
     }
 
+    /// Take the accumulated query replies; the daemon writes them back
+    /// to the pane's PTY.
+    pub fn take_pty_writes(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut *self.pty_writes.borrow_mut())
+    }
+
     /// Resize the viewport; libghostty reflows the primary screen.
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
         self.terminal.resize(cols, rows, 0, 0)?;
         Ok(())
+    }
+
+    /// Cursor cell position within the viewport, when visible.
+    pub fn cursor(&mut self) -> Result<Option<(u16, u16)>> {
+        let mut render_state = RenderState::new()?;
+        let snapshot = render_state.update(&self.terminal)?;
+        if !snapshot.cursor_visible()? {
+            return Ok(None);
+        }
+        Ok(snapshot.cursor_viewport()?.map(|c| (c.x, c.y)))
     }
 
     /// Current viewport as plain text, one line per row.
@@ -166,5 +218,48 @@ mod tests {
         if emu.resize(0, 0).is_ok() {
             let _ = emu.screen_text().unwrap();
         }
+    }
+
+    #[test]
+    fn da1_query_produces_a_reply_for_the_pty() {
+        // fish waits up to ten seconds for a DA1 answer; without a
+        // registered on_device_attributes callback libghostty drops the
+        // query silently. The reply must land in the pty_writes sink.
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b[c");
+        let replies = emu.take_pty_writes();
+        assert!(!replies.is_empty(), "no DA1 reply captured");
+        let reply = replies.concat();
+        assert!(reply.starts_with(b"\x1b["), "reply {reply:?} is not CSI");
+        assert!(reply.ends_with(b"c"), "reply {reply:?} is not a DA1 form");
+    }
+
+    #[test]
+    fn take_pty_writes_drains_the_sink() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b[c");
+        assert!(!emu.take_pty_writes().is_empty());
+        // A second drain with no new query returns nothing.
+        assert!(emu.take_pty_writes().is_empty());
+    }
+
+    #[test]
+    fn cursor_reports_the_visible_position() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        assert_eq!(
+            emu.cursor().unwrap(),
+            Some((0, 0)),
+            "fresh screen shows home"
+        );
+        emu.feed(b"hello\r\nworld");
+        let (x, y) = emu.cursor().unwrap().unwrap();
+        assert_eq!((x, y), (5, 1), "cursor after two lines of text");
+    }
+
+    #[test]
+    fn cursor_hides_when_a_program_conceals_it() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b[?25l");
+        assert_eq!(emu.cursor().unwrap(), None);
     }
 }

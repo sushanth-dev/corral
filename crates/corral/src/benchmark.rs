@@ -12,6 +12,7 @@ mod bench {
 
     use corral_core::emulation::Emulator;
     use corral_core::tree::{Node, Rect};
+    use corrald::protocol::PaneState;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -64,10 +65,15 @@ mod bench {
             emulators.push(emu);
         }
 
-        let mut panes: Vec<(u32, Rect, String)> = Vec::new();
+        let mut panes: Vec<PaneState> = Vec::new();
         for (id, rect) in rects {
             let text = emulators[id as usize].screen_text().expect("screen text");
-            panes.push((id, rect, text));
+            panes.push(PaneState {
+                id,
+                rect,
+                text,
+                cursor: None,
+            });
         }
 
         let backend = TestBackend::new(WIDTH, HEIGHT);
@@ -78,7 +84,7 @@ mod bench {
         for _ in 0..DRAWS {
             let start = Instant::now();
             for pane in &mut panes {
-                pane.2 = emulators[pane.0 as usize]
+                pane.text = emulators[pane.id as usize]
                     .screen_text()
                     .expect("screen text");
             }
@@ -97,7 +103,8 @@ mod bench {
             .any(|c| !c.symbol().is_empty());
         assert!(drew, "frame buffer is empty; nothing drew");
 
-        for (id, rect, _) in &panes {
+        for p in &panes {
+            let (id, rect) = (p.id, p.rect);
             let area_cells = rect.w as usize * rect.h as usize;
             let drawn = terminal
                 .backend()

@@ -2,8 +2,8 @@ mod benchmark;
 mod input;
 mod render;
 
-use corral_core::tree::{PaneId, Rect};
-use corrald::protocol::{ClientMsg, ServerMsg};
+use corral_core::tree::PaneId;
+use corrald::protocol::{ClientMsg, PaneState, ServerMsg};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -76,7 +76,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut leader_armed = false;
     let mut buf = String::new();
-    let mut panes: Vec<(PaneId, Rect, String)> = Vec::new();
+    let mut panes: Vec<PaneState> = Vec::new();
     let mut focused: PaneId = 0;
     let mut reader = std::io::BufReader::new(stream);
     loop {
@@ -125,6 +125,17 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
             }
         }
         terminal.draw(|f| render::draw(f, &panes, focused))?;
+        // Show the real cursor at the focused pane's position; ratatui
+        // hides it otherwise. Full-screen programs manage their own.
+        if let Some(p) = panes.iter().find(|p| p.id == focused)
+            && let Some((cx, cy)) = p.cursor
+        {
+            let (x, y) = (p.rect.x + cx, p.rect.y + cy);
+            if x < p.rect.x + p.rect.w && y < p.rect.y + p.rect.h {
+                terminal.show_cursor()?;
+                terminal.set_cursor_position(ratatui::layout::Position::new(x, y))?;
+            }
+        }
     }
     Ok(())
 }

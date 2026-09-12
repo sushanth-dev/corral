@@ -1,4 +1,4 @@
-use crate::protocol::{ClientMsg, ServerMsg};
+use crate::protocol::{ClientMsg, PaneState, ServerMsg};
 use crate::pty::{PtyEvent, PtyHandle};
 use anyhow::Result;
 use corral_core::emulation::Emulator;
@@ -191,6 +191,13 @@ impl Daemon {
                         if let Some(emu) = self.emulators.get_mut(&id) {
                             emu.feed(&bytes);
                             changed = true;
+                            // Query replies (DA1, DSR, DECRQM) route from
+                            // the emulator back into the pane's PTY.
+                            for reply in emu.take_pty_writes() {
+                                if let Some(pty) = self.ptys.get_mut(&id) {
+                                    pty.write_all(&reply)?;
+                                }
+                            }
                         }
                     }
                     Some(PtyEvent::Exited) => exited.push(id),
@@ -229,7 +236,13 @@ impl Daemon {
             let Some(emu) = self.emulators.get_mut(id) else {
                 continue;
             };
-            panes.push((*id, *rect, emu.screen_text()?));
+            let cursor = emu.cursor()?;
+            panes.push(PaneState {
+                id: *id,
+                rect: *rect,
+                text: emu.screen_text()?,
+                cursor,
+            });
         }
         let msg = ServerMsg::Frame {
             panes,
@@ -332,7 +345,7 @@ mod tests {
         );
         let mut reader = BufReader::new(client);
         let frame = wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().any(|(_, _, t)| t.contains("hello")),
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("hello")),
             _ => false,
         })
         .expect("frame with hello within 5s");
@@ -377,12 +390,12 @@ mod tests {
         };
         // Horizontal split: the two rects must not overlap and focus moves
         // to the new pane.
-        let (a, b) = (panes[0].1, panes[1].1);
+        let (a, b) = (panes[0].rect, panes[1].rect);
         assert!(
             !(a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h),
             "{a:?} overlaps {b:?}"
         );
-        assert_eq!(focused, panes[1].0);
+        assert_eq!(focused, panes[1].id);
         drop(reader);
         let _ = handle.join();
         let _ = std::fs::remove_file(dir.join("s.sock"));
@@ -431,7 +444,7 @@ mod tests {
             unreachable!()
         };
         assert!(
-            panes.iter().any(|(id, _, _)| *id == focused),
+            panes.iter().any(|p| p.id == focused),
             "focused {focused} is not a live pane"
         );
         drop(reader);
@@ -462,14 +475,14 @@ mod tests {
         // 16x4: the tree recomputes rects; the daemon must not error.
         send(reader.get_mut(), &ClientMsg::Resize { cols: 16, rows: 4 });
         let frame = wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().all(|(_, r, _)| r.w <= 16 && r.h <= 4),
+            ServerMsg::Frame { panes, .. } => panes.iter().all(|p| p.rect.w <= 16 && p.rect.h <= 4),
             _ => false,
         })
         .expect("frame with resized rects");
         let ServerMsg::Frame { panes, .. } = frame else {
             unreachable!()
         };
-        assert!(panes.iter().all(|(_, r, _)| r.w <= 16 && r.h <= 4));
+        assert!(panes.iter().all(|p| p.rect.w <= 16 && p.rect.h <= 4));
         drop(reader);
         let _ = handle.join();
         let _ = std::fs::remove_file(dir.join("s.sock"));
@@ -534,14 +547,14 @@ mod tests {
             },
         );
         let frame = wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().any(|(_, _, t)| t.contains("typed")),
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("typed")),
             _ => false,
         })
         .expect("frame with typed text");
         let ServerMsg::Frame { panes, .. } = frame else {
             unreachable!()
         };
-        let with_text = panes.iter().filter(|(_, _, t)| t.contains("typed")).count();
+        let with_text = panes.iter().filter(|p| p.text.contains("typed")).count();
         assert_eq!(with_text, 1, "typed text landed in more than one pane");
         drop(reader);
         let _ = handle.join();
@@ -573,7 +586,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(panes.len(), 1);
-        assert_eq!(focused, panes[0].0, "last live pane holds focus");
+        assert_eq!(focused, panes[0].id, "last live pane holds focus");
         drop(reader);
         let _ = handle.join();
     }
@@ -595,7 +608,7 @@ mod tests {
         );
         let mut reader = BufReader::new(client);
         let frame = wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().any(|(_, _, t)| t.contains("fine")),
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("fine")),
             _ => false,
         })
         .expect("daemon survived garbage and served the pane");
@@ -632,7 +645,7 @@ mod tests {
         send(reader.get_mut(), &ClientMsg::Resize { cols: 3, rows: 2 });
         let tiny = wait_for_msg(&mut reader, |m| match m {
             ServerMsg::Frame { panes, .. } => {
-                panes.len() == 2 && panes.iter().all(|(_, r, _)| r.w >= 1 && r.h >= 1)
+                panes.len() == 2 && panes.iter().all(|p| p.rect.w >= 1 && p.rect.h >= 1)
             }
             _ => false,
         })
@@ -643,13 +656,17 @@ mod tests {
         else {
             unreachable!()
         };
-        for (_, r, _) in &tiny_panes {
-            assert!(r.w >= 1 && r.h >= 1, "degenerate rect {r:?} at 3x2");
+        for p in &tiny_panes {
+            assert!(
+                p.rect.w >= 1 && p.rect.h >= 1,
+                "degenerate rect {:?} at 3x2",
+                p.rect
+            );
         }
         // Back to normal: rects grow again.
         send(reader.get_mut(), &ClientMsg::Resize { cols: 80, rows: 24 });
         let big = wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().all(|(_, r, _)| r.w > 20),
+            ServerMsg::Frame { panes, .. } => panes.iter().all(|p| p.rect.w > 20),
             _ => false,
         })
         .expect("restored frame");
@@ -659,7 +676,7 @@ mod tests {
         else {
             unreachable!()
         };
-        assert!(big_panes.iter().all(|(_, r, _)| r.w > 20));
+        assert!(big_panes.iter().all(|p| p.rect.w > 20));
         drop(reader);
         let _ = handle.join();
     }
@@ -688,7 +705,7 @@ mod tests {
         );
         let mut reader = BufReader::new(client.try_clone().unwrap());
         wait_for_msg(&mut reader, |m| {
-            matches!(m, ServerMsg::Frame { panes, .. } if panes.iter().any(|(_, _, t)| t.contains("one")))
+            matches!(m, ServerMsg::Frame { panes, .. } if panes.iter().any(|p| p.text.contains("one")))
         })
         .expect("first pane");
         send(
@@ -701,7 +718,7 @@ mod tests {
         );
         let frame = wait_for_msg(&mut reader, |m| match m {
             ServerMsg::Frame { panes, .. } => {
-                panes.len() == 2 && panes.iter().any(|(_, _, t)| t.contains("two"))
+                panes.len() == 2 && panes.iter().any(|p| p.text.contains("two"))
             }
             _ => false,
         })
@@ -714,10 +731,11 @@ mod tests {
         // Each half must be about 50 wide, not 100: split of the focused
         // pane, not of the full screen.
         assert_eq!(panes.len(), 2, "two panes after split");
-        for (_, r, _) in &panes {
+        for p in &panes {
             assert!(
-                r.w <= 51 && r.w >= 49,
-                "pane rect {r:?} should be half of 100 wide, not full width"
+                p.rect.w <= 51 && p.rect.w >= 49,
+                "pane rect {:?} should be half of 100 wide, not full width",
+                p.rect
             );
         }
         drop(reader);
@@ -775,7 +793,7 @@ mod tests {
         );
         let mut reader = BufReader::new(client);
         let frame = wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().any(|(_, _, t)| t.contains("later")),
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("later")),
             _ => false,
         })
         .expect("pane after attach works");

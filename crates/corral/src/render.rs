@@ -1,4 +1,5 @@
-use corral_core::tree::{PaneId, Rect};
+use corral_core::tree::PaneId;
+use corrald::protocol::PaneState;
 use ratatui::Frame;
 use ratatui::layout::Rect as RRect;
 use ratatui::style::{Color, Style};
@@ -12,8 +13,14 @@ const FOCUSED_GUTTER: Color = Color::Indexed(245);
 
 // The event loop (plan Task 7) consumes draw; v0.1 ships the renderer first.
 #[allow(dead_code)]
-pub fn draw(frame: &mut Frame, panes: &[(PaneId, Rect, String)], focused: PaneId) {
-    for (_id, rect, text) in panes {
+pub fn draw(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
+    for PaneState {
+        id: _,
+        rect,
+        text,
+        cursor: _,
+    } in panes
+    {
         let rr = RRect {
             x: rect.x,
             y: rect.y,
@@ -31,13 +38,15 @@ pub fn draw(frame: &mut Frame, panes: &[(PaneId, Rect, String)], focused: PaneId
 // covers, so the plan's block-over-rect alone never highlights it. Paint
 // the gutter cell strip between the focused pane and each adjacent sibling.
 #[allow(dead_code)]
-fn paint_gutters(frame: &mut Frame, panes: &[(PaneId, Rect, String)], focused: PaneId) {
-    let Some((_, f, _)) = panes.iter().find(|(id, _, _)| *id == focused) else {
+fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
+    let Some(fp) = panes.iter().find(|p| p.id == focused) else {
         return;
     };
+    let f = fp.rect;
     let gutter = Style::new().bg(FOCUSED_GUTTER);
-    for (id, rect, _) in panes {
-        if *id == focused {
+    for PaneState { id: _, rect, .. } in panes {
+        let rect = *rect;
+        if rect == f {
             continue;
         }
         // Sibling starts where the gutter column begins: focused pane on
@@ -94,35 +103,26 @@ mod tests {
     use corral_core::tree;
     use ratatui::{Terminal as TuiTerminal, backend::TestBackend};
 
-    fn panes() -> Vec<(u32, tree::Rect, String)> {
+    fn pane(id: u32, x: u16, y: u16, w: u16, h: u16, text: &str) -> PaneState {
+        PaneState {
+            id,
+            rect: tree::Rect { x, y, w, h },
+            text: text.into(),
+            cursor: None,
+        }
+    }
+
+    fn panes() -> Vec<PaneState> {
         vec![
-            (
-                1,
-                tree::Rect {
-                    x: 0,
-                    y: 0,
-                    w: 50,
-                    h: 10,
-                },
-                "pane-one\nsecond line".into(),
-            ),
-            (
-                2,
-                tree::Rect {
-                    x: 51,
-                    y: 0,
-                    w: 50,
-                    h: 10,
-                },
-                "pane-two".into(),
-            ),
+            pane(1, 0, 0, 50, 10, "pane-one\nsecond line"),
+            pane(2, 51, 0, 50, 10, "pane-two"),
         ]
     }
 
     fn draw_at(
         width: u16,
         height: u16,
-        panes: &[(u32, tree::Rect, String)],
+        panes: &[PaneState],
         focused: u32,
     ) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
@@ -163,36 +163,9 @@ mod tests {
         // When pane 3 has focus, the x=50 gutter is not adjacent to it and
         // must stay Reset while the horizontal gutter lights.
         let panes = vec![
-            (
-                1,
-                tree::Rect {
-                    x: 0,
-                    y: 0,
-                    w: 50,
-                    h: 10,
-                },
-                "one".into(),
-            ),
-            (
-                2,
-                tree::Rect {
-                    x: 51,
-                    y: 0,
-                    w: 50,
-                    h: 4,
-                },
-                "two".into(),
-            ),
-            (
-                3,
-                tree::Rect {
-                    x: 51,
-                    y: 5,
-                    w: 50,
-                    h: 5,
-                },
-                "three".into(),
-            ),
+            pane(1, 0, 0, 50, 10, "one"),
+            pane(2, 51, 0, 50, 4, "two"),
+            pane(3, 51, 5, 50, 5, "three"),
         ];
         let buf = draw_at(101, 10, &panes, 3);
         assert_eq!(buf[(50, 0)].bg, ratatui::style::Color::Reset);
@@ -224,32 +197,14 @@ mod tests {
     fn text_keeps_one_cell_off_the_gutter_edge() {
         // Left pane rect w 50: padding leaves column 49 empty, so the
         // focused-gutter edge is never overwritten by text.
-        let panes = vec![(
-            1,
-            tree::Rect {
-                x: 0,
-                y: 0,
-                w: 50,
-                h: 10,
-            },
-            "x".repeat(50),
-        )];
+        let panes = vec![pane(1, 0, 0, 50, 10, &"x".repeat(50))];
         let buf = draw_at(101, 10, &panes, 1);
         assert_eq!(buf[(49, 0)].symbol(), " ");
     }
 
     #[test]
     fn text_clips_at_the_rect_boundary() {
-        let panes = vec![(
-            7,
-            tree::Rect {
-                x: 0,
-                y: 0,
-                w: 10,
-                h: 3,
-            },
-            "a-very-long-line-that-overflows".into(),
-        )];
+        let panes = vec![pane(7, 0, 0, 10, 3, "a-very-long-line-that-overflows")];
         let buf = draw_at(20, 5, &panes, 7);
         // w 10 with 1-cell padding on each side fits 8 columns of text.
         assert!(row(&buf, 0, 20).contains("a-very-l"));
@@ -258,16 +213,7 @@ mod tests {
 
     #[test]
     fn empty_pane_text_draws_nothing_but_the_rect() {
-        let panes = vec![(
-            3,
-            tree::Rect {
-                x: 0,
-                y: 0,
-                w: 8,
-                h: 4,
-            },
-            String::new(),
-        )];
+        let panes = vec![pane(3, 0, 0, 8, 4, "")];
         let buf = draw_at(10, 4, &panes, 3);
         assert_eq!(row(&buf, 0, 10), " ".repeat(10));
     }

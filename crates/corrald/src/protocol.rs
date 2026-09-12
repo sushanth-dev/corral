@@ -24,12 +24,23 @@ pub enum ClientMsg {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub enum ServerMsg {
     Frame {
-        panes: Vec<(PaneId, Rect, String)>,
+        panes: Vec<PaneState>,
         focused: PaneId,
     },
     Exited {
         pane: PaneId,
     },
+}
+
+/// One pane's render state. The cursor is None while a full-screen
+/// program (alternate screen) owns the pane or the cursor sits outside
+/// the viewport.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct PaneState {
+    pub id: PaneId,
+    pub rect: Rect,
+    pub text: String,
+    pub cursor: Option<(u16, u16)>,
 }
 
 #[cfg(test)]
@@ -62,22 +73,23 @@ mod tests {
     }
 
     #[test]
-    fn server_frame_serializes_panes_as_triples() {
+    fn server_frame_serializes_pane_states() {
         let msg = ServerMsg::Frame {
-            panes: vec![(
-                1,
-                Rect {
+            panes: vec![PaneState {
+                id: 1,
+                rect: Rect {
                     x: 0,
                     y: 0,
                     w: 50,
                     h: 24,
                 },
-                "text".into(),
-            )],
+                text: "text".into(),
+                cursor: Some((10, 3)),
+            }],
             focused: 1,
         };
         let line = serde_json::to_string(&msg).unwrap();
-        assert!(line.contains("\"panes\":[[1,"));
+        assert!(line.contains("\"panes\":[{\"id\":1,"));
         assert!(line.contains("\"focused\":1"));
         let back: ServerMsg = serde_json::from_str(&line).unwrap();
         assert!(matches!(back, ServerMsg::Frame { focused: 1, .. }));
@@ -144,16 +156,17 @@ mod tests {
     #[test]
     fn pane_text_with_unicode_and_escapes_survives_json() {
         let msg = ServerMsg::Frame {
-            panes: vec![(
-                1,
-                Rect {
+            panes: vec![PaneState {
+                id: 1,
+                rect: Rect {
                     x: 0,
                     y: 0,
                     w: 80,
                     h: 24,
                 },
-                "héllo こんにちは \"quoted\" \\\nnewline".into(),
-            )],
+                text: "héllo こんにちは \"quoted\" \\\nnewline".into(),
+                cursor: None,
+            }],
             focused: 1,
         };
         let back: ServerMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
