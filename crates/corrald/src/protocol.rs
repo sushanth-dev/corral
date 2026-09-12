@@ -95,4 +95,88 @@ mod tests {
     fn unknown_client_variant_is_rejected() {
         assert!(serde_json::from_str::<ClientMsg>("{\"Nope\":1}").is_err());
     }
+
+    #[test]
+    fn create_pane_with_empty_args_and_cwd_round_trips() {
+        let msg = ClientMsg::CreatePane {
+            cmd: "/bin/sh".into(),
+            args: vec![],
+            cwd: String::new(),
+        };
+        let line = serde_json::to_string(&msg).unwrap();
+        let back: ClientMsg = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn key_with_empty_byte_vector_is_valid() {
+        let msg = ClientMsg::Key { bytes: vec![] };
+        let line = serde_json::to_string(&msg).unwrap();
+        assert_eq!(line, r#"{"Key":{"bytes":[]}}"#);
+        let back: ClientMsg = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn resize_accepts_extreme_dimensions() {
+        for (cols, rows) in [(1, 1), (u16::MAX, u16::MAX)] {
+            let msg = ClientMsg::Resize { cols, rows };
+            let back: ClientMsg =
+                serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+            assert_eq!(back, msg);
+        }
+        // Overflowing u16 is rejected, not clamped.
+        assert!(
+            serde_json::from_str::<ClientMsg>(r#"{"Resize":{"cols":70000,"rows":24}}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn frame_with_no_panes_round_trips() {
+        let msg = ServerMsg::Frame {
+            panes: vec![],
+            focused: 0,
+        };
+        let back: ServerMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn pane_text_with_unicode_and_escapes_survives_json() {
+        let msg = ServerMsg::Frame {
+            panes: vec![(
+                1,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 80,
+                    h: 24,
+                },
+                "héllo こんにちは \"quoted\" \\\nnewline".into(),
+            )],
+            focused: 1,
+        };
+        let back: ServerMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn exited_for_pane_zero_is_representable() {
+        let back: ServerMsg = serde_json::from_str(r#"{"Exited":{"pane":0}}"#).unwrap();
+        assert_eq!(back, ServerMsg::Exited { pane: 0 });
+    }
+
+    #[test]
+    fn truncated_json_line_is_rejected_not_panicking() {
+        let full = serde_json::to_string(&ClientMsg::Attach).unwrap();
+        let cut = &full[..full.len() / 2];
+        assert!(serde_json::from_str::<ClientMsg>(cut).is_err());
+        assert!(serde_json::from_str::<ClientMsg>("").is_err());
+        assert!(serde_json::from_str::<ClientMsg>("   ").is_err());
+    }
+
+    #[test]
+    fn server_message_unknown_variant_is_rejected() {
+        assert!(serde_json::from_str::<ServerMsg>("{\"Whatever\":1}").is_err());
+    }
 }

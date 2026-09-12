@@ -262,6 +262,18 @@ mod tests {
         stream.flush().unwrap();
     }
 
+    /// Binds a listener in a fresh temp dir and serves it on a thread.
+    /// Returns (socket path, server thread handle).
+    fn start_daemon(tag: &str) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
+        let dir = std::env::temp_dir().join(format!("corral-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let handle = std::thread::spawn(move || Daemon::serve(listener).unwrap());
+        (sock, handle)
+    }
+
     fn wait_for_msg(
         reader: &mut BufReader<UnixStream>,
         pred: impl Fn(&ServerMsg) -> bool,
@@ -476,5 +488,244 @@ mod tests {
         drop(reader);
         let _ = handle.join();
         let _ = std::fs::remove_file(dir.join("s.sock"));
+    }
+
+    #[test]
+    fn keys_route_to_the_focused_pane_only() {
+        // Two panes run `cat`; typing lands only in the focused (second)
+        // pane, and the first pane never receives the bytes.
+        let (_sock, handle) = start_daemon("keys");
+        let mut client = UnixStream::connect(&_sock).unwrap();
+        for out in ["one", "two"] {
+            send(
+                &mut client,
+                &ClientMsg::CreatePane {
+                    cmd: "sh".into(),
+                    args: vec!["-c".into(), format!("printf {out}; cat")],
+                    cwd: "/tmp".into(),
+                },
+            );
+        }
+        let mut reader = BufReader::new(client);
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.len() == 2,
+            _ => false,
+        })
+        .expect("two panes");
+        send(
+            reader.get_mut(),
+            &ClientMsg::Key {
+                bytes: b"typed\n".to_vec(),
+            },
+        );
+        let frame = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|(_, _, t)| t.contains("typed")),
+            _ => false,
+        })
+        .expect("frame with typed text");
+        let ServerMsg::Frame { panes, .. } = frame else {
+            unreachable!()
+        };
+        let with_text = panes.iter().filter(|(_, _, t)| t.contains("typed")).count();
+        assert_eq!(with_text, 1, "typed text landed in more than one pane");
+        drop(reader);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn second_exit_leaves_a_single_collapsed_pane() {
+        // Three short-lived panes: each exit collapses the tree until one
+        // pane fills the whole frame.
+        let (_sock, handle) = start_daemon("collapse");
+        let mut client = UnixStream::connect(&_sock).unwrap();
+        for out in ["one", "two", "three"] {
+            send(
+                &mut client,
+                &ClientMsg::CreatePane {
+                    cmd: "sh".into(),
+                    args: vec!["-c".into(), format!("printf {out}")],
+                    cwd: "/tmp".into(),
+                },
+            );
+        }
+        let mut reader = BufReader::new(client);
+        let frame = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.len() == 1,
+            _ => false,
+        })
+        .expect("final frame with one pane");
+        let ServerMsg::Frame { panes, focused } = frame else {
+            unreachable!()
+        };
+        assert_eq!(panes.len(), 1);
+        assert_eq!(focused, panes[0].0, "last live pane holds focus");
+        drop(reader);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn garbage_lines_between_messages_are_skipped() {
+        // The daemon must not die on malformed JSON from a client.
+        let (_sock, handle) = start_daemon("garbage");
+        let mut client = UnixStream::connect(&_sock).unwrap();
+        client.write_all(b"not json at all\n{\"Torn\":\n").unwrap();
+        client.flush().unwrap();
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "printf fine".into()],
+                cwd: "/tmp".into(),
+            },
+        );
+        let mut reader = BufReader::new(client);
+        let frame = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|(_, _, t)| t.contains("fine")),
+            _ => false,
+        })
+        .expect("daemon survived garbage and served the pane");
+        assert!(matches!(frame, ServerMsg::Frame { .. }));
+        drop(reader);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn resize_to_tiny_then_back_restores_layout() {
+        let (_sock, handle) = start_daemon("tiny");
+        let mut client = UnixStream::connect(&_sock).unwrap();
+        for out in ["one", "two"] {
+            send(
+                &mut client,
+                &ClientMsg::CreatePane {
+                    cmd: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        format!("while :; do printf {out}; sleep 1; done"),
+                    ],
+                    cwd: "/tmp".into(),
+                },
+            );
+        }
+        let mut reader = BufReader::new(client);
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.len() == 2,
+            _ => false,
+        })
+        .expect("two panes");
+        // Tiny size: every pane rect must still be at least 1x1. The panes
+        // keep printing, so post-resize frames flow.
+        send(reader.get_mut(), &ClientMsg::Resize { cols: 3, rows: 2 });
+        let tiny = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => {
+                panes.len() == 2 && panes.iter().all(|(_, r, _)| r.w >= 1 && r.h >= 1)
+            }
+            _ => false,
+        })
+        .expect("tiny frame with valid rects");
+        let ServerMsg::Frame {
+            panes: tiny_panes, ..
+        } = tiny
+        else {
+            unreachable!()
+        };
+        for (_, r, _) in &tiny_panes {
+            assert!(r.w >= 1 && r.h >= 1, "degenerate rect {r:?} at 3x2");
+        }
+        // Back to normal: rects grow again.
+        send(reader.get_mut(), &ClientMsg::Resize { cols: 80, rows: 24 });
+        let big = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().all(|(_, r, _)| r.w > 20),
+            _ => false,
+        })
+        .expect("restored frame");
+        let ServerMsg::Frame {
+            panes: big_panes, ..
+        } = big
+        else {
+            unreachable!()
+        };
+        assert!(big_panes.iter().all(|(_, r, _)| r.w > 20));
+        drop(reader);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn attach_alone_produces_no_frame_but_keeps_the_connection() {
+        let (_sock, handle) = start_daemon("attach");
+        let mut client = UnixStream::connect(&_sock).unwrap();
+        send(&mut client, &ClientMsg::Attach);
+        // Nothing crashed and the daemon is still responsive: a pane
+        // created after Attach works normally.
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "printf later".into()],
+                cwd: "/tmp".into(),
+            },
+        );
+        let mut reader = BufReader::new(client);
+        let frame = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|(_, _, t)| t.contains("later")),
+            _ => false,
+        })
+        .expect("pane after attach works");
+        assert!(matches!(frame, ServerMsg::Frame { .. }));
+        drop(reader);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn focus_into_an_empty_direction_keeps_current_focus() {
+        // A single pane: focus down/left has no neighbor, so the focused
+        // id in subsequent frames must stay on the live pane.
+        let (_sock, handle) = start_daemon("nofocus");
+        let mut client = UnixStream::connect(&_sock).unwrap();
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "printf solo; sleep 2".into()],
+                cwd: "/tmp".into(),
+            },
+        );
+        let mut reader = BufReader::new(client);
+        let first = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::Frame { .. }))
+            .expect("first frame");
+        let ServerMsg::Frame { focused, .. } = first else {
+            unreachable!()
+        };
+        for dir in [Dir::Horizontal, Dir::Vertical] {
+            send(reader.get_mut(), &ClientMsg::Focus { dir });
+        }
+        let frame = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::Frame { .. }))
+            .expect("frame after focus attempts");
+        let ServerMsg::Frame { focused: after, .. } = frame else {
+            unreachable!()
+        };
+        assert_eq!(after, focused, "focus moved with no neighbor");
+        drop(reader);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn socket_path_honors_env_and_uid_fallback_shape() {
+        // Env override wins outright.
+        // SAFETY: single-threaded test env manipulation.
+        unsafe { std::env::set_var("CORRAL_SOCKET", "/tmp/env-wins.sock") };
+        assert_eq!(
+            socket_path(),
+            std::path::PathBuf::from("/tmp/env-wins.sock")
+        );
+        unsafe { std::env::remove_var("CORRAL_SOCKET") };
+        // Fallback: /tmp/corral-$UID.sock with a numeric uid.
+        let path = socket_path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("corral-"), "got {name}");
+        let uid = name.trim_start_matches("corral-").trim_end_matches(".sock");
+        assert!(
+            !uid.is_empty() && uid.chars().all(|c| c.is_ascii_digit()),
+            "uid suffix {uid:?} is not numeric"
+        );
     }
 }

@@ -1,6 +1,7 @@
 use corral_core::tree::Dir;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+#[derive(Debug)]
 pub enum Action {
     Focus(Dir),
     // The plan's keymap distinguishes s (vertical) from v (horizontal);
@@ -143,6 +144,81 @@ mod tests {
         let mut armed = false;
         assert!(handle(key(KeyCode::F(5), KeyModifiers::NONE), &mut armed).is_none());
         assert!(handle(key(KeyCode::Char('q'), KeyModifiers::ALT), &mut armed).is_none());
+        assert!(!armed);
+    }
+
+    #[test]
+    fn second_ctrl_a_disarms_like_any_unknown_leader_key() {
+        // The armed branch consumes every key: a repeated Ctrl+a is an
+        // unmapped leader key, so it disarms silently and sends nothing.
+        let mut armed = false;
+        assert!(handle(key(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut armed).is_none());
+        assert!(armed);
+        assert!(handle(key(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut armed).is_none());
+        assert!(!armed);
+        // A fresh Ctrl+a re-arms after the disarm.
+        assert!(handle(key(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut armed).is_none());
+        assert!(armed);
+        assert!(matches!(
+            handle(key(KeyCode::Char('d'), KeyModifiers::NONE), &mut armed),
+            Some(Action::Quit)
+        ));
+    }
+
+    #[test]
+    fn uppercase_shifted_leader_key_disarms_without_action() {
+        // SHIFT is accepted on plain chars; uppercase H is an unmapped
+        // leader key and disarms silently rather than typing into a pane.
+        let mut armed = false;
+        handle(key(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut armed);
+        assert!(
+            handle(key(KeyCode::Char('H'), KeyModifiers::SHIFT), &mut armed).is_none(),
+            "uppercase H must not focus or send"
+        );
+        assert!(!armed);
+    }
+
+    #[test]
+    fn every_armed_leader_key_maps_to_the_planned_action() {
+        // Exhaustive map check straight from the plan's keymap table.
+        type Check = fn(&Action) -> bool;
+        let cases: Vec<(KeyCode, Check)> = vec![
+            (KeyCode::Char('h'), |a: &Action| {
+                matches!(a, Action::Focus(Dir::Horizontal))
+            }),
+            (KeyCode::Char('l'), |a: &Action| {
+                matches!(a, Action::Focus(Dir::Horizontal))
+            }),
+            (KeyCode::Char('j'), |a: &Action| {
+                matches!(a, Action::Focus(Dir::Vertical))
+            }),
+            (KeyCode::Char('k'), |a: &Action| {
+                matches!(a, Action::Focus(Dir::Vertical))
+            }),
+            (KeyCode::Char('s'), |a: &Action| {
+                matches!(a, Action::Split(Dir::Vertical))
+            }),
+            (KeyCode::Char('v'), |a: &Action| {
+                matches!(a, Action::Split(Dir::Horizontal))
+            }),
+            (KeyCode::Char('d'), |a: &Action| matches!(a, Action::Quit)),
+        ];
+        for (code, check) in cases {
+            let mut armed = false;
+            handle(key(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut armed);
+            let action = handle(key(code, KeyModifiers::NONE), &mut armed)
+                .unwrap_or_else(|| panic!("{code:?} produced no action"));
+            assert!(check(&action), "{code:?} produced {action:?}");
+            assert!(!armed, "{code:?} left the leader armed");
+        }
+    }
+
+    #[test]
+    fn escape_and_arrow_keys_send_nothing_while_disarmed() {
+        let mut armed = false;
+        assert!(handle(key(KeyCode::Esc, KeyModifiers::NONE), &mut armed).is_none());
+        assert!(handle(key(KeyCode::Up, KeyModifiers::NONE), &mut armed).is_none());
+        assert!(handle(key(KeyCode::Tab, KeyModifiers::NONE), &mut armed).is_none());
         assert!(!armed);
     }
 }

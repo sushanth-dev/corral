@@ -112,3 +112,45 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_path_prefers_the_env_override() {
+        // SAFETY: single-threaded test env manipulation.
+        unsafe { std::env::set_var("CORRAL_SOCKET", "/tmp/client-env-wins.sock") };
+        assert_eq!(
+            socket_path(),
+            std::path::PathBuf::from("/tmp/client-env-wins.sock")
+        );
+        unsafe { std::env::remove_var("CORRAL_SOCKET") };
+    }
+
+    #[test]
+    fn socket_path_falls_back_to_the_uid_shape() {
+        let path = socket_path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("corral-"), "got {name}");
+        assert!(name.ends_with(".sock"), "got {name}");
+        let uid = name.trim_start_matches("corral-").trim_end_matches(".sock");
+        assert!(
+            !uid.is_empty() && uid.chars().all(|c| c.is_ascii_digit()),
+            "uid suffix {uid:?} is not numeric"
+        );
+    }
+
+    #[test]
+    fn send_msg_writes_a_terminated_json_line() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut writer = a;
+        send_msg(&mut writer, &ClientMsg::Attach).unwrap();
+        drop(writer);
+        let mut got = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(b), &mut got).unwrap();
+        // Unit variants serialize as bare strings; the newline terminator
+        // is what the JSON-lines framing depends on.
+        assert_eq!(got, "\"Attach\"\n");
+    }
+}

@@ -335,4 +335,265 @@ mod tests {
         assert_eq!(node.remove(1), None);
         assert_eq!(node.rects(AREA), vec![(1, AREA)]);
     }
+
+    #[test]
+    fn rects_preserve_a_nonzero_origin() {
+        let node = Node::split(
+            Dir::Horizontal,
+            0.5,
+            Box::new(Node::leaf(1)),
+            Box::new(Node::leaf(2)),
+        );
+        let area = Rect {
+            x: 10,
+            y: 5,
+            w: 101,
+            h: 40,
+        };
+        assert_eq!(
+            node.rects(area),
+            vec![
+                (
+                    1,
+                    Rect {
+                        x: 10,
+                        y: 5,
+                        w: 50,
+                        h: 40
+                    }
+                ),
+                (
+                    2,
+                    Rect {
+                        x: 61,
+                        y: 5,
+                        w: 50,
+                        h: 40
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn asymmetric_ratio_gives_each_side_its_share() {
+        let node = Node::split(
+            Dir::Horizontal,
+            0.25,
+            Box::new(Node::leaf(1)),
+            Box::new(Node::leaf(2)),
+        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 10,
+        };
+        let rects = node.rects(area);
+        assert_eq!(rects[0].1.w, 24, "left pane loses the gutter column");
+        assert_eq!(rects[1].1.x, 25, "gutter column sits at the cut");
+        assert_eq!(rects[1].1.w, 75);
+
+        let node = Node::split(
+            Dir::Vertical,
+            0.75,
+            Box::new(Node::leaf(1)),
+            Box::new(Node::leaf(2)),
+        );
+        let tall = Rect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 40,
+        };
+        let rects = node.rects(tall);
+        assert_eq!(rects[0].1.h, 29);
+        assert_eq!(rects[1].1.y, 30);
+        assert_eq!(rects[1].1.h, 10);
+    }
+
+    #[test]
+    fn degenerate_one_cell_areas_still_yield_positive_rects() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        };
+        let h = Node::split(
+            Dir::Horizontal,
+            0.5,
+            Box::new(Node::leaf(1)),
+            Box::new(Node::leaf(2)),
+        );
+        for (_, r) in h.rects(area) {
+            assert!(r.w >= 1 && r.h >= 1, "horizontal gave {r:?}");
+        }
+        let v = Node::split(
+            Dir::Vertical,
+            0.5,
+            Box::new(Node::leaf(1)),
+            Box::new(Node::leaf(2)),
+        );
+        for (_, r) in v.rects(area) {
+            assert!(r.w >= 1 && r.h >= 1, "vertical gave {r:?}");
+        }
+    }
+
+    #[test]
+    fn removing_a_nested_pane_promotes_its_sibling_leaf() {
+        let mut node = Node::split(
+            Dir::Horizontal,
+            0.5,
+            Box::new(Node::leaf(1)),
+            Box::new(Node::split(
+                Dir::Vertical,
+                0.5,
+                Box::new(Node::leaf(2)),
+                Box::new(Node::leaf(3)),
+            )),
+        );
+        assert_eq!(node.remove(2), Some(3));
+        let rects = node.rects(AREA);
+        assert_eq!(rects.len(), 2);
+        assert!(rects.iter().any(|(id, _)| *id == 1));
+        assert!(rects.iter().any(|(id, _)| *id == 3));
+    }
+
+    #[test]
+    fn removing_a_leaf_with_a_split_sibling_returns_none_but_collapses() {
+        // Root H(V(2,3), 1): removing 1 collapses the root to V(2,3); the
+        // sibling is a split, so no single pane id comes back.
+        let mut node = Node::split(
+            Dir::Horizontal,
+            0.5,
+            Box::new(Node::split(
+                Dir::Vertical,
+                0.5,
+                Box::new(Node::leaf(2)),
+                Box::new(Node::leaf(3)),
+            )),
+            Box::new(Node::leaf(1)),
+        );
+        assert_eq!(node.remove(1), None);
+        assert_eq!(node.rects(AREA).len(), 2);
+    }
+
+    #[test]
+    fn replace_accepts_a_subtree_not_just_a_leaf() {
+        let mut node = Node::split(
+            Dir::Horizontal,
+            0.5,
+            Box::new(Node::leaf(1)),
+            Box::new(Node::leaf(2)),
+        );
+        let subtree = Node::split(
+            Dir::Vertical,
+            0.5,
+            Box::new(Node::leaf(8)),
+            Box::new(Node::leaf(9)),
+        );
+        assert!(node.replace(2, subtree));
+        let rects = node.rects(AREA);
+        assert_eq!(rects.len(), 3);
+        // The vertical cut of the right half (h 40) leaves a gutter row.
+        assert_eq!(rects[1].1.h, 19);
+        assert_eq!(rects[2].1.h, 20);
+        assert_eq!(rects[2].1.y, 20);
+    }
+
+    #[test]
+    fn focus_from_an_unknown_pane_is_none() {
+        let node = Node::split(
+            Dir::Horizontal,
+            0.5,
+            Box::new(Node::leaf(1)),
+            Box::new(Node::leaf(2)),
+        );
+        assert_eq!(node.focus_dir(99, Dir::Horizontal), None);
+        assert_eq!(node.focus_dir(99, Dir::Vertical), None);
+    }
+
+    #[test]
+    fn focus_walks_within_a_row_of_three() {
+        // Vertical split: panes 1 and 2 in the top row (Horizontal split),
+        // pane 3 fills the bottom.
+        let node = Node::split(
+            Dir::Vertical,
+            0.5,
+            Box::new(Node::split(
+                Dir::Horizontal,
+                0.5,
+                Box::new(Node::leaf(1)),
+                Box::new(Node::leaf(2)),
+            )),
+            Box::new(Node::leaf(3)),
+        );
+        assert_eq!(node.focus_dir(1, Dir::Horizontal), Some(2));
+        assert_eq!(node.focus_dir(2, Dir::Horizontal), Some(1));
+        assert_eq!(node.focus_dir(1, Dir::Vertical), Some(3));
+        assert_eq!(node.focus_dir(2, Dir::Vertical), Some(3));
+    }
+
+    #[test]
+    fn rect_and_dir_round_trip_through_json() {
+        for dir in [Dir::Horizontal, Dir::Vertical] {
+            let line = serde_json::to_string(&dir).unwrap();
+            assert_eq!(line, format!("\"{dir:?}\""));
+            let back: Dir = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, dir);
+        }
+        let rect = Rect {
+            x: 1,
+            y: 2,
+            w: 3,
+            h: 4,
+        };
+        let line = serde_json::to_string(&rect).unwrap();
+        assert_eq!(line, r#"{"x":1,"y":2,"w":3,"h":4}"#);
+        let back: Rect = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, rect);
+    }
+
+    #[test]
+    fn deep_nesting_stays_inside_the_area_and_disjoint() {
+        let mut node = Node::leaf(0);
+        for id in 1..8u32 {
+            let dir = if id % 2 == 0 {
+                Dir::Horizontal
+            } else {
+                Dir::Vertical
+            };
+            node = Node::split(dir, 0.5, Box::new(node), Box::new(Node::leaf(id)));
+        }
+        let rects = node.rects(AREA);
+        assert_eq!(rects.len(), 8);
+        for (_, r) in &rects {
+            assert!(r.w > 0 && r.h > 0, "empty rect {r:?}");
+            assert!(r.x + r.w <= AREA.w, "rect {r:?} exceeds width {}", AREA.w);
+            assert!(r.y + r.h <= AREA.h, "rect {r:?} exceeds height {}", AREA.h);
+        }
+        for (i, (_, a)) in rects.iter().enumerate() {
+            for (_, b) in rects.iter().skip(i + 1) {
+                let overlap =
+                    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+                assert!(!overlap, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn eight_panes_are_all_present_after_nesting() {
+        let mut node = Node::leaf(0);
+        for id in 1..8u32 {
+            node = Node::split(
+                Dir::Horizontal,
+                0.5,
+                Box::new(node),
+                Box::new(Node::leaf(id)),
+            );
+        }
+        let ids: Vec<PaneId> = node.rects(AREA).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
 }

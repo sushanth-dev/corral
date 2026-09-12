@@ -91,4 +91,80 @@ mod tests {
         let text = emu.screen_text().unwrap();
         assert!(text.lines().next().unwrap().contains("abcdefghijklmnop"));
     }
+
+    #[test]
+    fn empty_feed_changes_nothing() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"hi\r\n");
+        let before = emu.screen_text().unwrap();
+        emu.feed(b"");
+        assert_eq!(emu.screen_text().unwrap(), before);
+    }
+
+    #[test]
+    fn escape_sequence_split_across_feeds_does_not_leak() {
+        // The SGR prefix arrives in one PTY read, the rest in the next;
+        // the emulator must hold the partial sequence, not print it.
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b[");
+        emu.feed(b"1;31mred\x1b[0m\r\n");
+        let text = emu.screen_text().unwrap();
+        assert!(text.contains("red"));
+        assert!(!text.contains('\x1b'), "escape byte leaked into text");
+        assert!(!text.contains('['), "bracket leaked into text");
+    }
+
+    #[test]
+    fn wide_grapheme_occupies_its_own_cells() {
+        // CJK text is two cells wide; the renderer reads graphemes per
+        // cell, so the string must survive a round trip intact.
+        let mut emu = Emulator::new(20, 4).unwrap();
+        emu.feed("こんにちは".as_bytes());
+        let text = emu.screen_text().unwrap();
+        assert!(text.contains("こんにちは"));
+    }
+
+    #[test]
+    fn control_bytes_other_than_newline_do_not_corrupt_text() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"start\x07mid\x08end\r\n");
+        let text = emu.screen_text().unwrap();
+        assert!(text.contains("start"), "got {text:?}");
+        assert!(text.contains("end"), "got {text:?}");
+    }
+
+    #[test]
+    fn shrink_then_grow_resize_keeps_text_readable() {
+        let mut emu = Emulator::new(40, 10).unwrap();
+        emu.feed(b"the quick brown fox jumps over the lazy dog\r\n");
+        emu.resize(10, 10).unwrap();
+        let small = emu.screen_text().unwrap();
+        assert!(small.contains("the quick"), "shrunk view lost text");
+        emu.resize(40, 10).unwrap();
+        let back = emu.screen_text().unwrap();
+        assert!(
+            back.contains("jumps over the lazy") && back.lines().any(|l| l.contains("dog")),
+            "grown view lost text: {back:?}"
+        );
+    }
+
+    #[test]
+    fn cursor_home_carriage_return_and_backspace_move_the_cursor() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"abcdef\x08\x08XY\r\n");
+        let text = emu.screen_text().unwrap();
+        // Two backspaces overwrite "ef" with "XY".
+        assert!(text.contains("abcdXY"), "got {text:?}");
+    }
+
+    #[test]
+    fn zero_size_emulator_is_rejected_or_harmless() {
+        // A client could send Resize { cols: 0, rows: 0 }; the emulator
+        // must either reject it or survive it, never panic.
+        let mut emu = Emulator::new(80, 24).unwrap();
+        // Survived: screen_text must not panic either. Rejected is fine too.
+        if emu.resize(0, 0).is_ok() {
+            let _ = emu.screen_text().unwrap();
+        }
+    }
 }

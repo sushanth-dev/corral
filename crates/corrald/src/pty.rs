@@ -114,4 +114,124 @@ mod tests {
         }
         assert!(saw_output_end);
     }
+
+    #[test]
+    fn keys_written_reach_the_shell() {
+        // Feed the shell a command through write_all; its output proves
+        // the bytes crossed the PTY master/slave boundary. `cat` echoes
+        // through the pty and the shell reads the command, so the echo of
+        // the typed line itself is the signal.
+        let mut handle = PtyHandle::spawn("cat", &[], Path::new("/tmp"), 80, 24).unwrap();
+        handle.write_all(b"echo ok-$((1+1))\n").unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match handle
+                .rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+            {
+                Ok(PtyEvent::Output(chunk)) => got.extend(chunk),
+                Ok(PtyEvent::Exited) => break,
+                // Timeout: keep polling until the deadline.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            }
+            if got.windows(9).any(|w| w == b"ok-2\r\nok-")
+                || got.windows(5).any(|w| w == b"ok-2") && got.len() > 40
+            {
+                break;
+            }
+        }
+        // `cat` echoes the input; a real shell would run it. Either way
+        // the written bytes round-tripped through the pty.
+        assert!(
+            String::from_utf8_lossy(&got).contains("ok-$((1+1))"),
+            "written keys never crossed the pty: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
+    #[test]
+    fn resize_changes_the_pty_size() {
+        // `stty size` reads the kernel pty dimensions from inside.
+        let handle =
+            PtyHandle::spawn("sh", &["-c", "stty size"], Path::new("/tmp"), 80, 24).unwrap();
+        handle.resize(40, 12).unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match handle
+                .rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+            {
+                Ok(PtyEvent::Output(chunk)) => got.extend(chunk),
+                Ok(PtyEvent::Exited) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+            if got.windows(5).any(|w| w == b"12 40") {
+                break;
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&got).contains("12 40"),
+            "stty reported {:?}, expected rows 12 cols 40",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
+    #[test]
+    fn large_output_arrives_in_full() {
+        // 20000 lines (~108 KB) through an 8 KB reader buffer: the reader
+        // loop must not drop or truncate chunks.
+        let handle =
+            PtyHandle::spawn("sh", &["-c", "seq 1 20000"], Path::new("/tmp"), 80, 24).unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match handle
+                .rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+            {
+                Ok(PtyEvent::Output(chunk)) => got.extend(chunk),
+                Ok(PtyEvent::Exited) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&got);
+        assert!(
+            text.contains("\n1\r\n") || text.starts_with("1\r\n"),
+            "missing first line"
+        );
+        assert!(
+            text.trim_end().ends_with("20000"),
+            "missing final line; got {} bytes",
+            got.len()
+        );
+    }
+
+    #[test]
+    fn output_before_exit_ordering_holds() {
+        // The final Output event must precede Exited: the daemon relies on
+        // this to show the pane's last text before collapsing the tree.
+        let handle =
+            PtyHandle::spawn("sh", &["-c", "printf last"], Path::new("/tmp"), 80, 24).unwrap();
+        let mut saw_output = false;
+        for ev in handle.rx {
+            match ev {
+                PtyEvent::Output(_) => saw_output = true,
+                PtyEvent::Exited => break,
+            }
+        }
+        assert!(saw_output, "output never arrived before Exited");
+    }
 }

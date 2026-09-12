@@ -177,6 +177,7 @@ dependencies = [
  "anyhow",
  "libghostty-vt",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
