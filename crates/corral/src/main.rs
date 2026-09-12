@@ -1,3 +1,113 @@
+mod input;
 mod render;
 
-fn main() {}
+use corral_core::tree::{PaneId, Rect};
+use corrald::protocol::{ClientMsg, ServerMsg};
+use std::io::Write;
+use std::os::unix::net::UnixStream;
+use std::time::Duration;
+
+const POLL: Duration = Duration::from_millis(16);
+
+fn socket_path() -> std::path::PathBuf {
+    // corrald owns this helper; the client mirrors the env-over-UID rule.
+    if let Ok(p) = std::env::var("CORRAL_SOCKET") {
+        return std::path::PathBuf::from(p);
+    }
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "0".into());
+    std::env::temp_dir().join(format!("corral-{uid}.sock"))
+}
+
+fn send_msg(stream: &mut UnixStream, msg: &ClientMsg) -> anyhow::Result<()> {
+    let mut line = serde_json::to_string(msg)?;
+    line.push('\n');
+    stream.write_all(line.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    let path = socket_path();
+    let stream = UnixStream::connect(&path)?;
+    stream.set_nonblocking(true)?;
+    let mut writer = stream.try_clone()?;
+
+    crossterm::terminal::enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    let _ = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen);
+    let result = run(stream, &mut writer);
+    let _ = crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen);
+    crossterm::terminal::disable_raw_mode()?;
+    result
+}
+
+fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
+    send_msg(writer, &ClientMsg::Attach)?;
+    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+    let mut terminal = ratatui::Terminal::new(backend)?;
+    let mut leader_armed = false;
+    let mut buf = String::new();
+    let mut panes: Vec<(PaneId, Rect, String)> = Vec::new();
+    let mut focused: PaneId = 0;
+    let mut reader = std::io::BufReader::new(stream);
+    loop {
+        // Drain socket lines (nonblocking): frames land in the pane state
+        // used by the draw below.
+        loop {
+            let mut chunk = String::new();
+            match std::io::BufRead::read_line(&mut reader, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => buf.push_str(&chunk),
+            }
+        }
+        while let Some(pos) = buf.find('\n') {
+            let line: String = buf.drain(..=pos).collect();
+            let Ok(msg) = serde_json::from_str::<ServerMsg>(line.trim()) else {
+                continue;
+            };
+            match msg {
+                ServerMsg::Frame {
+                    panes: p,
+                    focused: f,
+                } => {
+                    panes = p;
+                    focused = f;
+                }
+                ServerMsg::Exited { .. } => {}
+            }
+        }
+        if crossterm::event::poll(POLL)?
+            && let crossterm::event::Event::Key(ev) = crossterm::event::read()?
+        {
+            match input::handle(ev, &mut leader_armed) {
+                Some(input::Action::Quit) => break,
+                Some(input::Action::Focus(dir)) => {
+                    send_msg(writer, &ClientMsg::Focus { dir })?;
+                }
+                Some(input::Action::Split(_)) => {
+                    let cmd = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+                    let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+                    send_msg(
+                        writer,
+                        &ClientMsg::CreatePane {
+                            cmd,
+                            args: vec!["-l".into()],
+                            cwd,
+                        },
+                    )?;
+                }
+                Some(input::Action::Send(bytes)) => {
+                    send_msg(writer, &ClientMsg::Key { bytes })?;
+                }
+                None => {}
+            }
+        }
+        terminal.draw(|f| render::draw(f, &panes, focused))?;
+    }
+    Ok(())
+}
