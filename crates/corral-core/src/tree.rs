@@ -1,6 +1,6 @@
 pub type PaneId = u32;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Rect {
     pub x: u16,
     pub y: u16,
@@ -8,7 +8,7 @@ pub struct Rect {
     pub h: u16,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Dir {
     Horizontal,
     Vertical,

@@ -25,6 +25,12 @@ impl Emulator {
         self.terminal.vt_write(data);
     }
 
+    /// Resize the viewport; libghostty reflows the primary screen.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        self.terminal.resize(cols, rows, 0, 0)?;
+        Ok(())
+    }
+
     /// Current viewport as plain text, one line per row.
     pub fn screen_text(&mut self) -> Result<String> {
         let mut render_state = RenderState::new()?;
@@ -73,7 +79,16 @@ mod tests {
         let mut emu = Emulator::new(10, 4).unwrap();
         emu.feed(b"abcdefghijklmnop");
         let text = emu.screen_text().unwrap();
-        assert_eq!(text.lines().nth(0).unwrap(), "abcdefghij");
+        assert_eq!(text.lines().next().unwrap(), "abcdefghij");
         assert!(text.lines().nth(1).unwrap().starts_with("klmnop"));
+    }
+
+    #[test]
+    fn resize_reflows_wrapped_text() {
+        let mut emu = Emulator::new(10, 4).unwrap();
+        emu.feed(b"abcdefghijklmnop");
+        emu.resize(20, 4).unwrap();
+        let text = emu.screen_text().unwrap();
+        assert!(text.lines().next().unwrap().contains("abcdefghijklmnop"));
     }
 }
