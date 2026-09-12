@@ -4,15 +4,11 @@ use ratatui::Frame;
 use ratatui::layout::Rect as RRect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Padding, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
-// Consumed by paint_gutters and (later) the Task 7 event loop; dead in the
-// binary until main.rs wires the loop.
-#[allow(dead_code)]
+// The focused pane's surrounding gutter lights up so focus is visible.
 const FOCUSED_GUTTER: Color = Color::Indexed(245);
 
-// The event loop (plan Task 7) consumes draw; v0.1 ships the renderer first.
-#[allow(dead_code)]
 pub fn draw(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
     for PaneState {
         id: _,
@@ -28,16 +24,17 @@ pub fn draw(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
             height: rect.h,
         };
         let lines: Vec<Line> = text.lines().map(Line::from).collect();
-        let para = Paragraph::new(lines).block(Block::default().padding(Padding::new(1, 1, 0, 0)));
+        // No padding: the tree's 1-cell gutter is the whole separator; the
+        // old side padding doubled its visual width.
+        let para = Paragraph::new(lines);
         frame.render_widget(para, rr);
     }
     paint_gutters(frame, panes, focused);
 }
 
 // tree.rects leaves a 1-cell gutter between siblings that no pane rect
-// covers, so the plan's block-over-rect alone never highlights it. Paint
-// the gutter cell strip between the focused pane and each adjacent sibling.
-#[allow(dead_code)]
+// covers, so the block-over-rect alone never highlights it. Paint the
+// gutter cell strip between the focused pane and each adjacent sibling.
 fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
     let Some(fp) = panes.iter().find(|p| p.id == focused) else {
         return;
@@ -194,21 +191,22 @@ mod tests {
     }
 
     #[test]
-    fn text_keeps_one_cell_off_the_gutter_edge() {
-        // Left pane rect w 50: padding leaves column 49 empty, so the
-        // focused-gutter edge is never overwritten by text.
+    fn text_fills_the_rect_up_to_the_gutter_edge() {
+        // No padding: a full-width line runs to the rect's last column;
+        // the gutter itself (col 50 here) stays its own cell.
         let panes = vec![pane(1, 0, 0, 50, 10, &"x".repeat(50))];
         let buf = draw_at(101, 10, &panes, 1);
-        assert_eq!(buf[(49, 0)].symbol(), " ");
+        assert_eq!(buf[(49, 0)].symbol(), "x");
+        assert_eq!(buf[(50, 0)].symbol(), " ");
     }
 
     #[test]
     fn text_clips_at_the_rect_boundary() {
         let panes = vec![pane(7, 0, 0, 10, 3, "a-very-long-line-that-overflows")];
         let buf = draw_at(20, 5, &panes, 7);
-        // w 10 with 1-cell padding on each side fits 8 columns of text.
-        assert!(row(&buf, 0, 20).contains("a-very-l"));
-        assert!(!row(&buf, 0, 20).contains("a-very-lo"));
+        // w 10 with no padding fits 10 columns of text.
+        assert!(row(&buf, 0, 20).contains("a-very-lon"));
+        assert!(!row(&buf, 0, 20).contains("a-very-long"));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::protocol::{ClientMsg, PaneState, ServerMsg};
 use crate::pty::{PtyEvent, PtyHandle};
 use anyhow::Result;
 use corral_core::emulation::Emulator;
-use corral_core::tree::{Dir, Node, PaneId, Rect};
+use corral_core::tree::{Node, PaneId, Rect};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -79,6 +79,13 @@ impl Daemon {
                     continue;
                 };
                 self.handle(&msg)?;
+                // Focus, Resize, and CreatePane change layout or focus
+                // without touching pane output; the client must still see
+                // their effect. Key presses produce output that the drain
+                // sweep pushes, so they get no extra frame here.
+                if !matches!(msg, ClientMsg::Key { .. }) {
+                    self.push_frame(&mut writer)?;
+                }
             }
         }
         Ok(())
@@ -87,7 +94,12 @@ impl Daemon {
     fn handle(&mut self, msg: &ClientMsg) -> Result<()> {
         match msg {
             ClientMsg::Attach => {}
-            ClientMsg::CreatePane { cmd, args, cwd } => {
+            ClientMsg::CreatePane {
+                cmd,
+                args,
+                cwd,
+                dir,
+            } => {
                 let id = self.next_id;
                 self.next_id += 1;
                 let shell_args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -104,14 +116,13 @@ impl Daemon {
                 if self.ptys.len() == 1 {
                     self.root = Node::leaf(id);
                 } else {
-                    // Split the focused pane in place: vertical when it is
-                    // taller than wide, horizontal otherwise (plan geometry
-                    // rule). The new pane takes the sibling half.
-                    let dir = self.split_dir();
+                    // Split the focused pane in place along the direction
+                    // the client asked for (Ctrl+a s vertical, Ctrl+a v
+                    // horizontal). The new pane takes the sibling half.
                     let focused = Node::leaf(self.focused);
                     self.root.replace(
                         self.focused,
-                        Node::split(dir, 0.5, Box::new(focused), Box::new(Node::leaf(id))),
+                        Node::split(*dir, 0.5, Box::new(focused), Box::new(Node::leaf(id))),
                     );
                 }
                 self.focused = id;
@@ -142,18 +153,6 @@ impl Daemon {
             }
         }
         Ok(())
-    }
-
-    fn split_dir(&self) -> Dir {
-        let rects = self.rects();
-        let Some((_, rect)) = rects.iter().find(|(id, _)| *id == self.focused) else {
-            return Dir::Horizontal;
-        };
-        if rect.h > rect.w {
-            Dir::Vertical
-        } else {
-            Dir::Horizontal
-        }
     }
 
     fn rects(&self) -> Vec<(PaneId, Rect)> {
@@ -279,6 +278,7 @@ pub fn socket_path() -> PathBuf {
 mod tests {
     use super::*;
     use crate::protocol::{ClientMsg, ServerMsg};
+    use corral_core::tree::Dir;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
@@ -341,6 +341,7 @@ mod tests {
                 cmd: "sh".into(),
                 args: vec!["-c".into(), "printf hello".into()],
                 cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
             },
         );
         let mut reader = BufReader::new(client);
@@ -376,6 +377,7 @@ mod tests {
                     cmd: "sh".into(),
                     args: vec!["-c".into(), format!("printf {out}; sleep 2")],
                     cwd: "/tmp".into(),
+                    dir: Dir::Horizontal,
                 },
             );
         }
@@ -418,6 +420,7 @@ mod tests {
                     cmd: "sh".into(),
                     args: vec!["-c".into(), format!("printf {out}; sleep 2")],
                     cwd: "/tmp".into(),
+                    dir: Dir::Horizontal,
                 },
             );
         }
@@ -453,6 +456,58 @@ mod tests {
     }
 
     #[test]
+    fn focus_pushes_a_frame_even_when_panes_produce_no_output() {
+        // Regression: Focus (and Resize) change no pane output, and the
+        // daemon only pushed frames when output changed, so switching
+        // panes never reached the client. Quiet panes (sleep) must not
+        // swallow the frame.
+        let (sock, handle) = start_daemon("focus-quiet");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        for _ in ["a", "b"] {
+            send(
+                &mut client,
+                &ClientMsg::CreatePane {
+                    cmd: "sh".into(),
+                    args: vec!["-c".into(), "sleep 30".into()],
+                    cwd: "/tmp".into(),
+                    dir: Dir::Horizontal,
+                },
+            );
+        }
+        let mut reader = BufReader::new(client);
+        let frame = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.len() == 2,
+            _ => false,
+        })
+        .expect("two quiet panes must still produce a frame");
+        let ServerMsg::Frame {
+            focused: focused_before,
+            ..
+        } = frame
+        else {
+            unreachable!()
+        };
+        send(
+            reader.get_mut(),
+            &ClientMsg::Focus {
+                dir: Dir::Horizontal,
+            },
+        );
+        let frame = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { focused, .. } => *focused != focused_before,
+            _ => false,
+        })
+        .expect("focus change must push a frame for quiet panes");
+        let ServerMsg::Frame { focused, .. } = frame else {
+            unreachable!()
+        };
+        assert_ne!(focused, focused_before);
+        drop(reader);
+        let _ = handle.join();
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[test]
     fn resize_message_resizes_the_emulators() {
         let dir = std::env::temp_dir().join(format!("corral-test-resize-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -468,6 +523,7 @@ mod tests {
                 cmd: "sh".into(),
                 args: vec!["-c".into(), "printf hi".into()],
                 cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
             },
         );
         let mut reader = BufReader::new(client);
@@ -504,6 +560,7 @@ mod tests {
                 cmd: "sh".into(),
                 args: vec!["-c".into(), "printf bye".into()],
                 cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
             },
         );
         let mut reader = BufReader::new(client);
@@ -531,6 +588,7 @@ mod tests {
                     cmd: "sh".into(),
                     args: vec!["-c".into(), format!("printf {out}; cat")],
                     cwd: "/tmp".into(),
+                    dir: Dir::Horizontal,
                 },
             );
         }
@@ -573,6 +631,7 @@ mod tests {
                     cmd: "sh".into(),
                     args: vec!["-c".into(), format!("printf {out}")],
                     cwd: "/tmp".into(),
+                    dir: Dir::Horizontal,
                 },
             );
         }
@@ -604,6 +663,7 @@ mod tests {
                 cmd: "sh".into(),
                 args: vec!["-c".into(), "printf fine".into()],
                 cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
             },
         );
         let mut reader = BufReader::new(client);
@@ -631,6 +691,7 @@ mod tests {
                         format!("while :; do printf {out}; sleep 1; done"),
                     ],
                     cwd: "/tmp".into(),
+                    dir: Dir::Horizontal,
                 },
             );
         }
@@ -701,6 +762,7 @@ mod tests {
                 cmd: "sh".into(),
                 args: vec!["-c".into(), "printf one; cat".into()],
                 cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
             },
         );
         let mut reader = BufReader::new(client.try_clone().unwrap());
@@ -714,6 +776,7 @@ mod tests {
                 cmd: "sh".into(),
                 args: vec!["-c".into(), "printf two; cat".into()],
                 cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
             },
         );
         let frame = wait_for_msg(&mut reader, |m| match m {
@@ -744,6 +807,68 @@ mod tests {
     }
 
     #[test]
+    fn vertical_split_request_splits_top_bottom() {
+        // The client's s key asks for Vertical; the daemon must honor the
+        // requested direction, not pick one from pane geometry.
+        let (_sock, handle) = start_daemon("vsplit");
+        let mut client = UnixStream::connect(&_sock).unwrap();
+        send(&mut client, &ClientMsg::Attach);
+        send(
+            &mut client,
+            &ClientMsg::Resize {
+                cols: 100,
+                rows: 40,
+            },
+        );
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "printf one; cat".into()],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        wait_for_msg(&mut reader, |m| {
+            matches!(m, ServerMsg::Frame { panes, .. } if panes.iter().any(|p| p.text.contains("one")))
+        })
+        .expect("first pane");
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "printf two; cat".into()],
+                cwd: "/tmp".into(),
+                dir: Dir::Vertical,
+            },
+        );
+        let frame = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => {
+                panes.len() == 2 && panes.iter().any(|p| p.text.contains("two"))
+            }
+            _ => false,
+        })
+        .expect("vertical split frame");
+        let ServerMsg::Frame { panes, .. } = frame else {
+            unreachable!()
+        };
+        assert_eq!(panes.len(), 2);
+        // Vertical: each half is about 20 tall of 40, full 100 wide.
+        for p in &panes {
+            assert!(
+                p.rect.h <= 21 && p.rect.h >= 19,
+                "vertical split rect {:?} should be half of 40 tall",
+                p.rect
+            );
+            assert_eq!(p.rect.w, 100, "vertical split keeps full width");
+        }
+        drop(reader);
+        drop(client);
+        let _ = handle.join();
+    }
+
+    #[test]
     fn client_disconnect_is_a_clean_exit_not_a_broken_pipe_error() {
         // The daemon pushes frames every sweep; when the client vanishes
         // mid-frame, the write fails with BrokenPipe. serve must return
@@ -759,6 +884,7 @@ mod tests {
                 cmd: "sh".into(),
                 args: vec!["-c".into(), "while :; do printf x; sleep 1; done".into()],
                 cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
             },
         );
         // Give the daemon time to enter its push loop, then vanish.
@@ -789,6 +915,7 @@ mod tests {
                 cmd: "sh".into(),
                 args: vec!["-c".into(), "printf later".into()],
                 cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
             },
         );
         let mut reader = BufReader::new(client);
@@ -814,6 +941,7 @@ mod tests {
                 cmd: "sh".into(),
                 args: vec!["-c".into(), "printf solo; sleep 2".into()],
                 cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
             },
         );
         let mut reader = BufReader::new(client);

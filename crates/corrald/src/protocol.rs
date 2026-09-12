@@ -8,6 +8,7 @@ pub enum ClientMsg {
         cmd: String,
         args: Vec<String>,
         cwd: String,
+        dir: Dir,
     },
     Key {
         bytes: Vec<u8>,
@@ -56,6 +57,7 @@ mod tests {
                 cmd: "sh".into(),
                 args: vec!["-c".into(), "printf hello".into()],
                 cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
             },
             ClientMsg::Key {
                 bytes: vec![b'x', 0x0d],
@@ -114,6 +116,7 @@ mod tests {
             cmd: "/bin/sh".into(),
             args: vec![],
             cwd: String::new(),
+            dir: Dir::Vertical,
         };
         let line = serde_json::to_string(&msg).unwrap();
         let back: ClientMsg = serde_json::from_str(&line).unwrap();

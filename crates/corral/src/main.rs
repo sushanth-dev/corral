@@ -70,6 +70,8 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
             cmd: shell,
             args,
             cwd,
+            // The first pane fills the screen; the direction is unused.
+            dir: corral_core::tree::Dir::Horizontal,
         },
     )?;
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
@@ -113,10 +115,18 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 Some(input::Action::Focus(dir)) => {
                     send_msg(writer, &ClientMsg::Focus { dir })?;
                 }
-                Some(input::Action::Split(_)) => {
+                Some(input::Action::Split(dir)) => {
                     let (cmd, args) = pane_command();
                     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
-                    send_msg(writer, &ClientMsg::CreatePane { cmd, args, cwd })?;
+                    send_msg(
+                        writer,
+                        &ClientMsg::CreatePane {
+                            cmd,
+                            args,
+                            cwd,
+                            dir,
+                        },
+                    )?;
                 }
                 Some(input::Action::Send(bytes)) => {
                     send_msg(writer, &ClientMsg::Key { bytes })?;
@@ -124,18 +134,21 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 None => {}
             }
         }
-        terminal.draw(|f| render::draw(f, &panes, focused))?;
-        // Show the real cursor at the focused pane's position; ratatui
-        // hides it otherwise. Full-screen programs manage their own.
-        if let Some(p) = panes.iter().find(|p| p.id == focused)
-            && let Some((cx, cy)) = p.cursor
-        {
-            let (x, y) = (p.rect.x + cx, p.rect.y + cy);
-            if x < p.rect.x + p.rect.w && y < p.rect.y + p.rect.h {
-                terminal.show_cursor()?;
-                terminal.set_cursor_position(ratatui::layout::Position::new(x, y))?;
+        terminal.draw(|f| {
+            render::draw(f, &panes, focused);
+            // Position the real cursor inside the frame; set_cursor_position
+            // inside draw only emits escape bytes when the position changes,
+            // so the terminal keeps its natural blink cadence. Full-screen
+            // programs manage their own cursor.
+            if let Some(p) = panes.iter().find(|p| p.id == focused)
+                && let Some((cx, cy)) = p.cursor
+            {
+                let (x, y) = (p.rect.x + cx, p.rect.y + cy);
+                if x < p.rect.x + p.rect.w && y < p.rect.y + p.rect.h {
+                    f.set_cursor_position(ratatui::layout::Position::new(x, y));
+                }
             }
-        }
+        })?;
     }
     Ok(())
 }

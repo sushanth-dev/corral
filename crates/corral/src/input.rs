@@ -4,11 +4,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 #[derive(Debug)]
 pub enum Action {
     Focus(Dir),
-    // The plan's keymap distinguishes s (vertical) from v (horizontal);
-    // the daemon applies its own geometry rule on CreatePane, so the
-    // direction is carried but unused by main until per-direction splits
-    // land in v0.2.
-    Split(#[allow(dead_code)] Dir),
+    // s splits vertically, v horizontally; the daemon splits the focused
+    // pane along the requested direction.
+    Split(Dir),
     Quit,
     Send(Vec<u8>),
 }
@@ -37,8 +35,12 @@ pub fn handle(ev: KeyEvent, armed: &mut bool) -> Option<Action> {
         }
         (KeyCode::Enter, _) => Some(Action::Send(b"\r".to_vec())),
         (KeyCode::Backspace, _) => Some(Action::Send(b"\x7f".to_vec())),
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Action::Send(b"\x03".to_vec())),
-        (KeyCode::Char('d'), KeyModifiers::CONTROL) => Some(Action::Send(b"\x04".to_vec())),
+        // Ctrl+letter forwards as the 0x01..=0x1a control byte so shell
+        // bindings (Ctrl+u, Ctrl+e, Ctrl+w, ...) work inside panes; only
+        // the leader itself is reserved.
+        (KeyCode::Char(c), KeyModifiers::CONTROL) if c.is_ascii_lowercase() && c != 'a' => {
+            Some(Action::Send(vec![c as u8 - b'a' + 1]))
+        }
         _ => None,
     }
 }
@@ -137,6 +139,27 @@ mod tests {
             handle(key(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut armed),
             Some(Action::Send(b)) if b == b"\x04"
         ));
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_e_forward_as_control_bytes() {
+        let mut armed = false;
+        assert!(matches!(
+            handle(key(KeyCode::Char('u'), KeyModifiers::CONTROL), &mut armed),
+            Some(Action::Send(b)) if b == b"\x15"
+        ));
+        assert!(matches!(
+            handle(key(KeyCode::Char('e'), KeyModifiers::CONTROL), &mut armed),
+            Some(Action::Send(b)) if b == b"\x05"
+        ));
+        // Every lowercase Ctrl+letter maps to its 0x01..=0x1a byte.
+        for c in b'b'..=b'z' {
+            let byte = c - b'a' + 1;
+            assert!(matches!(
+                handle(key(KeyCode::Char(c as char), KeyModifiers::CONTROL), &mut armed),
+                Some(Action::Send(b)) if b == vec![byte]
+            ));
+        }
     }
 
     #[test]
