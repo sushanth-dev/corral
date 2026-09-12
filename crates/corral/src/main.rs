@@ -1,3 +1,4 @@
+mod benchmark;
 mod input;
 mod render;
 
