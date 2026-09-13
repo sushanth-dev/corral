@@ -3,7 +3,7 @@ use corrald::protocol::PaneState;
 use ratatui::Frame;
 use ratatui::layout::Rect as RRect;
 use ratatui::style::{Color, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 // Gutters between panes render as thin line characters. Adjacent to the
@@ -11,7 +11,15 @@ use ratatui::widgets::Paragraph;
 const GUTTER: Color = Color::Indexed(238);
 const FOCUSED_GUTTER: Color = Color::Indexed(245);
 
-pub fn draw(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hint {
+    None,
+    /// Copy mode active; carries the focused pane's viewport position
+    /// (`None` while pinned to the bottom).
+    Copy(Option<(usize, usize)>),
+}
+
+pub fn draw(frame: &mut Frame, panes: &[PaneState], focused: PaneId, hint: Hint) {
     for PaneState {
         id: _, rect, text, ..
     } in panes
@@ -28,6 +36,37 @@ pub fn draw(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
         frame.render_widget(para, rr);
     }
     paint_gutters(frame, panes, focused);
+    if hint != Hint::None {
+        draw_hint(frame, hint);
+    }
+}
+
+// One status row on the last screen line, over everything else. Shows
+// the active mode and, in copy mode, the scroll position when the
+// viewport is off the bottom.
+fn draw_hint(frame: &mut Frame, hint: Hint) {
+    let area = frame.area();
+    let row = area.height.saturating_sub(1);
+    let text = match hint {
+        Hint::None => return,
+        Hint::Copy(None) => " copy mode ".to_string(),
+        Hint::Copy(Some((offset, total))) => {
+            format!(" copy mode {offset}/{total} ")
+        }
+    };
+    let style = Style::new().fg(Color::Black).bg(Color::Indexed(245));
+    let width = text.len() as u16;
+    let line = Line::from(vec![Span::styled(text, style)]);
+    let para = Paragraph::new(line);
+    frame.render_widget(
+        para,
+        RRect {
+            x: 0,
+            y: row,
+            width,
+            height: 1,
+        },
+    );
 }
 
 // tree.rects leaves a 1-cell gutter between siblings that no pane rect
@@ -115,7 +154,7 @@ mod tests {
     ) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, panes, focused)).unwrap();
+        term.draw(|f| draw(f, panes, focused, Hint::None)).unwrap();
         term.backend().buffer().clone()
     }
 
@@ -222,5 +261,30 @@ mod tests {
             assert_eq!(buf[(50, y)].symbol(), "│");
             assert_eq!(buf[(50, y)].fg, ratatui::style::Color::Indexed(245));
         }
+    }
+
+    #[test]
+    fn copy_mode_hint_renders_on_the_last_row() {
+        let panes = panes();
+        let backend = TestBackend::new(101, 10);
+        let mut term = TuiTerminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &panes, 1, Hint::Copy(Some((12, 96)))))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(row(&buf, 9, 101).contains("copy mode"));
+        assert!(row(&buf, 9, 101).contains("12/96"));
+        // Content rows stay untouched.
+        assert!(row(&buf, 0, 101).contains("pane-one"));
+    }
+
+    #[test]
+    fn copy_mode_hint_without_position_shows_mode_only() {
+        let panes = panes();
+        let backend = TestBackend::new(101, 10);
+        let mut term = TuiTerminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &panes, 1, Hint::Copy(None))).unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(row(&buf, 9, 101).contains("copy mode"));
+        assert!(!row(&buf, 9, 101).contains("/"));
     }
 }

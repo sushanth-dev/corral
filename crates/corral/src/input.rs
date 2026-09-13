@@ -1,7 +1,17 @@
 use corral_core::tree::Dir;
+use corrald::protocol::ScrollTarget;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-#[derive(Debug)]
+/// Client input mode. Copy mode (Ctrl+a [) routes keys to scrollback
+/// navigation and swallows everything else; nothing binds a bare key in
+/// input mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Input,
+    Copy,
+}
+
+#[derive(Debug, PartialEq)]
 pub enum Action {
     Focus(Dir),
     // s splits vertically, v horizontally; the daemon splits the focused
@@ -9,13 +19,44 @@ pub enum Action {
     Split(Dir),
     Quit,
     Send(Vec<u8>),
+    EnterCopy,
+    CopyScroll(ScrollTarget),
+    ExitCopy,
 }
 
-// The Ctrl+a leader is the only key corral consumes. Everything else
-// forwards to the focused pane exactly as a plain terminal would deliver
-// it: control bytes, escape sequences, modifier chords and all.
+// The Ctrl+a leader is the only key corral consumes in input mode. In
+// copy mode every key is consumed: vi keys scroll, everything else does
+// nothing, and no byte ever reaches the pane. `half_page` is the pane
+// height for Ctrl+d/Ctrl+u; it only matters in copy mode.
 
-pub fn handle(ev: KeyEvent, armed: &mut bool, app_cursor: bool) -> Option<Action> {
+pub fn handle(
+    ev: KeyEvent,
+    armed: &mut bool,
+    mode: &Mode,
+    app_cursor: bool,
+    half_page: u16,
+) -> Option<Action> {
+    if *mode == Mode::Copy {
+        return match (ev.code, ev.modifiers) {
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
+                Some(Action::CopyScroll(ScrollTarget::Delta(-1)))
+            }
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
+                Some(Action::CopyScroll(ScrollTarget::Delta(1)))
+            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => Some(Action::CopyScroll(
+                ScrollTarget::Delta(-(half_page as isize)),
+            )),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                Some(Action::CopyScroll(ScrollTarget::Delta(half_page as isize)))
+            }
+            (KeyCode::Char('g'), _) => Some(Action::CopyScroll(ScrollTarget::Top)),
+            (KeyCode::Char('G'), _) => Some(Action::CopyScroll(ScrollTarget::Bottom)),
+            (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => Some(Action::ExitCopy),
+            // Typing, the leader, focus keys: swallowed, never forwarded.
+            _ => None,
+        };
+    }
     if *armed {
         *armed = false;
         return match (ev.code, ev.modifiers) {
@@ -27,6 +68,7 @@ pub fn handle(ev: KeyEvent, armed: &mut bool, app_cursor: bool) -> Option<Action
             (KeyCode::Char('k'), _) => Some(Action::Focus(Dir::Vertical)),
             (KeyCode::Char('s'), _) => Some(Action::Split(Dir::Vertical)),
             (KeyCode::Char('v'), _) => Some(Action::Split(Dir::Horizontal)),
+            (KeyCode::Char('['), _) => Some(Action::EnterCopy),
             (KeyCode::Char('d'), _) => Some(Action::Quit),
             _ => None,
         };
@@ -159,10 +201,23 @@ mod tests {
 
     fn sent_ac(code: KeyCode, mods: KeyModifiers, app_cursor: bool) -> Vec<u8> {
         let mut armed = false;
-        match handle(key(code, mods), &mut armed, app_cursor) {
+        match handle(key(code, mods), &mut armed, &Mode::Input, app_cursor, 0) {
             Some(Action::Send(b)) => b,
             other => panic!("{code:?} {mods:?} produced {other:?}, expected Send"),
         }
+    }
+
+    /// Arms the leader then presses `code` in input mode.
+    fn leader_then(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
+        let mut armed = false;
+        handle(
+            key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut armed,
+            &Mode::Input,
+            false,
+            0,
+        );
+        handle(key(code, mods), &mut armed, &Mode::Input, false, 0)
     }
 
     #[test]
@@ -172,7 +227,9 @@ mod tests {
             handle(
                 key(KeyCode::Char('a'), KeyModifiers::CONTROL),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             )
             .is_none()
         );
@@ -181,7 +238,9 @@ mod tests {
             handle(
                 key(KeyCode::Char('h'), KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             ),
             Some(Action::Focus(Dir::Horizontal))
         ));
@@ -194,39 +253,51 @@ mod tests {
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(matches!(
             handle(
                 key(KeyCode::Char('j'), KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             ),
             Some(Action::Focus(Dir::Vertical))
         ));
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(matches!(
             handle(
                 key(KeyCode::Char('v'), KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             ),
             Some(Action::Split(Dir::Horizontal))
         ));
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(matches!(
             handle(
                 key(KeyCode::Char('s'), KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             ),
             Some(Action::Split(Dir::Vertical))
         ));
@@ -238,13 +309,17 @@ mod tests {
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(matches!(
             handle(
                 key(KeyCode::Char('d'), KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             ),
             Some(Action::Quit)
         ));
@@ -255,7 +330,7 @@ mod tests {
     fn plain_typing_sends_bytes_and_is_not_eaten() {
         let mut armed = false;
         assert!(matches!(
-            handle(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut armed, false),
+            handle(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut armed, &Mode::Input, false, 0),
             Some(Action::Send(b)) if b == b"x"
         ));
         assert!(!armed);
@@ -267,13 +342,17 @@ mod tests {
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(
             handle(
                 key(KeyCode::Char('z'), KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             )
             .is_none()
         );
@@ -323,11 +402,13 @@ mod tests {
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(armed);
         assert!(matches!(
-            handle(key(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut armed, false),
+            handle(key(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut armed, &Mode::Input, false, 0),
             Some(Action::Send(b)) if b == vec![0x01]
         ));
         assert!(!armed);
@@ -335,14 +416,18 @@ mod tests {
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(armed);
         assert!(matches!(
             handle(
                 key(KeyCode::Char('d'), KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             ),
             Some(Action::Quit)
         ));
@@ -471,11 +556,22 @@ mod tests {
             handle(
                 key(KeyCode::CapsLock, KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             )
             .is_none()
         );
-        assert!(handle(key(KeyCode::F(13), KeyModifiers::NONE), &mut armed, false).is_none());
+        assert!(
+            handle(
+                key(KeyCode::F(13), KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Input,
+                false,
+                0
+            )
+            .is_none()
+        );
         assert!(!armed);
     }
 
@@ -509,10 +605,18 @@ mod tests {
             handle(
                 key(KeyCode::Char('a'), KeyModifiers::CONTROL),
                 &mut armed,
+                &Mode::Input,
                 false,
+                0,
             );
-            let action = handle(key(code, KeyModifiers::NONE), &mut armed, false)
-                .unwrap_or_else(|| panic!("{code:?} produced no action"));
+            let action = handle(
+                key(code, KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Input,
+                false,
+                0,
+            )
+            .unwrap_or_else(|| panic!("{code:?} produced no action"));
             assert!(check(&action), "{code:?} produced {action:?}");
             assert!(!armed, "{code:?} left the leader armed");
         }
@@ -526,17 +630,149 @@ mod tests {
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(
             handle(
                 key(KeyCode::Char('H'), KeyModifiers::SHIFT),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             )
             .is_none(),
             "uppercase H must not focus or send"
         );
         assert!(!armed);
+    }
+
+    fn copy_action(code: KeyCode, mods: KeyModifiers) -> Action {
+        let mut armed = false;
+        handle(key(code, mods), &mut armed, &Mode::Copy, false, 12)
+            .unwrap_or_else(|| panic!("{code:?} {mods:?} produced no action in copy mode"))
+    }
+
+    #[test]
+    fn leader_bracket_enters_copy_mode_from_input() {
+        assert!(matches!(
+            leader_then(KeyCode::Char('['), KeyModifiers::NONE),
+            Some(Action::EnterCopy)
+        ));
+    }
+
+    #[test]
+    fn copy_mode_j_and_k_scroll_one_line() {
+        assert_eq!(
+            copy_action(KeyCode::Char('j'), KeyModifiers::NONE),
+            Action::CopyScroll(ScrollTarget::Delta(-1))
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('k'), KeyModifiers::NONE),
+            Action::CopyScroll(ScrollTarget::Delta(1))
+        );
+    }
+
+    #[test]
+    fn copy_mode_arrows_scroll_like_jk() {
+        assert_eq!(
+            copy_action(KeyCode::Down, KeyModifiers::NONE),
+            Action::CopyScroll(ScrollTarget::Delta(-1))
+        );
+        assert_eq!(
+            copy_action(KeyCode::Up, KeyModifiers::NONE),
+            Action::CopyScroll(ScrollTarget::Delta(1))
+        );
+    }
+
+    #[test]
+    fn copy_mode_ctrl_d_u_scroll_half_the_pane() {
+        assert_eq!(
+            copy_action(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            Action::CopyScroll(ScrollTarget::Delta(-12))
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            Action::CopyScroll(ScrollTarget::Delta(12))
+        );
+    }
+
+    #[test]
+    fn copy_mode_g_and_g_jump_to_top_and_bottom() {
+        assert_eq!(
+            copy_action(KeyCode::Char('g'), KeyModifiers::NONE),
+            Action::CopyScroll(ScrollTarget::Top)
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('G'), KeyModifiers::NONE),
+            Action::CopyScroll(ScrollTarget::Bottom)
+        );
+    }
+
+    #[test]
+    fn copy_mode_q_and_esc_exit() {
+        let mut armed = false;
+        assert!(matches!(
+            handle(
+                key(KeyCode::Char('q'), KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            ),
+            Some(Action::ExitCopy)
+        ));
+        assert!(matches!(
+            handle(
+                key(KeyCode::Esc, KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            ),
+            Some(Action::ExitCopy)
+        ));
+    }
+
+    #[test]
+    fn copy_mode_swallows_typing_and_focus_keys() {
+        for (code, mods) in [
+            (KeyCode::Char('x'), KeyModifiers::NONE),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL),
+            (KeyCode::Char('h'), KeyModifiers::NONE),
+            (KeyCode::Char('s'), KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::NONE),
+        ] {
+            let mut armed = false;
+            let got = handle(key(code, mods), &mut armed, &Mode::Copy, false, 0);
+            assert!(
+                !matches!(got, Some(Action::Send(_))),
+                "{code:?} leaked bytes to the pane in copy mode: {got:?}"
+            );
+            assert!(
+                !matches!(got, Some(Action::Focus(_)) | Some(Action::Split(_))),
+                "{code:?} changed layout in copy mode: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_mode_swallows_the_leader_itself() {
+        // Ctrl+a in copy mode must arm nothing and send nothing: the
+        // leader is inactive while navigating scrollback.
+        let mut armed = false;
+        assert!(
+            handle(
+                key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            )
+            .is_none()
+        );
+        assert!(!armed, "copy mode armed the leader");
     }
 }

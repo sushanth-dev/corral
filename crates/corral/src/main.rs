@@ -76,6 +76,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     )?;
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
+    let mut mode = input::Mode::Input;
     let mut leader_armed = false;
     let mut buf = String::new();
     let mut panes: Vec<PaneState> = Vec::new();
@@ -83,7 +84,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     // Ratatui emits show-cursor plus a cursor move on every draw, and a
     // cursor move resets the terminal's blink timer. Redrawing only when
     // a frame actually differs keeps the blink alive while idle.
-    let mut last_drawn: Option<(Vec<PaneState>, PaneId)> = None;
+    let mut last_drawn: Option<(Vec<PaneState>, PaneId, bool)> = None;
     let mut reader = std::io::BufReader::new(stream);
     loop {
         // Drain socket lines (nonblocking): frames land in the pane state
@@ -111,16 +112,28 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 ServerMsg::Exited { .. } => {}
             }
         }
-        let app_cursor = panes
-            .iter()
-            .find(|p| p.id == focused)
-            .map(|p| p.app_cursor)
-            .unwrap_or(false);
+        let focused_pane = panes.iter().find(|p| p.id == focused);
+        let app_cursor = focused_pane.map(|p| p.app_cursor).unwrap_or(false);
+        let half_page = focused_pane.map(|p| p.rect.h / 2).unwrap_or(0);
         if crossterm::event::poll(POLL)?
             && let crossterm::event::Event::Key(ev) = crossterm::event::read()?
         {
-            match input::handle(ev, &mut leader_armed, app_cursor) {
+            match input::handle(ev, &mut leader_armed, &mode, app_cursor, half_page) {
                 Some(input::Action::Quit) => break,
+                Some(input::Action::EnterCopy) => mode = input::Mode::Copy,
+                Some(input::Action::ExitCopy) => {
+                    mode = input::Mode::Input;
+                    // Leaving copy mode restores live follow at the bottom.
+                    send_msg(
+                        writer,
+                        &ClientMsg::Scroll {
+                            target: corrald::protocol::ScrollTarget::Bottom,
+                        },
+                    )?;
+                }
+                Some(input::Action::CopyScroll(target)) => {
+                    send_msg(writer, &ClientMsg::Scroll { target })?;
+                }
                 Some(input::Action::Focus(dir)) => {
                     send_msg(writer, &ClientMsg::Focus { dir })?;
                 }
@@ -143,11 +156,20 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 None => {}
             }
         }
-        let frame_changed = last_drawn.as_ref() != Some(&(panes.clone(), focused));
+        let hint = match mode {
+            input::Mode::Input => render::Hint::None,
+            input::Mode::Copy => render::Hint::Copy(
+                focused_pane
+                    .and_then(|p| p.scroll)
+                    .map(|s| (s.offset, s.total)),
+            ),
+        };
+        let frame_changed =
+            last_drawn.as_ref() != Some(&(panes.clone(), focused, hint != render::Hint::None));
         if frame_changed {
-            last_drawn = Some((panes.clone(), focused));
+            last_drawn = Some((panes.clone(), focused, hint != render::Hint::None));
             terminal.draw(|f| {
-                render::draw(f, &panes, focused);
+                render::draw(f, &panes, focused, hint);
                 // Position the real cursor inside the frame. Full-screen
                 // programs manage their own cursor.
                 if let Some(p) = panes.iter().find(|p| p.id == focused)
