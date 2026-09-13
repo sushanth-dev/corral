@@ -189,6 +189,16 @@ impl Daemon {
                     p.send(PaneCmd::DumpScrollback)?;
                 }
             }
+            ClientMsg::PromptJump { up } => {
+                if let Some(pane) = self.panes.get(&self.focused) {
+                    pane.send(PaneCmd::PromptJump { up: *up })?;
+                }
+            }
+            ClientMsg::YankCommand { anchor } => {
+                if let Some(pane) = self.panes.get(&self.focused) {
+                    pane.send(PaneCmd::YankCommand { anchor: *anchor })?;
+                }
+            }
         }
         Ok(())
     }
@@ -1288,6 +1298,96 @@ mod tests {
         );
         assert_eq!(lines.first().copied(), Some("1"), "dump starts at line 1");
         assert_eq!(lines.last().copied(), Some("60"), "dump ends at line 60");
+        drop(reader);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn prompt_jump_scrolls_between_osc133_prompts() {
+        let (sock, handle) = start_daemon("promptjump");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        // Three literal OSC133 A markers over a 60-line pane. `sh` does
+        // not emit these itself; fish would (plan Task S3-8 guardrail).
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf '\\033]133;A\\033\\\\'; echo prompt one; seq 1 20; printf '\\033]133;A\\033\\\\'; echo prompt two; seq 21 40; printf '\\033]133;A\\033\\\\'; echo prompt three; seq 41 100; sleep 30".into(),
+                ],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut reader = BufReader::new(client);
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.text.contains("100") && p.scroll.is_none()),
+            _ => false,
+        })
+        .expect("bottom frame showing line 100 within 5s");
+
+        // Up jumps to the previous prompt row. From the bottom the first
+        // up-jump reaches the bottom-most prompt (three); walking up
+        // again reaches two, then one.
+        send(reader.get_mut(), &ClientMsg::PromptJump { up: true });
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.scroll.is_some() && p.text.contains("prompt three")),
+            _ => false,
+        })
+        .expect("frame showing prompt three after up-jump within 5s");
+
+        send(reader.get_mut(), &ClientMsg::PromptJump { up: true });
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.scroll.is_some() && p.text.contains("prompt two")),
+            _ => false,
+        })
+        .expect("frame showing prompt two after second up-jump within 5s");
+
+        send(reader.get_mut(), &ClientMsg::PromptJump { up: true });
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.scroll.is_some() && p.text.contains("prompt one")),
+            _ => false,
+        })
+        .expect("frame showing prompt one after third up-jump within 5s");
+
+        // Down returns to the next prompt.
+        send(reader.get_mut(), &ClientMsg::PromptJump { up: false });
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.scroll.is_some() && p.text.contains("prompt two")),
+            _ => false,
+        })
+        .expect("frame showing prompt two after down-jump within 5s");
+
+        // `c` yanks the current command's block: from the bottom, the
+        // third prompt through its last output row.
+        send(reader.get_mut(), &ClientMsg::YankCommand { anchor: None });
+        let yank = wait_for_msg(&mut reader, |m| {
+            matches!(m, ServerMsg::ScrollbackDump { .. })
+        })
+        .expect("ScrollbackDump for yank within 5s");
+        let ServerMsg::ScrollbackDump { text, .. } = yank else {
+            unreachable!()
+        };
+        assert!(text.contains("prompt three"), "got {text:?}");
+        assert!(
+            text.contains("100"),
+            "last output row in the block, got {text:?}"
+        );
+        assert!(
+            !text.contains("prompt two") && !text.contains("prompt one"),
+            "block stops at the next prompt, got {text:?}"
+        );
         drop(reader);
         let _ = handle.join();
     }

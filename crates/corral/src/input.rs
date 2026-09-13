@@ -56,6 +56,12 @@ pub enum Action {
     ClearHistory,
     /// Leader `e`: open the focused pane's scrollback in an editor.
     EditScrollback,
+    /// `{` in copy mode: jump to the previous prompt row.
+    PromptPrev,
+    /// `}` in copy mode: jump to the next prompt row.
+    PromptNext,
+    /// `c` in copy mode: yank the current command's output.
+    YankCommand,
 }
 
 // The Ctrl+a leader is the only key corral consumes in input mode. In
@@ -98,6 +104,9 @@ pub fn handle(
             (KeyCode::Char('/'), _) => Some(Action::BeginSearch),
             (KeyCode::Char('n'), _) => Some(Action::SearchNext),
             (KeyCode::Char('N'), _) => Some(Action::SearchPrev),
+            (KeyCode::Char('{'), _) => Some(Action::PromptPrev),
+            (KeyCode::Char('}'), _) => Some(Action::PromptNext),
+            (KeyCode::Char('c'), _) => Some(Action::YankCommand),
             (KeyCode::Char('v'), _) => Some(Action::BeginSelect(SelectMode::Span)),
             (KeyCode::Char('V'), _) => Some(Action::BeginSelect(SelectMode::Rect)),
             (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => Some(Action::ExitCopy),
@@ -947,6 +956,22 @@ mod tests {
         assert_eq!(
             copy_action(KeyCode::Char('N'), KeyModifiers::NONE),
             Action::SearchPrev
+        );
+    }
+
+    #[test]
+    fn copy_mode_braces_jump_prompts_and_c_yanks() {
+        assert_eq!(
+            copy_action(KeyCode::Char('{'), KeyModifiers::NONE),
+            Action::PromptPrev
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('}'), KeyModifiers::NONE),
+            Action::PromptNext
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('c'), KeyModifiers::NONE),
+            Action::YankCommand
         );
     }
 

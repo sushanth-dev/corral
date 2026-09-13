@@ -48,6 +48,18 @@ pub enum ClientMsg {
     DumpScrollback {
         pane: Option<PaneId>,
     },
+    /// Scroll the focused pane's viewport to the previous (up) or next
+    /// (down) OSC133 prompt row (S3-8).
+    PromptJump {
+        up: bool,
+    },
+    /// Extract the current command's output (S3-8): from the prompt row
+    /// above `anchor` (a screen-space row; `None` pins to the bottom) to
+    /// the row before the next prompt. The text rides back on
+    /// ServerMsg::ScrollbackDump.
+    YankCommand {
+        anchor: Option<usize>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -145,6 +157,10 @@ mod tests {
             ClientMsg::ClearHistory,
             ClientMsg::DumpScrollback { pane: None },
             ClientMsg::DumpScrollback { pane: Some(3) },
+            ClientMsg::PromptJump { up: true },
+            ClientMsg::PromptJump { up: false },
+            ClientMsg::YankCommand { anchor: None },
+            ClientMsg::YankCommand { anchor: Some(7) },
         ];
         for msg in msgs {
             let line = serde_json::to_string(&msg).unwrap();

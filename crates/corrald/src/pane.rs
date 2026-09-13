@@ -33,6 +33,12 @@ pub enum PaneCmd {
     /// Produce the pane's full scrollback text (S3-7); the reply rides
     /// PaneOut as a ScrollbackDump the daemon core forwards to the client.
     DumpScrollback,
+    /// Jump the viewport to the previous (up) or next (down) OSC133
+    /// prompt row (S3-8).
+    PromptJump { up: bool },
+    /// Extract the command block ending at or before `anchor` (S3-8);
+    /// the reply rides PaneOut as a ScrollbackDump.
+    YankCommand { anchor: Option<usize> },
     /// Rebuild and resend the snapshot even if nothing changed.
     #[allow(dead_code)]
     Render,
@@ -146,6 +152,29 @@ fn run_worker(
                 }
                 PaneCmd::DumpScrollback => {
                     let text = emu.dump_scrollback().unwrap_or_default();
+                    let _ = out.send(PaneOut::ScrollbackDump { pane: id, text });
+                }
+                PaneCmd::PromptJump { up } => {
+                    let prompts = emu.prompt_rows().unwrap_or_default();
+                    let from = emu.scroll_position().unwrap_or(None).map(|p| p.offset);
+                    let target = if up {
+                        prompts.iter().rev().find(|&&r| from.is_none_or(|o| r < o))
+                    } else {
+                        prompts.iter().find(|&&r| from.is_some_and(|o| r > o))
+                    };
+                    if let Some(&row) = target {
+                        emu.scroll(ScrollTarget::Row(row));
+                    } else if up {
+                        // No prompt above: pin to the top like tmux.
+                        emu.scroll(ScrollTarget::Top);
+                    } else {
+                        // No prompt below: back to the bottom (live).
+                        emu.scroll(ScrollTarget::Bottom);
+                    }
+                    push_snapshot(id, &mut emu, cols, rows, &out);
+                }
+                PaneCmd::YankCommand { anchor } => {
+                    let text = emu.command_text(anchor).unwrap_or_default();
                     let _ = out.send(PaneOut::ScrollbackDump { pane: id, text });
                 }
                 PaneCmd::Render => {

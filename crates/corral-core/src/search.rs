@@ -62,6 +62,50 @@ impl Emulator {
         Ok(out)
     }
 
+    /// Screen-space rows whose semantic prompt state is `Prompt` (S3-8).
+    /// Shell-integrated shells emit OSC 133 A at each prompt; rows
+    /// without markers report `None` and yield no prompt rows.
+    pub fn prompt_rows(&mut self) -> Result<Vec<usize>> {
+        let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
+        let mut rows = Vec::new();
+        for row in 0..total {
+            let grid = self.terminal.grid_ref(Point::Screen(PointCoordinate {
+                x: 0,
+                y: row as u32,
+            }))?;
+            let prompt = grid.row()?.semantic_prompt()?;
+            if matches!(prompt, libghostty_vt::screen::RowSemanticPrompt::Prompt) {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The text of the command whose prompt is the last one at or above
+    /// `anchor`: prompt row through the row before the next prompt
+    /// (S3-8). `anchor` is a screen-space row; `None` means the bottom
+    /// of scrollback.
+    pub fn command_text(&mut self, anchor: Option<usize>) -> Result<String> {
+        let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
+        let anchor = anchor.unwrap_or(total.saturating_sub(1));
+        let prompts = self.prompt_rows()?;
+        let start = prompts.iter().rev().find(|&&r| r <= anchor).copied();
+        let Some(start) = start else {
+            return Ok(String::new());
+        };
+        let end = prompts
+            .iter()
+            .find(|&&r| r > start)
+            .copied()
+            .unwrap_or(total);
+        let mut out = String::new();
+        for row in start..end {
+            out.push_str(&self.row_text(row)?);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
     /// One screen-space row as plain text. Each cell resolves through
     /// `grid_ref`; one-shot operations (search, dump) accept the
     /// documented cost of screen-space lookups.
@@ -185,5 +229,62 @@ mod tests {
                 .all(|l| l.trim().is_empty()),
             "fresh screen dumps blank rows only"
         );
+    }
+
+    #[test]
+    fn prompt_rows_finds_osc133_markers() {
+        // The test shell does not emit OSC133; the markers arrive
+        // literally (plan Task S3-8 guardrail). Three prompt rows in a
+        // 50-line feed.
+        let mut emu = Emulator::new(80, 24).unwrap();
+        for i in 0..3 {
+            emu.feed(b"\x1b]133;A\x1b\\");
+            emu.feed(format!("prompt {i}\r\n").as_bytes());
+            for j in 0..14 {
+                emu.feed(format!("output {i}.{j}\r\n").as_bytes());
+            }
+        }
+        let rows = emu.prompt_rows().unwrap();
+        assert_eq!(rows, vec![0, 15, 30], "markers land on those rows");
+    }
+
+    #[test]
+    fn prompt_rows_without_markers_is_empty() {
+        let mut emu = marker_emulator();
+        assert!(
+            emu.prompt_rows().unwrap().is_empty(),
+            "plain output yields no prompt rows"
+        );
+    }
+
+    #[test]
+    fn command_text_returns_prompt_through_last_output_row() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        for i in 0..3 {
+            emu.feed(b"\x1b]133;A\x1b\\");
+            emu.feed(format!("cmd {i}\r\n").as_bytes());
+            for j in 0..5 {
+                emu.feed(format!("out {i}-{j}\r\n").as_bytes());
+            }
+        }
+        // Anchor at the bottom: the third command's block.
+        let text = emu.command_text(None).unwrap();
+        assert!(text.contains("cmd 2"), "got {text:?}");
+        assert!(text.contains("out 2-4"), "got {text:?}");
+        assert!(
+            !text.contains("out 1-"),
+            "block must stop at the next prompt, got {text:?}"
+        );
+        // Anchor inside the first block: cmd 0's output only.
+        let first = emu.command_text(Some(3)).unwrap();
+        assert!(first.contains("cmd 0"), "got {first:?}");
+        assert!(first.contains("out 0-4"), "got {first:?}");
+        assert!(!first.contains("cmd 1"), "got {first:?}");
+    }
+
+    #[test]
+    fn command_text_without_prompts_is_empty() {
+        let mut emu = marker_emulator();
+        assert_eq!(emu.command_text(None).unwrap(), "");
     }
 }

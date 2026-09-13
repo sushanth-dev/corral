@@ -35,6 +35,28 @@ fn send_msg(stream: &mut UnixStream, msg: &ClientMsg) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read one ScrollbackDump reply synchronously, skipping frames that
+/// arrive first. Puts the socket back in nonblocking mode afterwards.
+fn read_dump(reader: &mut std::io::BufReader<UnixStream>) -> anyhow::Result<String> {
+    reader
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))?;
+    let text = loop {
+        let mut chunk = String::new();
+        match std::io::BufRead::read_line(reader, &mut chunk) {
+            Ok(0) => anyhow::bail!("daemon closed during scrollback dump"),
+            Ok(_) => {}
+            Err(e) => anyhow::bail!("no scrollback dump within 5s: {e}"),
+        }
+        if let Ok(ServerMsg::ScrollbackDump { text, .. }) = serde_json::from_str(chunk.trim()) {
+            break text;
+        }
+    };
+    reader.get_mut().set_read_timeout(None)?;
+    reader.get_mut().set_nonblocking(true)?;
+    Ok(text)
+}
+
 fn main() -> anyhow::Result<()> {
     let path = socket_path();
     let stream = UnixStream::connect(&path)?;
@@ -230,29 +252,15 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 Some(input::Action::ClearHistory) => {
                     send_msg(writer, &ClientMsg::ClearHistory)?;
                 }
+                Some(input::Action::PromptPrev) => {
+                    send_msg(writer, &ClientMsg::PromptJump { up: true })?;
+                }
+                Some(input::Action::PromptNext) => {
+                    send_msg(writer, &ClientMsg::PromptJump { up: false })?;
+                }
                 Some(input::Action::EditScrollback) => {
                     send_msg(writer, &ClientMsg::DumpScrollback { pane: None })?;
-                    // Wait for the dump synchronously: switch the socket
-                    // to blocking with a timeout, skipping frames that
-                    // arrive first.
-                    reader
-                        .get_mut()
-                        .set_read_timeout(Some(Duration::from_secs(5)))?;
-                    let dump = loop {
-                        let mut chunk = String::new();
-                        match std::io::BufRead::read_line(&mut reader, &mut chunk) {
-                            Ok(0) => anyhow::bail!("daemon closed during scrollback dump"),
-                            Ok(_) => {}
-                            Err(e) => anyhow::bail!("no scrollback dump within 5s: {e}"),
-                        }
-                        if let Ok(ServerMsg::ScrollbackDump { text, .. }) =
-                            serde_json::from_str(chunk.trim())
-                        {
-                            break text;
-                        }
-                    };
-                    reader.get_mut().set_read_timeout(None)?;
-                    reader.get_mut().set_nonblocking(true)?;
+                    let dump = read_dump(&mut reader)?;
                     // Suspend the TUI, hand the dump to the editor, then
                     // restore; the dump file is deleted inside the flow.
                     let _ = crossterm::execute!(
@@ -271,6 +279,14 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     terminal.clear()?;
                     last_drawn = None;
                     edit_result?;
+                }
+                Some(input::Action::YankCommand) => {
+                    // The viewport top anchors the block: `c` copies the
+                    // command visible above the current view.
+                    let anchor = focused_pane.and_then(|p| p.scroll).map(|s| s.offset);
+                    send_msg(writer, &ClientMsg::YankCommand { anchor })?;
+                    let text = read_dump(&mut reader)?;
+                    clipboard.set_text(&text)?;
                 }
                 Some(input::Action::Split(dir)) => {
                     let (cmd, args) = pane_command();
