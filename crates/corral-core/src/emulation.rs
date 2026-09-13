@@ -133,6 +133,13 @@ impl Emulator {
         Ok(self.terminal.mode(libghostty_vt::terminal::Mode::DECCKM)?)
     }
 
+    /// Erase every scrollback line, leaving the active screen untouched
+    /// (CSI 3 J). libghostty has no dedicated call; the VT sequence is
+    /// the documented mechanism (plan Task S3-6 Step 2).
+    pub fn clear_history(&mut self) {
+        self.terminal.vt_write(b"\x1b[3J");
+    }
+
     /// Cursor cell position within the viewport, when visible.
     pub fn cursor(&mut self) -> Result<Option<(u16, u16)>> {
         let mut render_state = RenderState::new()?;
@@ -370,6 +377,33 @@ mod tests {
         assert!(
             text.contains("line100"),
             "bottom shows the latest line, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn clear_history_empties_scrollback_and_keeps_the_screen() {
+        let mut emu = Emulator::new(80, 5).unwrap();
+        for i in 1..=100 {
+            emu.feed(format!("line{i}\r\n").as_bytes());
+        }
+        // Scrolled back so history exists and is visible.
+        emu.scroll(ScrollTarget::Top);
+        assert!(
+            emu.terminal.scrollback_rows().unwrap() > 0,
+            "scrollback must be populated before clearing"
+        );
+        emu.clear_history();
+        assert_eq!(
+            emu.terminal.scrollback_rows().unwrap(),
+            0,
+            "CSI 3 J must empty the scrollback"
+        );
+        // The active screen keeps its last rows; nothing was wiped from it.
+        emu.scroll(ScrollTarget::Bottom);
+        let text = emu.screen_text().unwrap();
+        assert!(
+            text.lines().any(|l| l.contains("line100")),
+            "active screen intact after clear, got {text:?}"
         );
     }
 

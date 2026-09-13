@@ -28,6 +28,8 @@ pub enum PaneCmd {
         from: Option<usize>,
         reverse: bool,
     },
+    /// Erase the pane's scrollback (S3-6).
+    ClearHistory,
     /// Rebuild and resend the snapshot even if nothing changed.
     #[allow(dead_code)]
     Render,
@@ -129,6 +131,10 @@ fn run_worker(
                         pane: id,
                         rows: hits,
                     });
+                }
+                PaneCmd::ClearHistory => {
+                    emu.clear_history();
+                    push_snapshot(id, &mut emu, cols, rows, &out);
                 }
                 PaneCmd::Render => {
                     push_snapshot(id, &mut emu, cols, rows, &out);

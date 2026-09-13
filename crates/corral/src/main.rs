@@ -221,6 +221,9 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 Some(input::Action::Focus(dir)) => {
                     send_msg(writer, &ClientMsg::Focus { dir })?;
                 }
+                Some(input::Action::ClearHistory) => {
+                    send_msg(writer, &ClientMsg::ClearHistory)?;
+                }
                 Some(input::Action::Split(dir)) => {
                     let (cmd, args) = pane_command();
                     let cwd = std::env::current_dir()?.to_string_lossy().to_string();

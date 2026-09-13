@@ -52,6 +52,8 @@ pub enum Action {
     SearchNext,
     /// `N` in copy mode: repeat the last search backward.
     SearchPrev,
+    /// Leader `c`: erase the focused pane's scrollback.
+    ClearHistory,
 }
 
 // The Ctrl+a leader is the only key corral consumes in input mode. In
@@ -135,6 +137,7 @@ pub fn handle(
             (KeyCode::Char('s'), _) => Some(Action::Split(Dir::Vertical)),
             (KeyCode::Char('v'), _) => Some(Action::Split(Dir::Horizontal)),
             (KeyCode::Char('['), _) => Some(Action::EnterCopy),
+            (KeyCode::Char('c'), _) => Some(Action::ClearHistory),
             (KeyCode::Char('d'), _) => Some(Action::Quit),
             _ => None,
         };
@@ -663,6 +666,9 @@ mod tests {
             }),
             (KeyCode::Char('v'), |a: &Action| {
                 matches!(a, Action::Split(Dir::Horizontal))
+            }),
+            (KeyCode::Char('c'), |a: &Action| {
+                matches!(a, Action::ClearHistory)
             }),
             (KeyCode::Char('d'), |a: &Action| matches!(a, Action::Quit)),
         ];

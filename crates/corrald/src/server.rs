@@ -178,6 +178,11 @@ impl Daemon {
                     })?;
                 }
             }
+            ClientMsg::ClearHistory => {
+                if let Some(pane) = self.panes.get(&self.focused) {
+                    pane.send(PaneCmd::ClearHistory)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1152,6 +1157,84 @@ mod tests {
         assert!(
             next_rows.first().copied() > rows.first().copied(),
             "resume must skip the first hit, got {next_rows:?} after {rows:?}"
+        );
+        drop(reader);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn clear_history_empties_scrollback_while_the_screen_survives() {
+        let (sock, handle) = start_daemon("clear");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "seq 1 60; sleep 30".into()],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut reader = BufReader::new(client);
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("60")),
+            _ => false,
+        })
+        .expect("bottom frame showing line 60 within 5s");
+
+        // Scrolled up first so the viewport is not pinned to the bottom;
+        // the clear must also restore live follow.
+        send(
+            reader.get_mut(),
+            &ClientMsg::Scroll {
+                target: crate::protocol::ScrollTarget::Top,
+            },
+        );
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.scroll.is_some()),
+            _ => false,
+        })
+        .expect("frame scrolled away from the bottom within 5s");
+
+        send(reader.get_mut(), &ClientMsg::ClearHistory);
+        let cleared = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.scroll.is_none()),
+            _ => false,
+        })
+        .expect("frame after clear with scroll None within 5s");
+        let ServerMsg::Frame { panes, .. } = cleared else {
+            unreachable!()
+        };
+        // The active screen (last 24 of the 60 lines) survives the clear;
+        // scroll is None because the viewport is pinned back to the bottom.
+        assert!(
+            panes[0].text.contains("60"),
+            "active screen survives the clear, got {:?}",
+            panes[0].text
+        );
+
+        // Scrolling up now has nothing to reach: the frame stays pinned at
+        // the bottom with the same text. That is the proof the scrollback
+        // is empty.
+        send(
+            reader.get_mut(),
+            &ClientMsg::Scroll {
+                target: crate::protocol::ScrollTarget::Top,
+            },
+        );
+        let still_bottom = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.scroll.is_none() && p.text.contains("60")),
+            _ => false,
+        })
+        .expect("post-clear scroll up cannot leave the bottom within 5s");
+        let ServerMsg::Frame { panes, .. } = still_bottom else {
+            unreachable!()
+        };
+        assert!(
+            panes[0].scroll.is_none(),
+            "scrollback is empty: viewport cannot move"
         );
         drop(reader);
         let _ = handle.join();

@@ -41,6 +41,8 @@ pub enum ClientMsg {
         from: Option<usize>,
         reverse: bool,
     },
+    /// Erase the focused pane's scrollback (CSI 3 J).
+    ClearHistory,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -129,6 +131,7 @@ mod tests {
                 from: Some(41),
                 reverse: true,
             },
+            ClientMsg::ClearHistory,
         ];
         for msg in msgs {
             let line = serde_json::to_string(&msg).unwrap();
