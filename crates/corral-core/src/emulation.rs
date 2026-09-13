@@ -73,6 +73,13 @@ impl Emulator {
         Ok(())
     }
 
+    /// Whether the pane asked for application cursor keys (DECCKM, mode
+    /// 1). Arrows must arrive as ESC O A..D instead of ESC [ A..D then,
+    /// or vim and friends ignore them.
+    pub fn app_cursor(&mut self) -> Result<bool> {
+        Ok(self.terminal.mode(libghostty_vt::terminal::Mode::DECCKM)?)
+    }
+
     /// Cursor cell position within the viewport, when visible.
     pub fn cursor(&mut self) -> Result<Option<(u16, u16)>> {
         let mut render_state = RenderState::new()?;

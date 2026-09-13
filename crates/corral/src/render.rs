@@ -4,17 +4,16 @@ use ratatui::Frame;
 use ratatui::layout::Rect as RRect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::Paragraph;
 
-// The focused pane's surrounding gutter lights up so focus is visible.
+// Gutters between panes render as thin line characters. Adjacent to the
+// focused pane they light up so focus is visible.
+const GUTTER: Color = Color::Indexed(238);
 const FOCUSED_GUTTER: Color = Color::Indexed(245);
 
 pub fn draw(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
     for PaneState {
-        id: _,
-        rect,
-        text,
-        cursor: _,
+        id: _, rect, text, ..
     } in panes
     {
         let rr = RRect {
@@ -24,8 +23,7 @@ pub fn draw(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
             height: rect.h,
         };
         let lines: Vec<Line> = text.lines().map(Line::from).collect();
-        // No padding: the tree's 1-cell gutter is the whole separator; the
-        // old side padding doubled its visual width.
+        // No padding: the tree's 1-cell gutter is the whole separator.
         let para = Paragraph::new(lines);
         frame.render_widget(para, rr);
     }
@@ -33,63 +31,54 @@ pub fn draw(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
 }
 
 // tree.rects leaves a 1-cell gutter between siblings that no pane rect
-// covers, so the block-over-rect alone never highlights it. Paint the
-// gutter cell strip between the focused pane and each adjacent sibling.
+// covers. Paint it as a vertical or horizontal line character spanning
+// the overlap of the two adjacent panes; it lights when either side is
+// focused. Overlap, not exact alignment, so nested layouts work.
 fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
-    let Some(fp) = panes.iter().find(|p| p.id == focused) else {
-        return;
-    };
-    let f = fp.rect;
-    let gutter = Style::new().bg(FOCUSED_GUTTER);
-    for PaneState { id: _, rect, .. } in panes {
-        let rect = *rect;
-        if rect == f {
-            continue;
-        }
-        // Sibling starts where the gutter column begins: focused pane on
-        // the left. The gutter row belongs to the sibling span.
-        let right_of_focused =
-            f.y == rect.y && f.h == rect.h && f.x + f.w < rect.x && rect.x - (f.x + f.w) == 1;
-        // Focused pane on the right of this sibling.
-        let left_of_focused =
-            f.y == rect.y && f.h == rect.h && rect.x + rect.w < f.x && f.x - (rect.x + rect.w) == 1;
-        // Sibling below the gutter row: focused pane on top.
-        let below_focused =
-            f.x == rect.x && f.w == rect.w && f.y + f.h < rect.y && rect.y - (f.y + f.h) == 1;
-        // Focused pane below the gutter row.
-        let above_focused =
-            f.x == rect.x && f.w == rect.w && rect.y + rect.h < f.y && f.y - (rect.y + rect.h) == 1;
-        if right_of_focused || left_of_focused {
-            let gx = if right_of_focused {
-                f.x + f.w
+    for (i, a) in panes.iter().enumerate() {
+        for b in &panes[i + 1..] {
+            let (ra, rb) = (a.rect, b.rect);
+            // Vertical gutter: b starts where a's right gutter column is.
+            let vgap = if ra.x + ra.w < rb.x {
+                Some((ra.x + ra.w, a, b))
+            } else if rb.x + rb.w < ra.x {
+                Some((rb.x + rb.w, b, a))
             } else {
-                rect.x + rect.w
+                None
             };
-            frame.render_widget(
-                Block::default().style(gutter),
-                RRect {
-                    x: gx,
-                    y: f.y,
-                    width: 1,
-                    height: f.h,
-                },
-            );
-        }
-        if below_focused || above_focused {
-            let gy = if below_focused {
-                f.y + f.h
+            if let Some((gx, left, right)) = vgap {
+                let (l, r) = (left.rect, right.rect);
+                let y0 = l.y.max(r.y);
+                let y1 = (l.y + l.h).min(r.y + r.h);
+                if y1 > y0 && r.x - (l.x + l.w) == 1 {
+                    let hot = left.id == focused || right.id == focused;
+                    let style = Style::new().fg(if hot { FOCUSED_GUTTER } else { GUTTER });
+                    for y in y0..y1 {
+                        frame.buffer_mut()[(gx, y)].set_symbol("│").set_style(style);
+                    }
+                }
+                continue;
+            }
+            // Horizontal gutter: b starts where a's bottom gutter row is.
+            let hgap = if ra.y + ra.h < rb.y {
+                Some((ra.y + ra.h, a, b))
+            } else if rb.y + rb.h < ra.y {
+                Some((rb.y + rb.h, b, a))
             } else {
-                rect.y + rect.h
+                None
             };
-            frame.render_widget(
-                Block::default().style(gutter),
-                RRect {
-                    x: f.x,
-                    y: gy,
-                    width: f.w,
-                    height: 1,
-                },
-            );
+            if let Some((gy, top, bottom)) = hgap {
+                let (t, bo) = (top.rect, bottom.rect);
+                let x0 = t.x.max(bo.x);
+                let x1 = (t.x + t.w).min(bo.x + bo.w);
+                if x1 > x0 && bo.y - (t.y + t.h) == 1 {
+                    let hot = top.id == focused || bottom.id == focused;
+                    let style = Style::new().fg(if hot { FOCUSED_GUTTER } else { GUTTER });
+                    for x in x0..x1 {
+                        frame.buffer_mut()[(x, gy)].set_symbol("─").set_style(style);
+                    }
+                }
+            }
         }
     }
 }
@@ -106,6 +95,7 @@ mod tests {
             rect: tree::Rect { x, y, w, h },
             text: text.into(),
             cursor: None,
+            app_cursor: false,
         }
     }
 
@@ -139,8 +129,7 @@ mod tests {
         let top = row(&buf, 0, 101);
         assert!(top.contains("pane-one"));
         assert!(top.contains("pane-two"));
-        assert_eq!(buf[(50, 0)].bg, ratatui::style::Color::Indexed(245));
-        assert_eq!(buf[(0, 0)].bg, ratatui::style::Color::Reset);
+        assert_eq!(buf[(50, 0)].symbol(), "│");
     }
 
     #[test]
@@ -150,23 +139,24 @@ mod tests {
         let panes = panes();
         for focused in [1, 2] {
             let buf = draw_at(101, 10, &panes, focused);
-            assert_eq!(buf[(50, 0)].bg, ratatui::style::Color::Indexed(245));
+            assert_eq!(buf[(50, 0)].fg, ratatui::style::Color::Indexed(245));
         }
     }
 
     #[test]
-    fn unfocused_gutter_stays_reset() {
+    fn unfocused_gutter_stays_dim() {
         // Nested layout: pane 1 left, panes 2 and 3 stacked on the right.
         // When pane 3 has focus, the x=50 gutter is not adjacent to it and
-        // must stay Reset while the horizontal gutter lights.
+        // must stay dim while the horizontal gutter lights.
         let panes = vec![
             pane(1, 0, 0, 50, 10, "one"),
             pane(2, 51, 0, 50, 4, "two"),
             pane(3, 51, 5, 50, 5, "three"),
         ];
         let buf = draw_at(101, 10, &panes, 3);
-        assert_eq!(buf[(50, 0)].bg, ratatui::style::Color::Reset);
-        assert_eq!(buf[(60, 4)].bg, ratatui::style::Color::Indexed(245));
+        assert_eq!(buf[(50, 0)].fg, ratatui::style::Color::Indexed(238));
+        assert_eq!(buf[(60, 4)].fg, ratatui::style::Color::Indexed(245));
+        assert_eq!(buf[(60, 4)].symbol(), "─");
     }
 
     #[test]
@@ -177,8 +167,12 @@ mod tests {
             if x == 50 {
                 continue;
             }
-            let got = buf[(x, 5)].bg;
-            assert_eq!(got, ratatui::style::Color::Reset, "cell ({x},5) bg {got:?}");
+            let got = buf[(x, 5)].fg;
+            assert_ne!(
+                got,
+                ratatui::style::Color::Indexed(245),
+                "cell ({x},5) fg {got:?}"
+            );
         }
     }
 
@@ -193,11 +187,14 @@ mod tests {
     #[test]
     fn text_fills_the_rect_up_to_the_gutter_edge() {
         // No padding: a full-width line runs to the rect's last column;
-        // the gutter itself (col 50 here) stays its own cell.
-        let panes = vec![pane(1, 0, 0, 50, 10, &"x".repeat(50))];
+        // the gutter itself (col 50 here) carries the line character.
+        let panes = vec![
+            pane(1, 0, 0, 50, 10, &"x".repeat(50)),
+            pane(2, 51, 0, 50, 10, "b"),
+        ];
         let buf = draw_at(101, 10, &panes, 1);
         assert_eq!(buf[(49, 0)].symbol(), "x");
-        assert_eq!(buf[(50, 0)].symbol(), " ");
+        assert_eq!(buf[(50, 0)].symbol(), "│");
     }
 
     #[test]
@@ -221,7 +218,8 @@ mod tests {
         let panes = panes();
         let buf = draw_at(101, 10, &panes, 2);
         for y in 0..10u16 {
-            assert_eq!(buf[(50, y)].bg, ratatui::style::Color::Indexed(245));
+            assert_eq!(buf[(50, y)].symbol(), "│");
+            assert_eq!(buf[(50, y)].fg, ratatui::style::Color::Indexed(245));
         }
     }
 }

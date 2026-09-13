@@ -42,6 +42,9 @@ pub struct PaneState {
     pub rect: Rect,
     pub text: String,
     pub cursor: Option<(u16, u16)>,
+    /// The pane requested application cursor keys (DECCKM); the client
+    /// then sends arrows as ESC O A..D instead of ESC [ A..D.
+    pub app_cursor: bool,
 }
 
 #[cfg(test)]
@@ -87,6 +90,7 @@ mod tests {
                 },
                 text: "text".into(),
                 cursor: Some((10, 3)),
+                app_cursor: false,
             }],
             focused: 1,
         };
@@ -169,6 +173,7 @@ mod tests {
                 },
                 text: "héllo こんにちは \"quoted\" \\\nnewline".into(),
                 cursor: None,
+                app_cursor: true,
             }],
             focused: 1,
         };

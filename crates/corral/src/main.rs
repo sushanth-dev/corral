@@ -80,6 +80,10 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     let mut buf = String::new();
     let mut panes: Vec<PaneState> = Vec::new();
     let mut focused: PaneId = 0;
+    // Ratatui emits show-cursor plus a cursor move on every draw, and a
+    // cursor move resets the terminal's blink timer. Redrawing only when
+    // a frame actually differs keeps the blink alive while idle.
+    let mut last_drawn: Option<(Vec<PaneState>, PaneId)> = None;
     let mut reader = std::io::BufReader::new(stream);
     loop {
         // Drain socket lines (nonblocking): frames land in the pane state
@@ -107,10 +111,15 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 ServerMsg::Exited { .. } => {}
             }
         }
+        let app_cursor = panes
+            .iter()
+            .find(|p| p.id == focused)
+            .map(|p| p.app_cursor)
+            .unwrap_or(false);
         if crossterm::event::poll(POLL)?
             && let crossterm::event::Event::Key(ev) = crossterm::event::read()?
         {
-            match input::handle(ev, &mut leader_armed) {
+            match input::handle(ev, &mut leader_armed, app_cursor) {
                 Some(input::Action::Quit) => break,
                 Some(input::Action::Focus(dir)) => {
                     send_msg(writer, &ClientMsg::Focus { dir })?;
@@ -134,21 +143,23 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 None => {}
             }
         }
-        terminal.draw(|f| {
-            render::draw(f, &panes, focused);
-            // Position the real cursor inside the frame; set_cursor_position
-            // inside draw only emits escape bytes when the position changes,
-            // so the terminal keeps its natural blink cadence. Full-screen
-            // programs manage their own cursor.
-            if let Some(p) = panes.iter().find(|p| p.id == focused)
-                && let Some((cx, cy)) = p.cursor
-            {
-                let (x, y) = (p.rect.x + cx, p.rect.y + cy);
-                if x < p.rect.x + p.rect.w && y < p.rect.y + p.rect.h {
-                    f.set_cursor_position(ratatui::layout::Position::new(x, y));
+        let frame_changed = last_drawn.as_ref() != Some(&(panes.clone(), focused));
+        if frame_changed {
+            last_drawn = Some((panes.clone(), focused));
+            terminal.draw(|f| {
+                render::draw(f, &panes, focused);
+                // Position the real cursor inside the frame. Full-screen
+                // programs manage their own cursor.
+                if let Some(p) = panes.iter().find(|p| p.id == focused)
+                    && let Some((cx, cy)) = p.cursor
+                {
+                    let (x, y) = (p.rect.x + cx, p.rect.y + cy);
+                    if x < p.rect.x + p.rect.w && y < p.rect.y + p.rect.h {
+                        f.set_cursor_position(ratatui::layout::Position::new(x, y));
+                    }
                 }
-            }
-        })?;
+            })?;
+        }
     }
     Ok(())
 }

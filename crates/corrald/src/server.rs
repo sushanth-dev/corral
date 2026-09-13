@@ -236,11 +236,13 @@ impl Daemon {
                 continue;
             };
             let cursor = emu.cursor()?;
+            let app_cursor = emu.app_cursor()?;
             panes.push(PaneState {
                 id: *id,
                 rect: *rect,
                 text: emu.screen_text()?,
                 cursor,
+                app_cursor,
             });
         }
         let msg = ServerMsg::Frame {

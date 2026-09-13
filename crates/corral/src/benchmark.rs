@@ -73,6 +73,7 @@ mod bench {
                 rect,
                 text,
                 cursor: None,
+                app_cursor: false,
             });
         }
 
