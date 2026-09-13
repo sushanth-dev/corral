@@ -1,36 +1,43 @@
+use crate::pane::{PaneCmd, PaneOut, PaneWorker};
 use crate::protocol::{ClientMsg, PaneState, ServerMsg};
-use crate::pty::{PtyEvent, PtyHandle};
 use anyhow::Result;
-use corral_core::emulation::Emulator;
 use corral_core::tree::{Node, PaneId, Rect};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 const DRAIN_SWEEP: Duration = Duration::from_millis(16);
-const PER_PANE_WAIT: Duration = Duration::from_millis(2);
 
 pub struct Daemon {
     root: Node,
-    emulators: HashMap<PaneId, Emulator>,
-    ptys: HashMap<PaneId, PtyHandle>,
+    /// Command senders to the per-pane workers; each worker owns its
+    /// pane's emulator and PTY (the emulators are !Send).
+    panes: HashMap<PaneId, Sender<PaneCmd>>,
+    /// Latest snapshot per pane, updated from PaneOut messages.
+    snapshots: HashMap<PaneId, PaneState>,
+    out_tx: Sender<PaneOut>,
+    out_rx: Receiver<PaneOut>,
     focused: PaneId,
     next_id: PaneId,
     cols: u16,
     rows: u16,
 }
 
-// One thread owns every Emulator (they are !Send); PTY readers report
-// through channels drained in the recv_timeout sweep below.
+// The daemon core no longer touches emulators or PTYs: every pane state
+// mutation happens on the pane's worker thread and reaches the core as
+// a PaneOut snapshot on the shared channel.
 impl Daemon {
     pub fn new(cols: u16, rows: u16) -> Self {
+        let (out_tx, out_rx) = channel();
         Self {
             root: Node::leaf(0),
-            emulators: HashMap::new(),
-            ptys: HashMap::new(),
+            panes: HashMap::new(),
+            snapshots: HashMap::new(),
+            out_tx,
+            out_rx,
             focused: 0,
             next_id: 1,
             cols,
@@ -103,17 +110,16 @@ impl Daemon {
                 let id = self.next_id;
                 self.next_id += 1;
                 let shell_args: Vec<&str> = args.iter().map(String::as_str).collect();
-                let pty = PtyHandle::spawn(
+                let pty = crate::pty::PtyHandle::spawn(
                     cmd,
                     &shell_args,
                     std::path::Path::new(cwd),
                     self.cols,
                     self.rows,
                 )?;
-                self.ptys.insert(id, pty);
-                self.emulators
-                    .insert(id, Emulator::new(self.cols, self.rows)?);
-                if self.ptys.len() == 1 {
+                let tx = PaneWorker::spawn(id, pty, self.cols, self.rows, self.out_tx.clone());
+                self.panes.insert(id, tx);
+                if self.panes.len() == 1 {
                     self.root = Node::leaf(id);
                 } else {
                     // Split the focused pane in place along the direction
@@ -128,8 +134,8 @@ impl Daemon {
                 self.focused = id;
             }
             ClientMsg::Key { bytes } => {
-                if let Some(pty) = self.ptys.get_mut(&self.focused) {
-                    pty.write_all(bytes)?;
+                if let Some(pane) = self.panes.get(&self.focused) {
+                    pane.send(PaneCmd::Key(bytes.clone()))?;
                 }
             }
             ClientMsg::Resize { cols, rows } => {
@@ -137,12 +143,8 @@ impl Daemon {
                 self.rows = *rows;
                 let rects = self.rects();
                 for (id, rect) in &rects {
-                    let Some(pty) = self.ptys.get(id) else {
-                        continue;
-                    };
-                    pty.resize(rect.w, rect.h)?;
-                    if let Some(emu) = self.emulators.get_mut(id) {
-                        emu.resize(rect.w, rect.h)?;
+                    if let Some(pane) = self.panes.get(id) {
+                        pane.send(PaneCmd::Resize(rect.w, rect.h))?;
                     }
                 }
             }
@@ -169,53 +171,37 @@ impl Daemon {
         let mut changed = false;
         let mut exited: Vec<PaneId> = Vec::new();
         loop {
-            let ids: Vec<PaneId> = self.ptys.keys().copied().collect();
-            for id in ids {
-                let wait = PER_PANE_WAIT.min(deadline.saturating_duration_since(Instant::now()));
-                if wait.is_zero() {
-                    break;
+            let wait = DRAIN_SWEEP.min(deadline.saturating_duration_since(Instant::now()));
+            match self.out_rx.recv_timeout(wait) {
+                Ok(PaneOut::Snapshot { pane, state }) => {
+                    self.snapshots.insert(pane, state);
+                    changed = true;
                 }
-                // Fetch the event first, then borrow the emulator: the two
-                // map fields are borrowed one at a time.
-                let event = match self.ptys.get(&id) {
-                    Some(pty) => match pty.rx.recv_timeout(wait) {
-                        Ok(ev) => Some(ev),
-                        Err(RecvTimeoutError::Disconnected) => Some(PtyEvent::Exited),
-                        Err(RecvTimeoutError::Timeout) => None,
-                    },
-                    None => None,
-                };
-                match event {
-                    Some(PtyEvent::Output(bytes)) => {
-                        if let Some(emu) = self.emulators.get_mut(&id) {
-                            emu.feed(&bytes);
-                            changed = true;
-                            // Query replies (DA1, DSR, DECRQM) route from
-                            // the emulator back into the pane's PTY.
-                            for reply in emu.take_pty_writes() {
-                                if let Some(pty) = self.ptys.get_mut(&id) {
-                                    pty.write_all(&reply)?;
-                                }
-                            }
-                        }
+                Ok(PaneOut::Exited { pane }) => {
+                    // The worker also reports Exited when its command
+                    // channel drops at daemon shutdown; only a live pane
+                    // collapses the tree.
+                    if self.panes.contains_key(&pane) {
+                        exited.push(pane);
                     }
-                    Some(PtyEvent::Exited) => exited.push(id),
-                    None => {}
                 }
+                Err(RecvTimeoutError::Timeout) => {}
+                // Every worker is gone: nothing left to drain.
+                Err(RecvTimeoutError::Disconnected) => break,
             }
             if Instant::now() >= deadline {
                 break;
             }
         }
-        // Feed every Output first and push a frame while the panes are
-        // still alive: the client must see a pane's final output before
-        // the Exited message collapses the tree.
-        if changed {
+        // Snapshots first, frame while the panes are still alive: the
+        // client must see a pane's final output before the Exited
+        // message collapses the tree.
+        if changed || !exited.is_empty() {
             self.push_frame(writer)?;
         }
         for id in &exited {
-            self.ptys.remove(id);
-            self.emulators.remove(id);
+            self.panes.remove(id);
+            self.snapshots.remove(id);
             let sibling = self.root.remove(*id);
             if let Some(sib) = sibling {
                 self.focused = sib;
@@ -228,22 +214,16 @@ impl Daemon {
         Ok(())
     }
 
-    fn push_frame(&mut self, writer: &mut UnixStream) -> Result<()> {
+    fn push_frame(&self, writer: &mut UnixStream) -> Result<()> {
         let rects = self.rects();
         let mut panes = Vec::new();
         for (id, rect) in &rects {
-            let Some(emu) = self.emulators.get_mut(id) else {
+            let Some(snapshot) = self.snapshots.get(id) else {
                 continue;
             };
-            let cursor = emu.cursor()?;
-            let app_cursor = emu.app_cursor()?;
-            panes.push(PaneState {
-                id: *id,
-                rect: *rect,
-                text: emu.screen_text()?,
-                cursor,
-                app_cursor,
-            });
+            let mut state = snapshot.clone();
+            state.rect = *rect;
+            panes.push(state);
         }
         let msg = ServerMsg::Frame {
             panes,
@@ -275,7 +255,6 @@ pub fn socket_path() -> PathBuf {
         .unwrap_or_else(|| "0".into());
     std::env::temp_dir().join(format!("corral-{uid}.sock"))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
