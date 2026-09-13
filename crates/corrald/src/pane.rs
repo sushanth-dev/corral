@@ -34,8 +34,14 @@ pub enum PaneCmd {
     /// PaneOut as a ScrollbackDump the daemon core forwards to the client.
     DumpScrollback,
     /// Jump the viewport to the previous (up) or next (down) OSC133
-    /// prompt row (S3-8).
-    PromptJump { up: bool },
+    /// prompt row (S3-8). `cursor_row` anchors the walk at the copy
+    /// cursor inside the viewport; `None` anchors at the viewport
+    /// bottom.
+    PromptJump { up: bool, cursor_row: Option<usize> },
+    /// Erase the pane's scrollback and feed `text` back through the
+    /// emulator (S3-7 write-back): the terminal view shows the editor's
+    /// result.
+    LoadScrollback { text: String },
     /// Extract the command block ending at or before `anchor` (S3-8);
     /// the reply rides PaneOut as a ScrollbackDump.
     YankCommand { anchor: Option<usize> },
@@ -58,6 +64,12 @@ pub enum PaneOut {
     ScrollbackDump {
         pane: PaneId,
         text: String,
+    },
+    /// Reply to PaneCmd::PromptJump: the prompt landed at this row
+    /// inside the viewport.
+    PromptLanded {
+        pane: PaneId,
+        row: usize,
     },
     Exited {
         pane: PaneId,
@@ -154,33 +166,76 @@ fn run_worker(
                     let text = emu.dump_scrollback().unwrap_or_default();
                     let _ = out.send(PaneOut::ScrollbackDump { pane: id, text });
                 }
-                PaneCmd::PromptJump { up } => {
+                PaneCmd::PromptJump { up, cursor_row } => {
                     let prompts = emu.prompt_rows().unwrap_or_default();
-                    // The raw viewport top, not the collapsed scroll
-                    // position: a Row scroll to a prompt inside the
-                    // visible screen clamps to the bottom, and reading
-                    // the pinned state as "no history" would restart
-                    // the walk at the bottom-most prompt forever.
-                    let from = emu.viewport_offset().unwrap_or(0);
+                    // Anchor at the copy cursor, not the viewport top:
+                    // a Row scroll to a prompt inside the visible
+                    // screen clamps to the bottom, so a viewport-top
+                    // anchor re-finds the same prompt forever.
+                    // Screen-space anchor = viewport top + cursor row;
+                    // when pinned to the bottom the viewport top is
+                    // total minus the screen height.
+                    let total = emu
+                        .scroll_position()
+                        .unwrap_or(None)
+                        .map(|p| p.total)
+                        .unwrap_or(rows as usize);
+                    let top = emu
+                        .viewport_offset()
+                        .unwrap_or(total.saturating_sub(rows as usize));
+                    let anchor = top + cursor_row.unwrap_or(rows as usize - 1);
                     let target = if up {
-                        prompts.iter().rev().find(|&&r| r < from)
+                        prompts.iter().rev().find(|&&r| r < anchor)
                     } else {
-                        prompts.iter().find(|&&r| r > from)
+                        prompts.iter().find(|&&r| r > anchor)
                     };
-                    if let Some(&row) = target {
-                        emu.scroll(ScrollTarget::Row(row));
-                    } else if up {
-                        // No prompt above: pin to the top like tmux.
-                        emu.scroll(ScrollTarget::Top);
-                    } else {
-                        // No prompt below: back to the bottom (live).
-                        emu.scroll(ScrollTarget::Bottom);
-                    }
+                    let landed = match target {
+                        Some(&row) => {
+                            emu.scroll(ScrollTarget::Row(row));
+                            Some(row)
+                        }
+                        None if up => {
+                            // No prompt above: pin to the top like tmux.
+                            emu.scroll(ScrollTarget::Top);
+                            None
+                        }
+                        None => {
+                            // No prompt below: back to the bottom (live).
+                            emu.scroll(ScrollTarget::Bottom);
+                            None
+                        }
+                    };
                     push_snapshot(id, &mut emu, cols, rows, &out);
+                    // Report where the prompt landed relative to the
+                    // new viewport top so the client puts its copy
+                    // cursor on the prompt row.
+                    let row = match landed {
+                        Some(prompt_row) => {
+                            let top_after = emu
+                                .viewport_offset()
+                                .unwrap_or(total.saturating_sub(rows as usize));
+                            prompt_row.saturating_sub(top_after)
+                        }
+                        None => cursor_row.unwrap_or(rows as usize - 1),
+                    };
+                    let _ = out.send(PaneOut::PromptLanded { pane: id, row });
                 }
                 PaneCmd::YankCommand { anchor } => {
                     let text = emu.command_text(anchor).unwrap_or_default();
                     let _ = out.send(PaneOut::ScrollbackDump { pane: id, text });
+                }
+                PaneCmd::LoadScrollback { text } => {
+                    // The editor's result replaces the pane's history:
+                    // erase scrollback, pin to the bottom, and feed the
+                    // text through the emulator so styling and prompt
+                    // markers rebuild from the new content.
+                    emu.clear_history();
+                    emu.scroll(ScrollTarget::Bottom);
+                    emu.feed(text.as_bytes());
+                    for reply in emu.take_pty_writes() {
+                        let _ = pty.write_all(&reply);
+                    }
+                    push_snapshot(id, &mut emu, cols, rows, &out);
                 }
                 PaneCmd::Render => {
                     push_snapshot(id, &mut emu, cols, rows, &out);
@@ -232,6 +287,7 @@ fn push_snapshot(id: PaneId, emu: &mut Emulator, cols: u16, rows: u16, out: &Sen
         cursor: emu.cursor().unwrap_or(None),
         app_cursor: emu.app_cursor().unwrap_or(false),
         scroll,
+        lines: emu.screen_lines().unwrap_or_default(),
     };
     let _ = out.send(PaneOut::Snapshot { pane: id, state });
 }
@@ -256,6 +312,7 @@ mod tests {
         while !(got_hello && got_world) && std::time::Instant::now() < deadline {
             match out_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(PaneOut::SearchResult { .. }) => {}
+                Ok(PaneOut::PromptLanded { .. }) => {}
                 Ok(PaneOut::ScrollbackDump { .. }) => {}
                 Ok(PaneOut::Snapshot { pane, state }) => {
                     assert!(pane == 7 || pane == 9, "unknown pane id {pane}");

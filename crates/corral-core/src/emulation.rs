@@ -1,13 +1,50 @@
 use anyhow::Result;
 use libghostty_vt::render::{CellIterator, RowIterator};
+use libghostty_vt::style::{StyleColor, Underline};
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::terminal::{
     ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
     PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
 };
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+/// One colored attribute: unset falls back to the pane's default.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellColor {
+    Default,
+    /// 0-255 palette index, as the terminal set it.
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// Per-run text attributes (SGR state at the moment the run was written).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CellAttrs {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+    pub inverse: bool,
+}
+
+/// A run of same-styled text within one line.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StyledRun {
+    pub text: String,
+    pub fg: CellColor,
+    pub bg: CellColor,
+    pub attrs: CellAttrs,
+}
+
+/// One viewport row as styled runs, matching the pane's `text` line for
+/// line.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StyledLine {
+    pub runs: Vec<StyledRun>,
+}
 
 /// Where to scroll the pane's viewport. Mirrors the protocol type so
 /// the daemon can route a client's scroll request to a pane worker.
@@ -179,6 +216,70 @@ impl Emulator {
             out.push('\n');
         }
         Ok(out)
+    }
+
+    /// Current viewport as styled runs, one `StyledLine` per row. Same
+    /// walk as `screen_text`, keeping each cell's colors and attributes;
+    /// adjacent cells with equal styling merge into one run. Palette
+    /// indices are preserved so the client resolves them against its own
+    /// palette rather than the emulator's defaults.
+    pub fn screen_lines(&mut self) -> Result<Vec<StyledLine>> {
+        let mut render_state = RenderState::new()?;
+        let snapshot = render_state.update(&self.terminal)?;
+        let mut rows = RowIterator::new()?;
+        let mut cells = CellIterator::new()?;
+        let mut out = Vec::new();
+        let mut row_iter = rows.update(&snapshot)?;
+        while let Some(row) = row_iter.next() {
+            let mut line = StyledLine { runs: Vec::new() };
+            let mut cell_iter = cells.update(row)?;
+            while let Some(cell) = cell_iter.next() {
+                let style = cell.style()?;
+                let fg = cell_color(style.fg_color);
+                let bg = cell_color(style.bg_color);
+                let attrs = CellAttrs {
+                    bold: style.bold,
+                    italic: style.italic,
+                    underline: !matches!(style.underline, Underline::None),
+                    strikethrough: style.strikethrough,
+                    inverse: style.inverse,
+                };
+                let text: String = cell.graphemes()?.iter().collect();
+                match line.runs.last_mut() {
+                    Some(run) if run.fg == fg && run.bg == bg && run.attrs == attrs => {
+                        run.text.push_str(&text);
+                    }
+                    _ => line.runs.push(StyledRun {
+                        text,
+                        fg,
+                        bg,
+                        attrs,
+                    }),
+                }
+            }
+            // Trailing default-styled whitespace carries no information.
+            while let Some(last) = line.runs.last() {
+                if last.fg == CellColor::Default
+                    && last.bg == CellColor::Default
+                    && last.attrs == CellAttrs::default()
+                    && last.text.chars().all(|c| c == ' ' || c == '\0')
+                {
+                    line.runs.pop();
+                } else {
+                    break;
+                }
+            }
+            out.push(line);
+        }
+        Ok(out)
+    }
+}
+
+fn cell_color(sc: StyleColor) -> CellColor {
+    match sc {
+        StyleColor::None => CellColor::Default,
+        StyleColor::Palette(idx) => CellColor::Indexed(idx.0),
+        StyleColor::Rgb(c) => CellColor::Rgb(c.r, c.g, c.b),
     }
 }
 
@@ -469,5 +570,76 @@ mod tests {
             text.lines().next().unwrap().contains("line1"),
             "clamped at top"
         );
+    }
+
+    #[test]
+    fn screen_lines_match_screen_text_row_for_row() {
+        let mut emu = Emulator::new(80, 5).unwrap();
+        emu.feed(b"hello\r\nworld\r\n");
+        let lines = emu.screen_lines().unwrap();
+        let text = emu.screen_text().unwrap();
+        for (line, row) in lines.iter().zip(text.lines()) {
+            let joined: String = line.runs.iter().map(|r| r.text.as_str()).collect();
+            assert_eq!(joined, row, "styled runs must reproduce the row");
+        }
+    }
+
+    #[test]
+    fn sgr_colors_and_attributes_land_in_runs() {
+        let mut emu = Emulator::new(80, 5).unwrap();
+        emu.feed(b"\x1b[1;31mred-bold\x1b[0m plain \x1b[4munder\x1b[0m\r\n");
+        let lines = emu.screen_lines().unwrap();
+        let runs = &lines[0].runs;
+        let red = runs.iter().find(|r| r.text.contains("red-bold")).unwrap();
+        assert_eq!(red.fg, CellColor::Indexed(1), "got {:?}", red.fg);
+        assert!(red.attrs.bold);
+        let plain = runs.iter().find(|r| r.text.contains("plain")).unwrap();
+        assert_eq!(plain.fg, CellColor::Default);
+        assert!(!plain.attrs.bold);
+        let under = runs.iter().find(|r| r.text.contains("under")).unwrap();
+        assert!(under.attrs.underline);
+        assert!(!under.attrs.bold);
+    }
+
+    #[test]
+    fn adjacent_same_style_cells_merge_into_one_run() {
+        let mut emu = Emulator::new(80, 5).unwrap();
+        emu.feed(b"\x1b[32mgreen-one\x1b[32m still green\x1b[0m\r\n");
+        let lines = emu.screen_lines().unwrap();
+        let green: Vec<_> = lines[0]
+            .runs
+            .iter()
+            .filter(|r| r.fg == CellColor::Indexed(2))
+            .collect();
+        assert_eq!(
+            green.len(),
+            1,
+            "same-style cells merge, got {:?}",
+            lines[0].runs
+        );
+        assert_eq!(green[0].text.trim_end(), "green-one still green");
+    }
+
+    #[test]
+    fn trailing_default_whitespace_is_trimmed_from_runs() {
+        let mut emu = Emulator::new(80, 5).unwrap();
+        emu.feed(b"text\r\n");
+        let lines = emu.screen_lines().unwrap();
+        let runs = &lines[0].runs;
+        assert_eq!(runs.len(), 1, "no padded whitespace runs, got {runs:?}");
+        assert_eq!(runs[0].text, "text");
+    }
+
+    #[test]
+    fn background_color_lands_in_runs() {
+        let mut emu = Emulator::new(80, 5).unwrap();
+        emu.feed(b"\x1b[44mblue-bg\x1b[0m\r\n");
+        let lines = emu.screen_lines().unwrap();
+        let run = lines[0]
+            .runs
+            .iter()
+            .find(|r| r.text.contains("blue"))
+            .unwrap();
+        assert_eq!(run.bg, CellColor::Indexed(4), "got {:?}", run.bg);
     }
 }

@@ -1,3 +1,4 @@
+use corral_core::emulation::StyledLine;
 use corral_core::tree::{Dir, PaneId, Rect};
 use serde::{Deserialize, Serialize};
 
@@ -51,9 +52,13 @@ pub enum ClientMsg {
         pane: Option<PaneId>,
     },
     /// Scroll the focused pane's viewport to the previous (up) or next
-    /// (down) OSC133 prompt row (S3-8).
+    /// (down) OSC133 prompt row (S3-8). `cursor_row` is the copy-mode
+    /// cursor's row inside the viewport; the anchor is that row, not
+    /// the viewport top, so a jump never skips past the prompt under
+    /// the cursor. `None` anchors at the viewport bottom.
     PromptJump {
         up: bool,
+        cursor_row: Option<usize>,
     },
     /// Extract the current command's output (S3-8): from the prompt row
     /// above `anchor` (a screen-space row; `None` pins to the bottom) to
@@ -61,6 +66,12 @@ pub enum ClientMsg {
     /// ServerMsg::ScrollbackDump.
     YankCommand {
         anchor: Option<usize>,
+    },
+    /// Replace a pane's scrollback with edited text (S3-7 write-back):
+    /// the daemon erases the pane's history and feeds `text` through the
+    /// emulator, so the terminal view reflects the editor's changes.
+    LoadScrollback {
+        text: String,
     },
 }
 
@@ -85,6 +96,12 @@ pub enum ServerMsg {
         pane: PaneId,
         text: String,
     },
+    /// Reply to a prompt jump: the prompt now sits at this row inside
+    /// the viewport. The client moves its copy cursor there.
+    PromptLanded {
+        pane: PaneId,
+        row: usize,
+    },
 }
 
 /// One pane's render state. The cursor is None while a full-screen
@@ -103,6 +120,9 @@ pub struct PaneState {
     /// the bottom (live follow). The client shows a position indicator
     /// from this and stops forwarding arrow keys to the PTY while set.
     pub scroll: Option<ScrollPos>,
+    /// The visible screen as styled runs (colors, attributes). Same row
+    /// count as `text`; empty means "fall back to plain `text`".
+    pub lines: Vec<StyledLine>,
 }
 
 /// Scroll position of one pane's viewport, mirrored from
@@ -160,10 +180,19 @@ mod tests {
             ClientMsg::ClearHistory,
             ClientMsg::DumpScrollback { pane: None },
             ClientMsg::DumpScrollback { pane: Some(3) },
-            ClientMsg::PromptJump { up: true },
-            ClientMsg::PromptJump { up: false },
+            ClientMsg::PromptJump {
+                up: true,
+                cursor_row: None,
+            },
+            ClientMsg::PromptJump {
+                up: false,
+                cursor_row: Some(11),
+            },
             ClientMsg::YankCommand { anchor: None },
             ClientMsg::YankCommand { anchor: Some(7) },
+            ClientMsg::LoadScrollback {
+                text: "edited\nlines".into(),
+            },
         ];
         for msg in msgs {
             let line = serde_json::to_string(&msg).unwrap();
@@ -190,6 +219,7 @@ mod tests {
                     offset: 12,
                     total: 96,
                 }),
+                lines: vec![],
             }],
             focused: 1,
         };
@@ -235,6 +265,65 @@ mod tests {
             text: "line one\nline two\n".into(),
         };
         let back: ServerMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn prompt_landed_round_trips() {
+        let msg = ServerMsg::PromptLanded { pane: 3, row: 41 };
+        let line = serde_json::to_string(&msg).unwrap();
+        let back: ServerMsg = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn pane_lines_carry_styled_runs_through_json() {
+        use corral_core::emulation::{CellAttrs, CellColor, StyledLine, StyledRun};
+        let msg = ServerMsg::Frame {
+            panes: vec![PaneState {
+                id: 1,
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 80,
+                    h: 3,
+                },
+                text: "red plain\n".into(),
+                cursor: None,
+                app_cursor: false,
+                scroll: None,
+                lines: vec![StyledLine {
+                    runs: vec![
+                        StyledRun {
+                            text: "red".into(),
+                            fg: CellColor::Indexed(1),
+                            bg: CellColor::Default,
+                            attrs: CellAttrs {
+                                bold: true,
+                                ..CellAttrs::default()
+                            },
+                        },
+                        StyledRun {
+                            text: " plain".into(),
+                            fg: CellColor::Default,
+                            bg: CellColor::Rgb(10, 20, 30),
+                            attrs: CellAttrs::default(),
+                        },
+                    ],
+                }],
+            }],
+            focused: 1,
+        };
+        let line = serde_json::to_string(&msg).unwrap();
+        assert!(
+            line.contains("\"fg\":{\"Indexed\":1}"),
+            "indexed fg must survive: {line}"
+        );
+        assert!(
+            line.contains("\"bg\":{\"Rgb\":[10,20,30]}"),
+            "rgb bg must survive: {line}"
+        );
+        let back: ServerMsg = serde_json::from_str(&line).unwrap();
         assert_eq!(back, msg);
     }
 
@@ -304,6 +393,7 @@ mod tests {
                 cursor: None,
                 app_cursor: true,
                 scroll: None,
+                lines: vec![],
             }],
             focused: 1,
         };

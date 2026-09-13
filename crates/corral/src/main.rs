@@ -107,12 +107,18 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut mode = input::Mode::Input;
     let mut selection: Option<selection::Selection> = None;
+    // Copy-mode cursor: viewport-relative (row, col). Set on entering
+    // copy mode, moved by hjkl, and placed on prompts by PromptLanded.
+    let mut copy_cursor: Option<(usize, usize)> = None;
     // Search prompt state: the needle being typed, and the last submitted
     // needle that n/N repeat.
     let mut search_needle = String::new();
     let mut search_reverse = false;
     let mut last_search: Option<String> = None;
     let mut last_search_reverse = false;
+    // The last search reply: hits as screen-space rows, highlighted in
+    // the viewport until a new search replaces them.
+    let mut search_hits: Option<(PaneId, Vec<usize>)> = None;
     // The real run uses the system clipboard; tests drive the run loop's
     // pieces with MemoryClipboard directly.
     let mut clipboard: Box<dyn clipboard::Clipboard> = Box::new(clipboard::SystemClipboard::new());
@@ -125,7 +131,14 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     // a frame actually differs keeps the blink alive while idle.
     // The selection cursor joins the diff key: a SelectMove changes no
     // pane state but must repaint the highlight.
-    type FrameKey = (Vec<PaneState>, PaneId, render::Hint, Option<(usize, usize)>);
+    type FrameKey = (
+        Vec<PaneState>,
+        PaneId,
+        render::Hint,
+        Option<(usize, usize)>,
+        Option<(usize, usize)>,
+        Option<(PaneId, Vec<usize>)>,
+    );
     let mut last_drawn: Option<FrameKey> = None;
     let mut reader = std::io::BufReader::new(stream);
     loop {
@@ -152,10 +165,19 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     focused = f;
                 }
                 ServerMsg::Exited { .. } => {}
-                ServerMsg::SearchResult { .. } => {
-                    // The worker already scrolled to the match; the frame
-                    // carrying the new viewport follows right behind. No
-                    // highlight in v0.2 (plan Task 5 known gap).
+                ServerMsg::SearchResult { pane, rows } => {
+                    // The worker already scrolled to the first match; the
+                    // frame carrying the new viewport follows right
+                    // behind. Hits stay highlighted until the next search.
+                    search_hits = Some((pane, rows));
+                }
+                ServerMsg::PromptLanded { pane, row } => {
+                    // The prompt now sits `row` rows below the viewport
+                    // top: put the copy cursor on it. The frame carrying
+                    // the new viewport follows behind this reply.
+                    if pane == focused {
+                        copy_cursor = Some((row, 0));
+                    }
                 }
                 ServerMsg::ScrollbackDump { .. } => {
                     // Only meaningful in the EditScrollback flow, which
@@ -173,10 +195,18 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
             let action = input::handle(ev, &mut leader_armed, &mode, app_cursor, half_page);
             match action {
                 Some(input::Action::Quit) => break,
-                Some(input::Action::EnterCopy) => mode = input::Mode::Copy,
+                Some(input::Action::EnterCopy) => {
+                    mode = input::Mode::Copy;
+                    // The cursor starts at the bottom-left of the view,
+                    // where the user's eyes already are.
+                    let bottom = focused_pane.map(|p| p.rect.h as usize).unwrap_or(1);
+                    copy_cursor = Some((bottom - 1, 0));
+                }
                 Some(input::Action::ExitCopy) => {
                     mode = input::Mode::Input;
                     selection = None;
+                    copy_cursor = None;
+                    search_hits = None;
                     // Leaving copy mode restores live follow at the bottom.
                     send_msg(
                         writer,
@@ -184,6 +214,33 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                             target: corrald::protocol::ScrollTarget::Bottom,
                         },
                     )?;
+                }
+                Some(input::Action::CopyCursorMove { drow, dcol }) => {
+                    // Move the viewport cursor; when it pushes past the
+                    // top or bottom edge, drag the viewport with it.
+                    if let (Some(cur), Some(p)) = (copy_cursor.as_mut(), focused_pane) {
+                        let height = p.rect.h as isize;
+                        let width = p.rect.w as isize;
+                        let (r, c) = (cur.0 as isize, cur.1 as isize);
+                        let new_r = (r + drow).clamp(0, height - 1).max(0);
+                        let new_c = (c + dcol).clamp(0, width - 1).max(0);
+                        *cur = (new_r as usize, new_c as usize);
+                        if new_r == 0 && drow < 0 {
+                            send_msg(
+                                writer,
+                                &ClientMsg::Scroll {
+                                    target: corrald::protocol::ScrollTarget::Delta(-1),
+                                },
+                            )?;
+                        } else if new_r == height - 1 && drow > 0 {
+                            send_msg(
+                                writer,
+                                &ClientMsg::Scroll {
+                                    target: corrald::protocol::ScrollTarget::Delta(1),
+                                },
+                            )?;
+                        }
+                    }
                 }
                 Some(input::Action::CopyScroll(target)) => {
                     send_msg(writer, &ClientMsg::Scroll { target })?;
@@ -273,10 +330,22 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     send_msg(writer, &ClientMsg::ClearHistory)?;
                 }
                 Some(input::Action::PromptPrev) => {
-                    send_msg(writer, &ClientMsg::PromptJump { up: true })?;
+                    send_msg(
+                        writer,
+                        &ClientMsg::PromptJump {
+                            up: true,
+                            cursor_row: copy_cursor.map(|(r, _)| r),
+                        },
+                    )?;
                 }
                 Some(input::Action::PromptNext) => {
-                    send_msg(writer, &ClientMsg::PromptJump { up: false })?;
+                    send_msg(
+                        writer,
+                        &ClientMsg::PromptJump {
+                            up: false,
+                            cursor_row: copy_cursor.map(|(r, _)| r),
+                        },
+                    )?;
                 }
                 Some(input::Action::EditScrollback) => {
                     send_msg(writer, &ClientMsg::DumpScrollback { pane: None })?;
@@ -302,7 +371,9 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     // screen behind ratatui's diff cache.
                     terminal.clear()?;
                     last_drawn = None;
-                    edit_result?;
+                    if let Ok(edited) = edit_result {
+                        send_msg(writer, &ClientMsg::LoadScrollback { text: edited })?;
+                    }
                 }
                 Some(input::Action::YankCommand) => {
                     // The viewport top anchors the block: `c` copies the
@@ -343,13 +414,36 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
             input::Mode::Search => render::Hint::Search(search_needle.clone()),
         };
         let sel_cursor = selection.as_ref().map(|s| s.cursor);
+        let visible_cursor = matches!(mode, input::Mode::Copy | input::Mode::Select(_))
+            .then_some(copy_cursor)
+            .flatten();
+        let active_search = search_hits.as_ref().and_then(|(pane, rows)| {
+            let p = panes.iter().find(|p| p.id == *pane)?;
+            let needle = last_search.as_ref()?;
+            Some((*pane, render::search_spans(&p.text, needle)))
+                .filter(|(_, spans)| !spans.is_empty() || !rows.is_empty())
+        });
         // The whole hint joins the diff key: collapsing it to a bool
         // would skip the repaint that reveals the search prompt when a
         // Copy frame turns into a Search frame.
-        let frame_changed =
-            last_drawn.as_ref() != Some(&(panes.clone(), focused, hint.clone(), sel_cursor));
+        let frame_changed = last_drawn.as_ref()
+            != Some(&(
+                panes.clone(),
+                focused,
+                hint.clone(),
+                sel_cursor,
+                visible_cursor,
+                search_hits.clone(),
+            ));
         if frame_changed {
-            last_drawn = Some((panes.clone(), focused, hint.clone(), sel_cursor));
+            last_drawn = Some((
+                panes.clone(),
+                focused,
+                hint.clone(),
+                sel_cursor,
+                visible_cursor,
+                search_hits.clone(),
+            ));
             terminal.draw(|f| {
                 // Selection spans render reversed over the focused pane's
                 // visible grid.
@@ -357,7 +451,13 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     (Some(sel), Some(p)) => vec![(p.id, sel.spans(&p.text))],
                     _ => Vec::new(),
                 };
-                render::draw(f, &panes, focused, hint, &spans);
+                // Search hits highlight in the pane the daemon matched;
+                // spans are already viewport rows because the daemon
+                // scrolled the hit onto screen before replying.
+                let search: Vec<(PaneId, render::SpanList)> = active_search
+                    .map(|(pane, spans)| vec![(pane, spans)])
+                    .unwrap_or_default();
+                render::draw(f, &panes, focused, hint, &spans, &search, visible_cursor);
                 // Position the real cursor inside the frame. Full-screen
                 // programs manage their own cursor.
                 if let Some(p) = panes.iter().find(|p| p.id == focused)

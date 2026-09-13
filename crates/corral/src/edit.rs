@@ -29,14 +29,21 @@ fn write_dump_file(text: &str) -> io::Result<PathBuf> {
 }
 
 /// Run the editor over a fresh dump file and always delete the file
-/// afterwards, success or failure. `run` receives the file path; the
-/// real client passes an editor spawner, tests pass a fake.
-pub fn edit_scrollback(text: &str, run: &mut dyn FnMut(&Path) -> io::Result<()>) -> io::Result<()> {
+/// afterwards, success or failure. Returns the edited contents read back
+/// from the file before deletion, so the caller can write them back into
+/// the pane. `run` receives the file path; the real client passes an
+/// editor spawner, tests pass a fake.
+pub fn edit_scrollback(
+    text: &str,
+    run: &mut dyn FnMut(&Path) -> io::Result<()>,
+) -> io::Result<String> {
     let path = write_dump_file(text)?;
     let result = run(&path);
+    // Read back before deleting: the editor may have changed the file.
+    let edited = fs::read_to_string(&path).unwrap_or_else(|_| text.to_string());
     // Delete on every exit path: the dump holds pane contents.
     let _ = fs::remove_file(&path);
-    result
+    result.map(|_| edited)
 }
 
 /// Spawn the editor on `path`: $EDITOR when set, else nvim, then vi.

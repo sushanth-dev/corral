@@ -46,11 +46,18 @@ impl Daemon {
         }
     }
 
-    /// Accept one client and serve until it disconnects. v0.1 is single
-    /// client; the caller owns the listener and socket cleanup.
+    /// Serve clients forever. The daemon state (panes, scrollback,
+    /// focus) lives here, not in the connection: a disconnect (Ctrl+a d)
+    /// keeps every pane running, and the next connection attaches to the
+    /// same session. One client at a time; the next connection queues
+    /// until the current one hangs up. The caller owns the listener and
+    /// socket cleanup.
     pub fn serve(listener: UnixListener) -> Result<()> {
-        let (stream, _) = listener.accept()?;
-        Daemon::new(80, 24).run(stream)
+        let mut daemon = Daemon::new(80, 24);
+        loop {
+            let (stream, _) = listener.accept()?;
+            daemon.run(stream)?;
+        }
     }
 
     fn run(&mut self, stream: UnixStream) -> Result<()> {
@@ -60,6 +67,11 @@ impl Daemon {
         // read_line on a nonblocking stream can return a partial JSON
         // line; bytes stay in this buffer until a newline completes them.
         let mut buf = String::new();
+        // A re-attaching client needs the current layout immediately:
+        // without panes it creates the first shell, with panes it
+        // attaches to the existing ones. Push the frame before the loop
+        // so the decision is frame-driven, not guessed.
+        self.push_frame(&mut writer)?;
         loop {
             // A frame write to a departed client reports BrokenPipe; that
             // is a clean disconnect, not a daemon error.
@@ -190,14 +202,22 @@ impl Daemon {
                     p.send(PaneCmd::DumpScrollback)?;
                 }
             }
-            ClientMsg::PromptJump { up } => {
+            ClientMsg::PromptJump { up, cursor_row } => {
                 if let Some(pane) = self.panes.get(&self.focused) {
-                    pane.send(PaneCmd::PromptJump { up: *up })?;
+                    pane.send(PaneCmd::PromptJump {
+                        up: *up,
+                        cursor_row: *cursor_row,
+                    })?;
                 }
             }
             ClientMsg::YankCommand { anchor } => {
                 if let Some(pane) = self.panes.get(&self.focused) {
                     pane.send(PaneCmd::YankCommand { anchor: *anchor })?;
+                }
+            }
+            ClientMsg::LoadScrollback { text } => {
+                if let Some(pane) = self.panes.get(&self.focused) {
+                    pane.send(PaneCmd::LoadScrollback { text: text.clone() })?;
                 }
             }
         }
@@ -246,6 +266,10 @@ impl Daemon {
                 Ok(PaneOut::ScrollbackDump { pane, text }) => {
                     // Same out-of-band path as the search reply (S3-7).
                     write_msg(writer, &ServerMsg::ScrollbackDump { pane, text })?;
+                }
+                Ok(PaneOut::PromptLanded { pane, row }) => {
+                    // The client moves its copy cursor onto the prompt.
+                    write_msg(writer, &ServerMsg::PromptLanded { pane, row })?;
                 }
                 Ok(PaneOut::Exited { pane }) => {
                     // The worker also reports Exited when its command
@@ -341,16 +365,17 @@ mod tests {
         stream.flush().unwrap();
     }
 
-    /// Binds a listener in a fresh temp dir and serves it on a thread.
-    /// Returns (socket path, server thread handle).
-    fn start_daemon(tag: &str) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
+    /// Binds a listener in a fresh temp dir and serves it on a detached
+    /// thread. The daemon never stops (a persistent session outlives any
+    /// client); tests just need the socket path.
+    fn start_daemon(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("corral-test-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("s.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
-        let handle = std::thread::spawn(move || Daemon::serve(listener).unwrap());
-        (sock, handle)
+        std::thread::spawn(move || Daemon::serve(listener).unwrap());
+        sock
     }
 
     fn wait_for_msg(
@@ -383,7 +408,7 @@ mod tests {
         let sock = dir.join("s.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
-        let handle = std::thread::spawn(move || Daemon::serve(listener).unwrap());
+        std::thread::spawn(move || Daemon::serve(listener).unwrap());
 
         let mut client = UnixStream::connect(&sock).unwrap();
         send(
@@ -406,8 +431,7 @@ mod tests {
         };
         assert_eq!(panes.len(), 1);
         assert_eq!(focused, 1);
-        drop(reader);
-        let _ = handle.join(); // serve ends when the client drops
+        drop(reader); // serve ends when the client drops
         let _ = std::fs::remove_file(dir.join("s.sock"));
     }
 
@@ -418,7 +442,7 @@ mod tests {
         let sock = dir.join("s.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
-        let handle = std::thread::spawn(move || Daemon::serve(listener).unwrap());
+        std::thread::spawn(move || Daemon::serve(listener).unwrap());
 
         let mut client = UnixStream::connect(&sock).unwrap();
         for out in ["one", "two"] {
@@ -450,7 +474,6 @@ mod tests {
         );
         assert_eq!(focused, panes[1].id);
         drop(reader);
-        let _ = handle.join();
         let _ = std::fs::remove_file(dir.join("s.sock"));
     }
 
@@ -461,7 +484,7 @@ mod tests {
         let sock = dir.join("s.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
-        let handle = std::thread::spawn(move || Daemon::serve(listener).unwrap());
+        std::thread::spawn(move || Daemon::serve(listener).unwrap());
 
         let mut client = UnixStream::connect(&sock).unwrap();
         for out in ["one", "two"] {
@@ -502,7 +525,6 @@ mod tests {
             "focused {focused} is not a live pane"
         );
         drop(reader);
-        let _ = handle.join();
         let _ = std::fs::remove_file(dir.join("s.sock"));
     }
 
@@ -512,7 +534,7 @@ mod tests {
         // daemon only pushed frames when output changed, so switching
         // panes never reached the client. Quiet panes (sleep) must not
         // swallow the frame.
-        let (sock, handle) = start_daemon("focus-quiet");
+        let sock = start_daemon("focus-quiet");
         let mut client = UnixStream::connect(&sock).unwrap();
         for _ in ["a", "b"] {
             send(
@@ -554,7 +576,6 @@ mod tests {
         };
         assert_ne!(focused, focused_before);
         drop(reader);
-        let _ = handle.join();
         let _ = std::fs::remove_file(sock);
     }
 
@@ -565,7 +586,7 @@ mod tests {
         let sock = dir.join("s.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
-        let handle = std::thread::spawn(move || Daemon::serve(listener).unwrap());
+        std::thread::spawn(move || Daemon::serve(listener).unwrap());
 
         let mut client = UnixStream::connect(&sock).unwrap();
         send(
@@ -591,7 +612,6 @@ mod tests {
         };
         assert!(panes.iter().all(|p| p.rect.w <= 16 && p.rect.h <= 4));
         drop(reader);
-        let _ = handle.join();
         let _ = std::fs::remove_file(dir.join("s.sock"));
     }
 
@@ -602,7 +622,7 @@ mod tests {
         let sock = dir.join("s.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
-        let handle = std::thread::spawn(move || Daemon::serve(listener).unwrap());
+        std::thread::spawn(move || Daemon::serve(listener).unwrap());
 
         let mut client = UnixStream::connect(&sock).unwrap();
         send(
@@ -622,7 +642,6 @@ mod tests {
         };
         assert_eq!(pane, 1);
         drop(reader);
-        let _ = handle.join();
         let _ = std::fs::remove_file(dir.join("s.sock"));
     }
 
@@ -630,7 +649,7 @@ mod tests {
     fn keys_route_to_the_focused_pane_only() {
         // Two panes run `cat`; typing lands only in the focused (second)
         // pane, and the first pane never receives the bytes.
-        let (_sock, handle) = start_daemon("keys");
+        let _sock = start_daemon("keys");
         let mut client = UnixStream::connect(&_sock).unwrap();
         for out in ["one", "two"] {
             send(
@@ -666,14 +685,13 @@ mod tests {
         let with_text = panes.iter().filter(|p| p.text.contains("typed")).count();
         assert_eq!(with_text, 1, "typed text landed in more than one pane");
         drop(reader);
-        let _ = handle.join();
     }
 
     #[test]
     fn second_exit_leaves_a_single_collapsed_pane() {
         // Three short-lived panes: each exit collapses the tree until one
         // pane fills the whole frame.
-        let (_sock, handle) = start_daemon("collapse");
+        let _sock = start_daemon("collapse");
         let mut client = UnixStream::connect(&_sock).unwrap();
         for out in ["one", "two", "three"] {
             send(
@@ -698,13 +716,12 @@ mod tests {
         assert_eq!(panes.len(), 1);
         assert_eq!(focused, panes[0].id, "last live pane holds focus");
         drop(reader);
-        let _ = handle.join();
     }
 
     #[test]
     fn garbage_lines_between_messages_are_skipped() {
         // The daemon must not die on malformed JSON from a client.
-        let (_sock, handle) = start_daemon("garbage");
+        let _sock = start_daemon("garbage");
         let mut client = UnixStream::connect(&_sock).unwrap();
         client.write_all(b"not json at all\n{\"Torn\":\n").unwrap();
         client.flush().unwrap();
@@ -725,12 +742,11 @@ mod tests {
         .expect("daemon survived garbage and served the pane");
         assert!(matches!(frame, ServerMsg::Frame { .. }));
         drop(reader);
-        let _ = handle.join();
     }
 
     #[test]
     fn resize_to_tiny_then_back_restores_layout() {
-        let (_sock, handle) = start_daemon("tiny");
+        let _sock = start_daemon("tiny");
         let mut client = UnixStream::connect(&_sock).unwrap();
         for out in ["one", "two"] {
             send(
@@ -790,14 +806,13 @@ mod tests {
         };
         assert!(big_panes.iter().all(|p| p.rect.w > 20));
         drop(reader);
-        let _ = handle.join();
     }
 
     #[test]
     fn second_pane_splits_the_focused_pane_not_the_screen() {
         // Split-in-place: pane 2 must take half of pane 1's rect, leaving
         // a nested layout, not two half-screen panes.
-        let (_sock, handle) = start_daemon("split");
+        let _sock = start_daemon("split");
         let mut client = UnixStream::connect(&_sock).unwrap();
         send(&mut client, &ClientMsg::Attach);
         send(
@@ -854,14 +869,13 @@ mod tests {
         }
         drop(reader);
         drop(client);
-        let _ = handle.join();
     }
 
     #[test]
     fn vertical_split_request_splits_top_bottom() {
         // The client's s key asks for Vertical; the daemon must honor the
         // requested direction, not pick one from pane geometry.
-        let (_sock, handle) = start_daemon("vsplit");
+        let _sock = start_daemon("vsplit");
         let mut client = UnixStream::connect(&_sock).unwrap();
         send(&mut client, &ClientMsg::Attach);
         send(
@@ -916,50 +930,68 @@ mod tests {
         }
         drop(reader);
         drop(client);
-        let _ = handle.join();
     }
 
     #[test]
-    fn client_disconnect_is_a_clean_exit_not_a_broken_pipe_error() {
-        // The daemon pushes frames every sweep; when the client vanishes
-        // mid-frame, the write fails with BrokenPipe. serve must return
-        // Ok (thread join without panic proves the clean exit), not Ok(())
-        // wrapped in an error that unwraps into a panic.
-        let (_sock, handle) = start_daemon("brokepipe");
-        let mut client = UnixStream::connect(&_sock).unwrap();
-        send(&mut client, &ClientMsg::Attach);
-        send(&mut client, &ClientMsg::Resize { cols: 80, rows: 24 });
+    fn panes_survive_a_disconnect_and_a_second_client_reattaches() {
+        // Ctrl+a d must not kill the session: the daemon keeps panes
+        // running after the client drops, and the next connection sees
+        // the existing pane in its first frame.
+        let _sock = start_daemon("detach");
+        let mut first = UnixStream::connect(&_sock).unwrap();
         send(
-            &mut client,
+            &mut first,
             &ClientMsg::CreatePane {
                 cmd: "sh".into(),
-                args: vec!["-c".into(), "while :; do printf x; sleep 1; done".into()],
+                args: vec!["-c".into(), "printf kept; cat".into()],
                 cwd: "/tmp".into(),
                 dir: Dir::Horizontal,
             },
         );
-        // Give the daemon time to enter its push loop, then vanish.
-        std::thread::sleep(Duration::from_millis(500));
-        drop(client);
-        // join() panics if the thread ended in Err; poll for exit, then
-        // join so a broken-pipe error surfaces as a failed join.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !handle.is_finished() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(handle.is_finished(), "daemon never noticed the disconnect");
-        handle
-            .join()
-            .expect("daemon exited cleanly, not with BrokenPipe");
+        let mut reader = BufReader::new(first.try_clone().unwrap());
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("kept")),
+            _ => false,
+        })
+        .expect("first client sees the pane");
+        drop(reader);
+        drop(first);
+
+        // The same daemon serves the next connection with the live pane.
+        let mut second = UnixStream::connect(&_sock).unwrap();
+        let mut reader = BufReader::new(second);
+        let frame = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("kept")),
+            _ => false,
+        })
+        .expect("re-attach frame carries the surviving pane");
+        let ServerMsg::Frame { panes, focused } = frame else {
+            unreachable!()
+        };
+        assert_eq!(panes.len(), 1, "the pane survived the disconnect");
+        assert_eq!(focused, panes[0].id);
+
+        // The surviving pane still answers input from the new client.
+        send(
+            reader.get_mut(),
+            &ClientMsg::Key {
+                bytes: b"alive\n".to_vec(),
+            },
+        );
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("alive")),
+            _ => false,
+        })
+        .expect("reattached pane accepts keys");
     }
 
     #[test]
-    fn attach_alone_produces_no_frame_but_keeps_the_connection() {
-        let (_sock, handle) = start_daemon("attach");
+    fn attach_pushes_an_immediate_frame_and_keeps_the_connection() {
+        let _sock = start_daemon("attach");
         let mut client = UnixStream::connect(&_sock).unwrap();
         send(&mut client, &ClientMsg::Attach);
-        // Nothing crashed and the daemon is still responsive: a pane
-        // created after Attach works normally.
+        // The connection-start frame arrives first (empty at this point);
+        // a pane created after Attach works normally.
         send(
             &mut client,
             &ClientMsg::CreatePane {
@@ -977,14 +1009,13 @@ mod tests {
         .expect("pane after attach works");
         assert!(matches!(frame, ServerMsg::Frame { .. }));
         drop(reader);
-        let _ = handle.join();
     }
 
     #[test]
     fn focus_into_an_empty_direction_keeps_current_focus() {
         // A single pane: focus down/left has no neighbor, so the focused
         // id in subsequent frames must stay on the live pane.
-        let (_sock, handle) = start_daemon("nofocus");
+        let _sock = start_daemon("nofocus");
         let mut client = UnixStream::connect(&_sock).unwrap();
         send(
             &mut client,
@@ -996,8 +1027,13 @@ mod tests {
             },
         );
         let mut reader = BufReader::new(client);
-        let first = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::Frame { .. }))
-            .expect("first frame");
+        // The connect-time frame is empty; focus is meaningful once the
+        // pane exists.
+        let first = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => !panes.is_empty(),
+            _ => false,
+        })
+        .expect("first frame with the pane");
         let ServerMsg::Frame { focused, .. } = first else {
             unreachable!()
         };
@@ -1011,7 +1047,6 @@ mod tests {
         };
         assert_eq!(after, focused, "focus moved with no neighbor");
         drop(reader);
-        let _ = handle.join();
     }
 
     #[test]
@@ -1037,7 +1072,7 @@ mod tests {
 
     #[test]
     fn scroll_command_moves_the_viewport_and_reports_position() {
-        let (sock, handle) = start_daemon("scroll");
+        let sock = start_daemon("scroll");
         let mut client = UnixStream::connect(&sock).unwrap();
         send(
             &mut client,
@@ -1110,12 +1145,11 @@ mod tests {
             panes[0].text
         );
         drop(reader);
-        let _ = handle.join();
     }
 
     #[test]
     fn search_finds_rows_and_the_viewport_jumps_to_the_first_hit() {
-        let (sock, handle) = start_daemon("search");
+        let sock = start_daemon("search");
         let mut client = UnixStream::connect(&sock).unwrap();
         send(
             &mut client,
@@ -1194,12 +1228,11 @@ mod tests {
             "resume must skip the first hit, got {next_rows:?} after {rows:?}"
         );
         drop(reader);
-        let _ = handle.join();
     }
 
     #[test]
     fn clear_history_empties_scrollback_while_the_screen_survives() {
-        let (sock, handle) = start_daemon("clear");
+        let sock = start_daemon("clear");
         let mut client = UnixStream::connect(&sock).unwrap();
         send(
             &mut client,
@@ -1272,12 +1305,11 @@ mod tests {
             "scrollback is empty: viewport cannot move"
         );
         drop(reader);
-        let _ = handle.join();
     }
 
     #[test]
     fn dump_scrollback_returns_all_sixty_lines() {
-        let (sock, handle) = start_daemon("dump");
+        let sock = start_daemon("dump");
         let mut client = UnixStream::connect(&sock).unwrap();
         send(
             &mut client,
@@ -1314,12 +1346,11 @@ mod tests {
         assert_eq!(lines.first().copied(), Some("1"), "dump starts at line 1");
         assert_eq!(lines.last().copied(), Some("60"), "dump ends at line 60");
         drop(reader);
-        let _ = handle.join();
     }
 
     #[test]
     fn prompt_jump_scrolls_between_osc133_prompts() {
-        let (sock, handle) = start_daemon("promptjump");
+        let sock = start_daemon("promptjump");
         let mut client = UnixStream::connect(&sock).unwrap();
         // Three literal OSC133 A markers over a 60-line pane. `sh` does
         // not emit these itself; fish would (plan Task S3-8 guardrail).
@@ -1347,7 +1378,22 @@ mod tests {
         // Up jumps to the previous prompt row. From the bottom the first
         // up-jump reaches the bottom-most prompt (three); walking up
         // again reaches two, then one.
-        send(reader.get_mut(), &ClientMsg::PromptJump { up: true });
+        send(
+            reader.get_mut(),
+            &ClientMsg::PromptJump {
+                up: true,
+                cursor_row: None,
+            },
+        );
+        let landed = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::PromptLanded { .. }))
+            .expect("PromptLanded reply within 5s");
+        let ServerMsg::PromptLanded { pane, row } = landed else {
+            unreachable!()
+        };
+        assert!(
+            pane > 0 && row < 24,
+            "landing row is viewport-relative: {row}"
+        );
         wait_for_msg(&mut reader, |m| match m {
             ServerMsg::Frame { panes, .. } => panes
                 .iter()
@@ -1356,26 +1402,46 @@ mod tests {
         })
         .expect("frame showing prompt three after up-jump within 5s");
 
-        send(reader.get_mut(), &ClientMsg::PromptJump { up: true });
-        wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes
-                .iter()
-                .any(|p| p.scroll.is_some() && p.text.contains("prompt two")),
-            _ => false,
-        })
-        .expect("frame showing prompt two after second up-jump within 5s");
-
-        send(reader.get_mut(), &ClientMsg::PromptJump { up: true });
-        wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes
-                .iter()
-                .any(|p| p.scroll.is_some() && p.text.contains("prompt one")),
-            _ => false,
-        })
-        .expect("frame showing prompt one after third up-jump within 5s");
+        // The client replays its cursor row from the landing reply: the
+        // anchor is the cursor, not the viewport top, so the walk moves
+        // one prompt per jump instead of re-finding the same one.
+        let mut cursor_row = row;
+        for (needle, label) in [
+            ("prompt two", "second up-jump"),
+            ("prompt one", "third up-jump"),
+        ] {
+            send(
+                reader.get_mut(),
+                &ClientMsg::PromptJump {
+                    up: true,
+                    cursor_row: Some(cursor_row),
+                },
+            );
+            // The reply precedes the frame in the same drain sweep, so
+            // read it first; the frame-wait below would swallow it.
+            let landed = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::PromptLanded { .. }))
+                .expect("PromptLanded reply within 5s");
+            let ServerMsg::PromptLanded { row: r, .. } = landed else {
+                unreachable!()
+            };
+            cursor_row = r;
+            wait_for_msg(&mut reader, |m| match m {
+                ServerMsg::Frame { panes, .. } => panes
+                    .iter()
+                    .any(|p| p.scroll.is_some() && p.text.contains(needle)),
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("frame showing {needle} after {label} within 5s"));
+        }
 
         // Down returns to the next prompt.
-        send(reader.get_mut(), &ClientMsg::PromptJump { up: false });
+        send(
+            reader.get_mut(),
+            &ClientMsg::PromptJump {
+                up: false,
+                cursor_row: Some(cursor_row),
+            },
+        );
         wait_for_msg(&mut reader, |m| match m {
             ServerMsg::Frame { panes, .. } => panes
                 .iter()
@@ -1404,6 +1470,5 @@ mod tests {
             "block stops at the next prompt, got {text:?}"
         );
         drop(reader);
-        let _ = handle.join();
     }
 }

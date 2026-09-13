@@ -36,6 +36,13 @@ pub enum Action {
         drow: isize,
         dcol: isize,
     },
+    /// Copy-mode cursor motion (h/j/k/l and arrows). The client moves
+    /// its viewport cursor and scrolls the pane when the cursor pushes
+    /// past the top or bottom edge.
+    CopyCursorMove {
+        drow: isize,
+        dcol: isize,
+    },
     Yank,
     CancelSelect,
     /// `/` in copy mode: open the search prompt.
@@ -69,9 +76,37 @@ pub enum Action {
 }
 
 // The Ctrl+a leader is the only key corral consumes in input mode. In
-// copy mode every key is consumed: vi keys scroll, everything else does
-// nothing, and no byte ever reaches the pane. `half_page` is the pane
-// height for Ctrl+d/Ctrl+u; it only matters in copy mode.
+// copy mode the leader still arms (tmux-style) so Ctrl+a c and Ctrl+a e
+// reach their actions from scrollback; every other copy key is
+// consumed: vi keys move the cursor, everything else does nothing, and
+// no byte ever reaches the pane. `half_page` is the pane height for
+// Ctrl+d/Ctrl+u; it only matters in copy mode.
+
+/// The shared leader table: the key after Ctrl+a. Used by input mode
+/// and, since the leader arms there too, by copy mode.
+fn leader_action(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
+    match (code, mods) {
+        (KeyCode::Char('h'), _) => Some(Action::Focus(Dir::Horizontal)),
+        (KeyCode::Char('l'), _) => Some(Action::Focus(Dir::Horizontal)),
+        (KeyCode::Char('j'), _) => Some(Action::Focus(Dir::Vertical)),
+        (KeyCode::Char('k'), _) => Some(Action::Focus(Dir::Vertical)),
+        // tmux geometry: % splits right (side by side, cut in width =
+        // Dir::Horizontal here), " splits below (stacked =
+        // Dir::Vertical).
+        (KeyCode::Char('%'), _) => Some(Action::Split(Dir::Horizontal)),
+        (KeyCode::Char('"'), _) => Some(Action::Split(Dir::Vertical)),
+        (KeyCode::Char('o'), _) => Some(Action::FocusNext),
+        (KeyCode::Left, _) => Some(Action::Focus(Dir::Horizontal)),
+        (KeyCode::Right, _) => Some(Action::Focus(Dir::Horizontal)),
+        (KeyCode::Up, _) => Some(Action::Focus(Dir::Vertical)),
+        (KeyCode::Down, _) => Some(Action::Focus(Dir::Vertical)),
+        (KeyCode::Char('['), _) => Some(Action::EnterCopy),
+        (KeyCode::Char('c'), _) => Some(Action::ClearHistory),
+        (KeyCode::Char('e'), _) => Some(Action::EditScrollback),
+        (KeyCode::Char('d'), _) => Some(Action::Quit),
+        _ => None,
+    }
+}
 
 pub fn handle(
     ev: KeyEvent,
@@ -90,14 +125,36 @@ pub fn handle(
         };
     }
     if *mode == Mode::Copy {
+        // The leader works in copy mode (tmux-style): Ctrl+a arms, the
+        // next key goes through the shared leader table (Ctrl+a c clear
+        // history and Ctrl+a e edit scrollback both land from here).
+        if matches!(
+            (ev.code, ev.modifiers),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL)
+        ) {
+            *armed = true;
+            return None;
+        }
+        if *armed {
+            *armed = false;
+            return leader_action(ev.code, ev.modifiers);
+        }
         return match (ev.code, ev.modifiers) {
             // libghostty's ScrollViewport::Delta is "up is negative": k
             // (earlier lines) is negative, j (later lines) is positive.
+            // h/j/k/l and arrows move the copy cursor instead of raw
+            // scrolling; the cursor drags the viewport at the edges.
+            (KeyCode::Char('h'), _) | (KeyCode::Left, _) => {
+                Some(Action::CopyCursorMove { drow: 0, dcol: -1 })
+            }
+            (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
+                Some(Action::CopyCursorMove { drow: 0, dcol: 1 })
+            }
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
-                Some(Action::CopyScroll(ScrollTarget::Delta(1)))
+                Some(Action::CopyCursorMove { drow: 1, dcol: 0 })
             }
             (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
-                Some(Action::CopyScroll(ScrollTarget::Delta(-1)))
+                Some(Action::CopyCursorMove { drow: -1, dcol: 0 })
             }
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 Some(Action::CopyScroll(ScrollTarget::Delta(half_page as isize)))
@@ -117,7 +174,7 @@ pub fn handle(
             (KeyCode::Char('v'), _) => Some(Action::BeginSelect(SelectMode::Span)),
             (KeyCode::Char('V'), _) => Some(Action::BeginSelect(SelectMode::Rect)),
             (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => Some(Action::ExitCopy),
-            // Typing, the leader, focus keys: swallowed, never forwarded.
+            // Typing, focus keys: swallowed, never forwarded.
             _ => None,
         };
     }
@@ -145,29 +202,16 @@ pub fn handle(
     }
     if *armed {
         *armed = false;
-        return match (ev.code, ev.modifiers) {
-            // Ctrl+a Ctrl+a passes a real 0x01 through, tmux-style.
-            (KeyCode::Char('a'), KeyModifiers::CONTROL) => Some(Action::Send(vec![0x01])),
-            (KeyCode::Char('h'), _) => Some(Action::Focus(Dir::Horizontal)),
-            (KeyCode::Char('l'), _) => Some(Action::Focus(Dir::Horizontal)),
-            (KeyCode::Char('j'), _) => Some(Action::Focus(Dir::Vertical)),
-            (KeyCode::Char('k'), _) => Some(Action::Focus(Dir::Vertical)),
-            // tmux geometry: % splits right (side by side, cut in width
-            // = Dir::Horizontal here), " splits below (stacked =
-            // Dir::Vertical).
-            (KeyCode::Char('%'), _) => Some(Action::Split(Dir::Horizontal)),
-            (KeyCode::Char('"'), _) => Some(Action::Split(Dir::Vertical)),
-            (KeyCode::Char('o'), _) => Some(Action::FocusNext),
-            (KeyCode::Left, _) => Some(Action::Focus(Dir::Horizontal)),
-            (KeyCode::Right, _) => Some(Action::Focus(Dir::Horizontal)),
-            (KeyCode::Up, _) => Some(Action::Focus(Dir::Vertical)),
-            (KeyCode::Down, _) => Some(Action::Focus(Dir::Vertical)),
-            (KeyCode::Char('['), _) => Some(Action::EnterCopy),
-            (KeyCode::Char('c'), _) => Some(Action::ClearHistory),
-            (KeyCode::Char('e'), _) => Some(Action::EditScrollback),
-            (KeyCode::Char('d'), _) => Some(Action::Quit),
-            _ => None,
-        };
+        // Ctrl+a Ctrl+a passes a real 0x01 through, tmux-style; it only
+        // exists in input mode, where Ctrl+a means "send".
+        if matches!(
+            (ev.code, ev.modifiers),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL)
+        ) && *mode == Mode::Input
+        {
+            return Some(Action::Send(vec![0x01]));
+        }
+        return leader_action(ev.code, ev.modifiers);
     }
     match (ev.code, ev.modifiers) {
         (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
@@ -785,29 +829,105 @@ mod tests {
     }
 
     #[test]
-    fn copy_mode_j_and_k_scroll_one_line() {
-        // k means earlier lines (up), and libghostty's Delta documents
-        // "up is negative".
+    fn copy_mode_j_and_k_move_the_cursor() {
         assert_eq!(
             copy_action(KeyCode::Char('j'), KeyModifiers::NONE),
-            Action::CopyScroll(ScrollTarget::Delta(1))
+            Action::CopyCursorMove { drow: 1, dcol: 0 }
         );
         assert_eq!(
             copy_action(KeyCode::Char('k'), KeyModifiers::NONE),
-            Action::CopyScroll(ScrollTarget::Delta(-1))
+            Action::CopyCursorMove { drow: -1, dcol: 0 }
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('h'), KeyModifiers::NONE),
+            Action::CopyCursorMove { drow: 0, dcol: -1 }
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('l'), KeyModifiers::NONE),
+            Action::CopyCursorMove { drow: 0, dcol: 1 }
         );
     }
 
     #[test]
-    fn copy_mode_arrows_scroll_like_jk() {
+    fn copy_mode_arrows_move_the_cursor_like_hjkl() {
         assert_eq!(
             copy_action(KeyCode::Down, KeyModifiers::NONE),
-            Action::CopyScroll(ScrollTarget::Delta(1))
+            Action::CopyCursorMove { drow: 1, dcol: 0 }
         );
         assert_eq!(
             copy_action(KeyCode::Up, KeyModifiers::NONE),
-            Action::CopyScroll(ScrollTarget::Delta(-1))
+            Action::CopyCursorMove { drow: -1, dcol: 0 }
         );
+        assert_eq!(
+            copy_action(KeyCode::Left, KeyModifiers::NONE),
+            Action::CopyCursorMove { drow: 0, dcol: -1 }
+        );
+        assert_eq!(
+            copy_action(KeyCode::Right, KeyModifiers::NONE),
+            Action::CopyCursorMove { drow: 0, dcol: 1 }
+        );
+    }
+
+    #[test]
+    fn leader_arms_in_copy_mode_and_clear_history_and_edit_work() {
+        // tmux allows the prefix inside copy mode; Ctrl+a c (clear
+        // history) and Ctrl+a e (edit scrollback) must land from here.
+        let mut armed = false;
+        handle(
+            key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut armed,
+            &Mode::Copy,
+            false,
+            0,
+        );
+        assert!(armed, "copy mode must arm the leader");
+        assert!(matches!(
+            handle(
+                key(KeyCode::Char('c'), KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            ),
+            Some(Action::ClearHistory)
+        ));
+        assert!(!armed);
+        handle(
+            key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut armed,
+            &Mode::Copy,
+            false,
+            0,
+        );
+        assert!(matches!(
+            handle(
+                key(KeyCode::Char('e'), KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            ),
+            Some(Action::EditScrollback)
+        ));
+        // An unknown leader key disarms and swallows.
+        handle(
+            key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut armed,
+            &Mode::Copy,
+            false,
+            0,
+        );
+        assert!(
+            handle(
+                key(KeyCode::Char('z'), KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            )
+            .is_none()
+        );
+        assert!(!armed);
     }
 
     #[test]
@@ -960,8 +1080,9 @@ mod tests {
 
     #[test]
     fn copy_mode_swallows_the_leader_itself() {
-        // Ctrl+a in copy mode must arm nothing and send nothing: the
-        // leader is inactive while navigating scrollback.
+        // Ctrl+a in copy mode arms the leader (tmux-style) but sends
+        // nothing; Ctrl+a Ctrl+a does not pass a literal 0x01 from copy
+        // mode because nothing there is ever forwarded to the pane.
         let mut armed = false;
         assert!(
             handle(
@@ -973,7 +1094,18 @@ mod tests {
             )
             .is_none()
         );
-        assert!(!armed, "copy mode armed the leader");
+        assert!(armed, "copy mode did not arm the leader");
+        assert!(
+            handle(
+                key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            )
+            .is_none(),
+            "leader-leader in copy mode must not send bytes"
+        );
     }
 
     #[test]

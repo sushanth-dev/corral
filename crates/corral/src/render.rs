@@ -1,8 +1,9 @@
+use corral_core::emulation::CellColor;
 use corral_core::tree::PaneId;
 use corrald::protocol::PaneState;
 use ratatui::Frame;
 use ratatui::layout::Rect as RRect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -10,6 +11,12 @@ use ratatui::widgets::Paragraph;
 // focused pane they light up so focus is visible.
 const GUTTER: Color = Color::Indexed(238);
 const FOCUSED_GUTTER: Color = Color::Indexed(245);
+// The copy-mode cursor: a light block over the cell, visible on both
+// dark and light text.
+const CURSOR_BG: Color = Color::Indexed(245);
+// Search matches: yellow on black, distinct from the reversed
+// selection highlight.
+const SEARCH_BG: Color = Color::Indexed(3);
 
 /// Selection highlight spans for one pane: (row, first col, last col
 /// inclusive) in text-grid coordinates.
@@ -33,18 +40,17 @@ pub fn draw(
     focused: PaneId,
     hint: Hint,
     spans: &[(PaneId, SpanList)],
+    search: &[(PaneId, SpanList)],
+    cursor: Option<(usize, usize)>,
 ) {
-    for PaneState {
-        id: _, rect, text, ..
-    } in panes
-    {
+    for pane in panes {
         let rr = RRect {
-            x: rect.x,
-            y: rect.y,
-            width: rect.w,
-            height: rect.h,
+            x: pane.rect.x,
+            y: pane.rect.y,
+            width: pane.rect.w,
+            height: pane.rect.h,
         };
-        let lines: Vec<Line> = text.lines().map(Line::from).collect();
+        let lines = pane_lines(pane);
         // No padding: the tree's 1-cell gutter is the whole separator.
         let para = Paragraph::new(lines);
         frame.render_widget(para, rr);
@@ -53,7 +59,27 @@ pub fn draw(
         let Some(p) = panes.iter().find(|p| p.id == *pane_id) else {
             continue;
         };
-        paint_spans(frame, p, sel_spans);
+        paint_spans(
+            frame,
+            p,
+            sel_spans,
+            Style::new().add_modifier(Modifier::REVERSED),
+        );
+    }
+    // Search hits paint yellow-on-black so they read at a glance.
+    for (pane_id, hit_spans) in search {
+        let Some(p) = panes.iter().find(|p| p.id == *pane_id) else {
+            continue;
+        };
+        paint_spans(
+            frame,
+            p,
+            hit_spans,
+            Style::new().fg(Color::Black).bg(SEARCH_BG),
+        );
+    }
+    if let Some(p) = panes.iter().find(|p| p.id == focused) {
+        paint_cursor(frame, p, cursor);
     }
     paint_gutters(frame, panes, focused);
     if hint != Hint::None {
@@ -61,11 +87,106 @@ pub fn draw(
     }
 }
 
+/// The pane's visible rows as styled ratatui lines. Falls back to plain
+/// `text` when the daemon sent no style runs (tests, benchmarks).
+fn pane_lines(pane: &PaneState) -> Vec<Line<'static>> {
+    if !pane.lines.is_empty() {
+        return pane
+            .lines
+            .iter()
+            .map(|line| {
+                Line::from(
+                    line.runs
+                        .iter()
+                        .map(|run| Span::styled(run.text.clone(), run_style(run)))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+    }
+    pane.text
+        .lines()
+        .map(|l| Line::from(l.to_string()))
+        .collect()
+}
+
+fn run_style(run: &corral_core::emulation::StyledRun) -> Style {
+    let mut style = Style::new();
+    style = match run.fg {
+        CellColor::Default => style,
+        CellColor::Indexed(i) => style.fg(Color::Indexed(i)),
+        CellColor::Rgb(r, g, b) => style.fg(Color::Rgb(r, g, b)),
+    };
+    style = match run.bg {
+        CellColor::Default => style,
+        CellColor::Indexed(i) => style.bg(Color::Indexed(i)),
+        CellColor::Rgb(r, g, b) => style.bg(Color::Rgb(r, g, b)),
+    };
+    let a = run.attrs;
+    let mut mods = Modifier::empty();
+    if a.bold {
+        mods |= Modifier::BOLD;
+    }
+    if a.italic {
+        mods |= Modifier::ITALIC;
+    }
+    if a.underline {
+        mods |= Modifier::UNDERLINED;
+    }
+    if a.strikethrough {
+        mods |= Modifier::CROSSED_OUT;
+    }
+    if a.inverse {
+        mods |= Modifier::REVERSED;
+    }
+    style.add_modifier(mods)
+}
+
+// The copy-mode cursor paints one viewport cell. The pane rect maps
+// the viewport coordinates to screen cells.
+fn paint_cursor(frame: &mut Frame, pane: &PaneState, cursor: Option<(usize, usize)>) {
+    let Some((row, col)) = cursor else {
+        return;
+    };
+    let y = pane.rect.y + row as u16;
+    let x = pane.rect.x + col as u16;
+    if y >= pane.rect.y + pane.rect.h || x >= pane.rect.x + pane.rect.w {
+        return;
+    }
+    let cell = &mut frame.buffer_mut()[(x, y)];
+    cell.set_bg(CURSOR_BG);
+    cell.set_fg(Color::Black);
+}
+
+/// Every occurrence of `needle` in `text` as highlight spans: one
+/// (row, first col, last col inclusive) per match. Empty needles
+/// match nothing.
+pub fn search_spans(text: &str, needle: &str) -> SpanList {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let mut spans = Vec::new();
+    for (row, line) in text.lines().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let mut col = 0;
+        while col + needle_chars.len() <= chars.len() {
+            if chars[col..col + needle_chars.len()] == needle_chars[..] {
+                spans.push((row, col, col + needle_chars.len() - 1));
+                col += needle_chars.len();
+            } else {
+                col += 1;
+            }
+        }
+    }
+    spans
+}
+
 // Reversed style over the selected cells of one pane. Spans carry
 // (row, first col, last col inclusive) in text-grid coordinates; the
-// pane rect maps them to screen cells.
-fn paint_spans(frame: &mut Frame, pane: &PaneState, spans: &SpanList) {
-    let style = Style::new().add_modifier(ratatui::style::Modifier::REVERSED);
+// pane rect maps them to screen cells. `style` decides the paint:
+// REVERSED for selections, yellow for search hits.
+fn paint_spans(frame: &mut Frame, pane: &PaneState, spans: &SpanList, style: Style) {
     let buf = frame.buffer_mut();
     for (row, c0, c1) in spans {
         let y = pane.rect.y + *row as u16;
@@ -179,6 +300,7 @@ mod tests {
             cursor: None,
             app_cursor: false,
             scroll: None,
+            lines: vec![],
         }
     }
 
@@ -195,7 +317,7 @@ mod tests {
         panes: &[PaneState],
         focused: u32,
     ) -> ratatui::buffer::Buffer {
-        draw_with_spans(width, height, panes, focused, Hint::None, &[])
+        draw_full(width, height, panes, focused, Hint::None, &[], &[], None)
     }
 
     fn draw_with_spans(
@@ -206,9 +328,23 @@ mod tests {
         hint: Hint,
         spans: &[(u32, SpanList)],
     ) -> ratatui::buffer::Buffer {
+        draw_full(width, height, panes, focused, hint, spans, &[], None)
+    }
+
+    fn draw_full(
+        width: u16,
+        height: u16,
+        panes: &[PaneState],
+        focused: u32,
+        hint: Hint,
+        spans: &[(u32, SpanList)],
+        search: &[(u32, SpanList)],
+        cursor: Option<(usize, usize)>,
+    ) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, panes, focused, hint, spans)).unwrap();
+        term.draw(|f| draw(f, panes, focused, hint, spans, search, cursor))
+            .unwrap();
         term.backend().buffer().clone()
     }
 
@@ -322,7 +458,7 @@ mod tests {
         let panes = panes();
         let backend = TestBackend::new(101, 10);
         let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, &panes, 1, Hint::Copy(Some((12, 96))), &[]))
+        term.draw(|f| draw(f, &panes, 1, Hint::Copy(Some((12, 96))), &[], &[], None))
             .unwrap();
         let buf = term.backend().buffer().clone();
         assert!(row(&buf, 9, 101).contains("copy mode"));
@@ -336,7 +472,7 @@ mod tests {
         let panes = panes();
         let backend = TestBackend::new(101, 10);
         let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, &panes, 1, Hint::Copy(None), &[]))
+        term.draw(|f| draw(f, &panes, 1, Hint::Copy(None), &[], &[], None))
             .unwrap();
         let buf = term.backend().buffer().clone();
         assert!(row(&buf, 9, 101).contains("copy mode"));
@@ -391,5 +527,132 @@ mod tests {
                 .modifier
                 .contains(ratatui::style::Modifier::REVERSED)
         );
+    }
+
+    #[test]
+    fn styled_runs_paint_fg_bg_and_attributes() {
+        use corral_core::emulation::{CellAttrs, CellColor, StyledLine, StyledRun};
+        let mut p = pane(1, 0, 0, 50, 10, "red bold plain");
+        p.lines = vec![StyledLine {
+            runs: vec![
+                StyledRun {
+                    text: "red".into(),
+                    fg: CellColor::Indexed(1),
+                    bg: CellColor::Default,
+                    attrs: CellAttrs {
+                        bold: true,
+                        ..CellAttrs::default()
+                    },
+                },
+                StyledRun {
+                    text: " bold".into(),
+                    fg: CellColor::Indexed(1),
+                    bg: CellColor::Default,
+                    attrs: CellAttrs {
+                        bold: true,
+                        ..CellAttrs::default()
+                    },
+                },
+                StyledRun {
+                    text: " plain".into(),
+                    fg: CellColor::Default,
+                    bg: CellColor::Rgb(10, 20, 30),
+                    attrs: CellAttrs::default(),
+                },
+            ],
+        }];
+        let panes = vec![p];
+        let buf = draw_at(60, 10, &panes, 1);
+        assert_eq!(buf[(0, 0)].fg, Color::Indexed(1), "red run fg");
+        assert!(buf[(0, 0)].modifier.contains(Modifier::BOLD), "bold run");
+        assert_eq!(buf[(9, 0)].bg, Color::Rgb(10, 20, 30), "rgb bg run paints");
+        assert_eq!(buf[(9, 0)].fg, Color::Reset, "plain run keeps default fg");
+    }
+
+    #[test]
+    fn styled_lines_fall_back_to_plain_text_when_empty() {
+        let panes = panes();
+        let buf = draw_at(101, 10, &panes, 1);
+        assert!(row(&buf, 0, 101).contains("pane-one"));
+    }
+
+    #[test]
+    fn copy_mode_cursor_paints_one_cell() {
+        let panes = panes();
+        let buf = draw_full(101, 10, &panes, 1, Hint::Copy(None), &[], &[], Some((2, 4)));
+        assert_eq!(buf[(4, 2)].bg, CURSOR_BG, "cursor cell carries its bg");
+        assert_eq!(buf[(5, 2)].bg, Color::Reset, "neighbor cells untouched");
+    }
+
+    #[test]
+    fn copy_mode_cursor_clips_at_the_pane_rect() {
+        let panes = panes();
+        let buf = draw_full(
+            101,
+            10,
+            &panes,
+            1,
+            Hint::Copy(None),
+            &[],
+            &[],
+            Some((2, 500)),
+        );
+        assert_eq!(
+            buf[(50, 2)].bg,
+            Color::Reset,
+            "cursor never leaves the pane"
+        );
+    }
+
+    #[test]
+    fn copy_mode_cursor_only_on_the_focused_pane() {
+        let panes = panes();
+        let buf = draw_full(101, 10, &panes, 2, Hint::Copy(None), &[], &[], Some((0, 0)));
+        assert_eq!(
+            buf[(0, 0)].bg,
+            Color::Reset,
+            "unfocused pane shows no cursor"
+        );
+    }
+
+    #[test]
+    fn search_spans_find_every_occurrence_per_row() {
+        let spans = search_spans("abc abc\nxabcx\nnope", "abc");
+        assert_eq!(spans, vec![(0, 0, 2), (0, 4, 6), (1, 1, 3)]);
+    }
+
+    #[test]
+    fn search_spans_of_an_empty_needle_is_empty() {
+        assert!(search_spans("anything", "").is_empty());
+    }
+
+    #[test]
+    fn search_spans_highlight_on_screen() {
+        let panes = panes();
+        let hit_spans = search_spans(&panes[0].text, "pane");
+        let buf = draw_with_spans(
+            101,
+            10,
+            &panes,
+            1,
+            Hint::Copy(None),
+            &[(1, hit_spans.clone())],
+        );
+        // The search spans carry the same highlight style as selections
+        // here (draw_with_spans paints REVERSED); the client passes the
+        // search style through draw_full.
+        assert!(
+            buf[(0, 0)].modifier.contains(Modifier::REVERSED),
+            "match start highlighted"
+        );
+        assert_eq!(hit_spans.len(), 1, "only pane-one's first row matches");
+    }
+
+    #[test]
+    fn search_spans_paint_yellow_in_the_client_style() {
+        // The dedicated search style: yellow bg, not reversed.
+        let style = Style::new().fg(Color::Black).bg(SEARCH_BG);
+        assert_eq!(style.bg, Some(SEARCH_BG));
+        assert!(!style.add_modifier.contains(Modifier::REVERSED));
     }
 }
