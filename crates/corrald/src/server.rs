@@ -330,7 +330,28 @@ impl Daemon {
 fn write_msg(writer: &mut UnixStream, msg: &ServerMsg) -> Result<()> {
     let mut line = serde_json::to_string(msg)?;
     line.push('\n');
-    writer.write_all(line.as_bytes())?;
+    write_all_blocking(writer, line.as_bytes())
+}
+
+// The client stream is nonblocking; a full socket buffer returns
+// WouldBlock (EAGAIN), which is retryable, not fatal. Spin with a short
+// sleep until the kernel takes the rest. Without this, a large styled
+// frame kills the daemon when the socket buffer fills.
+fn write_all_blocking(writer: &mut UnixStream, mut bytes: &[u8]) -> Result<()> {
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => {
+                return Err(
+                    std::io::Error::new(std::io::ErrorKind::WriteZero, "zero write").into(),
+                );
+            }
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
     writer.flush()?;
     Ok(())
 }
