@@ -183,6 +183,12 @@ impl Daemon {
                     pane.send(PaneCmd::ClearHistory)?;
                 }
             }
+            ClientMsg::DumpScrollback { pane } => {
+                let target = pane.unwrap_or(self.focused);
+                if let Some(p) = self.panes.get(&target) {
+                    p.send(PaneCmd::DumpScrollback)?;
+                }
+            }
         }
         Ok(())
     }
@@ -211,6 +217,10 @@ impl Daemon {
                     // A search reply goes straight to the client, outside
                     // the normal frame cadence.
                     write_msg(writer, &ServerMsg::SearchResult { pane, rows })?;
+                }
+                Ok(PaneOut::ScrollbackDump { pane, text }) => {
+                    // Same out-of-band path as the search reply (S3-7).
+                    write_msg(writer, &ServerMsg::ScrollbackDump { pane, text })?;
                 }
                 Ok(PaneOut::Exited { pane }) => {
                     // The worker also reports Exited when its command
@@ -1236,6 +1246,48 @@ mod tests {
             panes[0].scroll.is_none(),
             "scrollback is empty: viewport cannot move"
         );
+        drop(reader);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn dump_scrollback_returns_all_sixty_lines() {
+        let (sock, handle) = start_daemon("dump");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "seq 1 60; sleep 30".into()],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut reader = BufReader::new(client);
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("60")),
+            _ => false,
+        })
+        .expect("bottom frame showing line 60 within 5s");
+
+        send(reader.get_mut(), &ClientMsg::DumpScrollback { pane: None });
+        let reply = wait_for_msg(&mut reader, |m| {
+            matches!(m, ServerMsg::ScrollbackDump { .. })
+        })
+        .expect("ScrollbackDump within 5s");
+        let ServerMsg::ScrollbackDump { pane, text } = reply else {
+            unreachable!()
+        };
+        assert!(pane > 0, "reply names the pane it dumped");
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            60,
+            "all 60 lines are in the dump, got {}",
+            lines.len()
+        );
+        assert_eq!(lines.first().copied(), Some("1"), "dump starts at line 1");
+        assert_eq!(lines.last().copied(), Some("60"), "dump ends at line 60");
         drop(reader);
         let _ = handle.join();
     }

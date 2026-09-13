@@ -43,6 +43,11 @@ pub enum ClientMsg {
     },
     /// Erase the focused pane's scrollback (CSI 3 J).
     ClearHistory,
+    /// Dump a pane's full scrollback (S3-7). `None` means the focused
+    /// pane; the reply rides ServerMsg::ScrollbackDump.
+    DumpScrollback {
+        pane: Option<PaneId>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -59,6 +64,12 @@ pub enum ServerMsg {
     SearchResult {
         pane: PaneId,
         rows: Vec<usize>,
+    },
+    /// The named pane's full scrollback as plain text (S3-7), one
+    /// screen-space row per line.
+    ScrollbackDump {
+        pane: PaneId,
+        text: String,
     },
 }
 
@@ -132,6 +143,8 @@ mod tests {
                 reverse: true,
             },
             ClientMsg::ClearHistory,
+            ClientMsg::DumpScrollback { pane: None },
+            ClientMsg::DumpScrollback { pane: Some(3) },
         ];
         for msg in msgs {
             let line = serde_json::to_string(&msg).unwrap();
@@ -194,6 +207,16 @@ mod tests {
         })
         .unwrap();
         assert!(empty.contains("\"rows\":[]"), "got {empty}");
+    }
+
+    #[test]
+    fn scrollback_dump_round_trips() {
+        let msg = ServerMsg::ScrollbackDump {
+            pane: 5,
+            text: "line one\nline two\n".into(),
+        };
+        let back: ServerMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(back, msg);
     }
 
     #[test]

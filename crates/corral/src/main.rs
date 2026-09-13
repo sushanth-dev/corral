@@ -1,5 +1,6 @@
 mod benchmark;
 mod clipboard;
+mod edit;
 mod input;
 mod render;
 mod selection;
@@ -128,6 +129,11 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     // carrying the new viewport follows right behind. No
                     // highlight in v0.2 (plan Task 5 known gap).
                 }
+                ServerMsg::ScrollbackDump { .. } => {
+                    // Only meaningful in the EditScrollback flow, which
+                    // reads the socket directly; anything arriving in the
+                    // normal loop is stale.
+                }
             }
         }
         let focused_pane = panes.iter().find(|p| p.id == focused);
@@ -223,6 +229,48 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 }
                 Some(input::Action::ClearHistory) => {
                     send_msg(writer, &ClientMsg::ClearHistory)?;
+                }
+                Some(input::Action::EditScrollback) => {
+                    send_msg(writer, &ClientMsg::DumpScrollback { pane: None })?;
+                    // Wait for the dump synchronously: switch the socket
+                    // to blocking with a timeout, skipping frames that
+                    // arrive first.
+                    reader
+                        .get_mut()
+                        .set_read_timeout(Some(Duration::from_secs(5)))?;
+                    let dump = loop {
+                        let mut chunk = String::new();
+                        match std::io::BufRead::read_line(&mut reader, &mut chunk) {
+                            Ok(0) => anyhow::bail!("daemon closed during scrollback dump"),
+                            Ok(_) => {}
+                            Err(e) => anyhow::bail!("no scrollback dump within 5s: {e}"),
+                        }
+                        if let Ok(ServerMsg::ScrollbackDump { text, .. }) =
+                            serde_json::from_str(chunk.trim())
+                        {
+                            break text;
+                        }
+                    };
+                    reader.get_mut().set_read_timeout(None)?;
+                    reader.get_mut().set_nonblocking(true)?;
+                    // Suspend the TUI, hand the dump to the editor, then
+                    // restore; the dump file is deleted inside the flow.
+                    let _ = crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::terminal::LeaveAlternateScreen
+                    );
+                    crossterm::terminal::disable_raw_mode()?;
+                    let edit_result = edit::edit_scrollback(&dump, &mut edit::spawn_editor);
+                    crossterm::terminal::enable_raw_mode()?;
+                    let _ = crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::terminal::EnterAlternateScreen
+                    );
+                    // Force a full repaint: the editor scribbled on the
+                    // screen behind ratatui's diff cache.
+                    terminal.clear()?;
+                    last_drawn = None;
+                    edit_result?;
                 }
                 Some(input::Action::Split(dir)) => {
                     let (cmd, args) = pane_command();

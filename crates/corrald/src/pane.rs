@@ -30,6 +30,9 @@ pub enum PaneCmd {
     },
     /// Erase the pane's scrollback (S3-6).
     ClearHistory,
+    /// Produce the pane's full scrollback text (S3-7); the reply rides
+    /// PaneOut as a ScrollbackDump the daemon core forwards to the client.
+    DumpScrollback,
     /// Rebuild and resend the snapshot even if nothing changed.
     #[allow(dead_code)]
     Render,
@@ -44,6 +47,11 @@ pub enum PaneOut {
     SearchResult {
         pane: PaneId,
         rows: Vec<usize>,
+    },
+    /// Reply to PaneCmd::DumpScrollback (S3-7).
+    ScrollbackDump {
+        pane: PaneId,
+        text: String,
     },
     Exited {
         pane: PaneId,
@@ -136,6 +144,10 @@ fn run_worker(
                     emu.clear_history();
                     push_snapshot(id, &mut emu, cols, rows, &out);
                 }
+                PaneCmd::DumpScrollback => {
+                    let text = emu.dump_scrollback().unwrap_or_default();
+                    let _ = out.send(PaneOut::ScrollbackDump { pane: id, text });
+                }
                 PaneCmd::Render => {
                     push_snapshot(id, &mut emu, cols, rows, &out);
                 }
@@ -210,6 +222,7 @@ mod tests {
         while !(got_hello && got_world) && std::time::Instant::now() < deadline {
             match out_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(PaneOut::SearchResult { .. }) => {}
+                Ok(PaneOut::ScrollbackDump { .. }) => {}
                 Ok(PaneOut::Snapshot { pane, state }) => {
                     assert!(pane == 7 || pane == 9, "unknown pane id {pane}");
                     if state.text.contains("hello") {

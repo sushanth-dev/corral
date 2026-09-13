@@ -49,10 +49,23 @@ impl Emulator {
         Ok(hits)
     }
 
+    /// The full scrollback plus active screen as plain text, one
+    /// screen-space row per line (S3-7). This is what the client writes
+    /// to the temp file for $EDITOR.
+    pub fn dump_scrollback(&mut self) -> Result<String> {
+        let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
+        let mut out = String::new();
+        for row in 0..total {
+            out.push_str(&self.row_text(row)?);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
     /// One screen-space row as plain text. Each cell resolves through
-    /// `grid_ref`; search is a one-shot operation so the documented
-    /// cost of screen-space lookups is acceptable.
-    fn row_text(&mut self, row: usize) -> Result<String> {
+    /// `grid_ref`; one-shot operations (search, dump) accept the
+    /// documented cost of screen-space lookups.
+    pub(crate) fn row_text(&mut self, row: usize) -> Result<String> {
         let cols = self.terminal.cols()?;
         let mut line = String::new();
         let mut buf = [0 as char; 8];
@@ -139,5 +152,38 @@ mod tests {
         emu.scroll(ScrollTarget::Top);
         let hits = emu.search("NEEDLEMARK", None, false).unwrap();
         assert_eq!(hits.first().copied(), Some(0));
+    }
+
+    #[test]
+    fn dump_scrollback_returns_every_screen_space_row() {
+        // 50 lines into an 80x24 emulator: history plus active screen,
+        // all in order. The grid also carries blank rows (the cursor
+        // line below the last feed), so compare the non-empty lines.
+        let mut emu = marker_emulator();
+        let dump = emu.dump_scrollback().unwrap();
+        let lines: Vec<&str> = dump.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 50, "every fed line is in the dump");
+        assert!(
+            lines.first().unwrap().contains("NEEDLEMARK line 0"),
+            "top of scrollback first, got {:?}",
+            lines.first().unwrap()
+        );
+        assert!(
+            lines.last().unwrap().contains("plain line 49"),
+            "active screen last, got {:?}",
+            lines.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn dump_scrollback_of_a_fresh_screen_has_no_content() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        assert!(
+            emu.dump_scrollback()
+                .unwrap()
+                .lines()
+                .all(|l| l.trim().is_empty()),
+            "fresh screen dumps blank rows only"
+        );
     }
 }

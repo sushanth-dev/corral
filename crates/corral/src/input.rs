@@ -54,6 +54,8 @@ pub enum Action {
     SearchPrev,
     /// Leader `c`: erase the focused pane's scrollback.
     ClearHistory,
+    /// Leader `e`: open the focused pane's scrollback in an editor.
+    EditScrollback,
 }
 
 // The Ctrl+a leader is the only key corral consumes in input mode. In
@@ -138,6 +140,7 @@ pub fn handle(
             (KeyCode::Char('v'), _) => Some(Action::Split(Dir::Horizontal)),
             (KeyCode::Char('['), _) => Some(Action::EnterCopy),
             (KeyCode::Char('c'), _) => Some(Action::ClearHistory),
+            (KeyCode::Char('e'), _) => Some(Action::EditScrollback),
             (KeyCode::Char('d'), _) => Some(Action::Quit),
             _ => None,
         };
@@ -669,6 +672,9 @@ mod tests {
             }),
             (KeyCode::Char('c'), |a: &Action| {
                 matches!(a, Action::ClearHistory)
+            }),
+            (KeyCode::Char('e'), |a: &Action| {
+                matches!(a, Action::EditScrollback)
             }),
             (KeyCode::Char('d'), |a: &Action| matches!(a, Action::Quit)),
         ];
