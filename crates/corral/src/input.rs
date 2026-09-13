@@ -2,13 +2,16 @@ use corral_core::tree::Dir;
 use corrald::protocol::ScrollTarget;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::selection::SelectMode;
+
 /// Client input mode. Copy mode (Ctrl+a [) routes keys to scrollback
 /// navigation and swallows everything else; nothing binds a bare key in
-/// input mode.
+/// input mode. Select is copy mode with an active v/V selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Input,
     Copy,
+    Select(SelectMode),
 }
 
 #[derive(Debug, PartialEq)]
@@ -22,6 +25,17 @@ pub enum Action {
     EnterCopy,
     CopyScroll(ScrollTarget),
     ExitCopy,
+    BeginSelect(SelectMode),
+    /// Motion while a selection is active: move the selection cursor by
+    /// (drow, dcol) within the visible grid. Coordinates are
+    /// viewport-relative; the recorded simplification means no scrolling
+    /// mid-selection.
+    SelectMove {
+        drow: isize,
+        dcol: isize,
+    },
+    Yank,
+    CancelSelect,
 }
 
 // The Ctrl+a leader is the only key corral consumes in input mode. In
@@ -52,8 +66,32 @@ pub fn handle(
             }
             (KeyCode::Char('g'), _) => Some(Action::CopyScroll(ScrollTarget::Top)),
             (KeyCode::Char('G'), _) => Some(Action::CopyScroll(ScrollTarget::Bottom)),
+            (KeyCode::Char('v'), _) => Some(Action::BeginSelect(SelectMode::Span)),
+            (KeyCode::Char('V'), _) => Some(Action::BeginSelect(SelectMode::Rect)),
             (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => Some(Action::ExitCopy),
             // Typing, the leader, focus keys: swallowed, never forwarded.
+            _ => None,
+        };
+    }
+    if matches!(mode, Mode::Select(_)) {
+        return match (ev.code, ev.modifiers) {
+            (KeyCode::Char('v'), _) => Some(Action::CancelSelect),
+            (KeyCode::Char('V'), _) => Some(Action::CancelSelect),
+            (KeyCode::Char('y'), _) | (KeyCode::Enter, _) => Some(Action::Yank),
+            (KeyCode::Esc, _) => Some(Action::CancelSelect),
+            (KeyCode::Char('q'), _) => Some(Action::ExitCopy),
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
+                Some(Action::SelectMove { drow: 1, dcol: 0 })
+            }
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
+                Some(Action::SelectMove { drow: -1, dcol: 0 })
+            }
+            (KeyCode::Char('h'), _) | (KeyCode::Left, _) => {
+                Some(Action::SelectMove { drow: 0, dcol: -1 })
+            }
+            (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
+                Some(Action::SelectMove { drow: 0, dcol: 1 })
+            }
             _ => None,
         };
     }
@@ -654,6 +692,11 @@ mod tests {
             .unwrap_or_else(|| panic!("{code:?} {mods:?} produced no action in copy mode"))
     }
 
+    fn select_action(code: KeyCode, mods: KeyModifiers, mode: Mode) -> Option<Action> {
+        let mut armed = false;
+        handle(key(code, mods), &mut armed, &mode, false, 12)
+    }
+
     #[test]
     fn leader_bracket_enters_copy_mode_from_input() {
         assert!(matches!(
@@ -707,6 +750,81 @@ mod tests {
         assert_eq!(
             copy_action(KeyCode::Char('G'), KeyModifiers::NONE),
             Action::CopyScroll(ScrollTarget::Bottom)
+        );
+    }
+
+    #[test]
+    fn copy_mode_v_and_v_begin_selection() {
+        assert_eq!(
+            copy_action(KeyCode::Char('v'), KeyModifiers::NONE),
+            Action::BeginSelect(SelectMode::Span)
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('V'), KeyModifiers::NONE),
+            Action::BeginSelect(SelectMode::Rect)
+        );
+    }
+
+    #[test]
+    fn select_mode_motions_move_the_cursor() {
+        let mode = Mode::Select(SelectMode::Span);
+        assert_eq!(
+            select_action(KeyCode::Char('j'), KeyModifiers::NONE, mode),
+            Some(Action::SelectMove { drow: 1, dcol: 0 })
+        );
+        assert_eq!(
+            select_action(KeyCode::Char('k'), KeyModifiers::NONE, mode),
+            Some(Action::SelectMove { drow: -1, dcol: 0 })
+        );
+        assert_eq!(
+            select_action(KeyCode::Char('h'), KeyModifiers::NONE, mode),
+            Some(Action::SelectMove { drow: 0, dcol: -1 })
+        );
+        assert_eq!(
+            select_action(KeyCode::Char('l'), KeyModifiers::NONE, mode),
+            Some(Action::SelectMove { drow: 0, dcol: 1 })
+        );
+        assert_eq!(
+            select_action(KeyCode::Left, KeyModifiers::NONE, mode),
+            Some(Action::SelectMove { drow: 0, dcol: -1 })
+        );
+        assert_eq!(
+            select_action(KeyCode::Right, KeyModifiers::NONE, mode),
+            Some(Action::SelectMove { drow: 0, dcol: 1 })
+        );
+    }
+
+    #[test]
+    fn select_mode_y_and_enter_yank() {
+        let mode = Mode::Select(SelectMode::Rect);
+        assert_eq!(
+            select_action(KeyCode::Char('y'), KeyModifiers::NONE, mode),
+            Some(Action::Yank)
+        );
+        assert_eq!(
+            select_action(KeyCode::Enter, KeyModifiers::NONE, mode),
+            Some(Action::Yank)
+        );
+    }
+
+    #[test]
+    fn select_mode_v_esc_cancel_and_q_exit() {
+        let mode = Mode::Select(SelectMode::Span);
+        assert_eq!(
+            select_action(KeyCode::Char('v'), KeyModifiers::NONE, mode),
+            Some(Action::CancelSelect)
+        );
+        assert_eq!(
+            select_action(KeyCode::Char('V'), KeyModifiers::NONE, mode),
+            Some(Action::CancelSelect)
+        );
+        assert_eq!(
+            select_action(KeyCode::Esc, KeyModifiers::NONE, mode),
+            Some(Action::CancelSelect)
+        );
+        assert_eq!(
+            select_action(KeyCode::Char('q'), KeyModifiers::NONE, mode),
+            Some(Action::ExitCopy)
         );
     }
 

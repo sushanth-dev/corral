@@ -11,15 +11,27 @@ use ratatui::widgets::Paragraph;
 const GUTTER: Color = Color::Indexed(238);
 const FOCUSED_GUTTER: Color = Color::Indexed(245);
 
+/// Selection highlight spans for one pane: (row, first col, last col
+/// inclusive) in text-grid coordinates.
+pub type SpanList = Vec<(usize, usize, usize)>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hint {
     None,
     /// Copy mode active; carries the focused pane's viewport position
     /// (`None` while pinned to the bottom).
     Copy(Option<(usize, usize)>),
+    /// Copy mode with an active selection.
+    Select,
 }
 
-pub fn draw(frame: &mut Frame, panes: &[PaneState], focused: PaneId, hint: Hint) {
+pub fn draw(
+    frame: &mut Frame,
+    panes: &[PaneState],
+    focused: PaneId,
+    hint: Hint,
+    spans: &[(PaneId, SpanList)],
+) {
     for PaneState {
         id: _, rect, text, ..
     } in panes
@@ -35,9 +47,36 @@ pub fn draw(frame: &mut Frame, panes: &[PaneState], focused: PaneId, hint: Hint)
         let para = Paragraph::new(lines);
         frame.render_widget(para, rr);
     }
+    for (pane_id, sel_spans) in spans {
+        let Some(p) = panes.iter().find(|p| p.id == *pane_id) else {
+            continue;
+        };
+        paint_spans(frame, p, sel_spans);
+    }
     paint_gutters(frame, panes, focused);
     if hint != Hint::None {
         draw_hint(frame, hint);
+    }
+}
+
+// Reversed style over the selected cells of one pane. Spans carry
+// (row, first col, last col inclusive) in text-grid coordinates; the
+// pane rect maps them to screen cells.
+fn paint_spans(frame: &mut Frame, pane: &PaneState, spans: &SpanList) {
+    let style = Style::new().add_modifier(ratatui::style::Modifier::REVERSED);
+    let buf = frame.buffer_mut();
+    for (row, c0, c1) in spans {
+        let y = pane.rect.y + *row as u16;
+        if y >= pane.rect.y + pane.rect.h {
+            continue;
+        }
+        for col in *c0..=*c1 {
+            let x = pane.rect.x + col as u16;
+            if x >= pane.rect.x + pane.rect.w {
+                break;
+            }
+            buf[(x, y)].set_style(style);
+        }
     }
 }
 
@@ -53,6 +92,7 @@ fn draw_hint(frame: &mut Frame, hint: Hint) {
         Hint::Copy(Some((offset, total))) => {
             format!(" copy mode {offset}/{total} ")
         }
+        Hint::Select => " copy mode select ".to_string(),
     };
     let style = Style::new().fg(Color::Black).bg(Color::Indexed(245));
     let width = text.len() as u16;
@@ -152,9 +192,20 @@ mod tests {
         panes: &[PaneState],
         focused: u32,
     ) -> ratatui::buffer::Buffer {
+        draw_with_spans(width, height, panes, focused, Hint::None, &[])
+    }
+
+    fn draw_with_spans(
+        width: u16,
+        height: u16,
+        panes: &[PaneState],
+        focused: u32,
+        hint: Hint,
+        spans: &[(u32, SpanList)],
+    ) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, panes, focused, Hint::None)).unwrap();
+        term.draw(|f| draw(f, panes, focused, hint, spans)).unwrap();
         term.backend().buffer().clone()
     }
 
@@ -268,7 +319,7 @@ mod tests {
         let panes = panes();
         let backend = TestBackend::new(101, 10);
         let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, &panes, 1, Hint::Copy(Some((12, 96)))))
+        term.draw(|f| draw(f, &panes, 1, Hint::Copy(Some((12, 96))), &[]))
             .unwrap();
         let buf = term.backend().buffer().clone();
         assert!(row(&buf, 9, 101).contains("copy mode"));
@@ -282,9 +333,60 @@ mod tests {
         let panes = panes();
         let backend = TestBackend::new(101, 10);
         let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, &panes, 1, Hint::Copy(None))).unwrap();
+        term.draw(|f| draw(f, &panes, 1, Hint::Copy(None), &[]))
+            .unwrap();
         let buf = term.backend().buffer().clone();
         assert!(row(&buf, 9, 101).contains("copy mode"));
         assert!(!row(&buf, 9, 101).contains("/"));
+    }
+
+    #[test]
+    fn selection_spans_render_reversed() {
+        let panes = panes();
+        let buf = draw_with_spans(101, 10, &panes, 1, Hint::Select, &[(1, vec![(0, 0, 3)])]);
+        // The first four cells of pane one carry the reversed modifier.
+        for x in 0..4u16 {
+            assert!(
+                buf[(x, 0)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED),
+                "cell ({x},0) not reversed"
+            );
+        }
+        // Cell 4 of row 0 is outside the span.
+        assert!(
+            !buf[(4, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        // The select hint renders too.
+        assert!(row(&buf, 9, 101).contains("select"));
+    }
+
+    #[test]
+    fn selection_spans_clip_at_the_pane_rect() {
+        // Span reaches past the pane width; nothing paints into the
+        // gutter or the neighbor.
+        let panes = panes();
+        let buf = draw_with_spans(101, 10, &panes, 1, Hint::None, &[(1, vec![(0, 0, 500)])]);
+        for x in 50..101u16 {
+            assert!(
+                !buf[(x, 0)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            );
+        }
+    }
+
+    #[test]
+    fn selection_spans_for_an_unknown_pane_are_ignored() {
+        let panes = panes();
+        let buf = draw_with_spans(101, 10, &panes, 1, Hint::None, &[(99, vec![(0, 0, 5)])]);
+        assert!(row(&buf, 0, 101).contains("pane-two"));
+        assert!(
+            !buf[(51, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
     }
 }

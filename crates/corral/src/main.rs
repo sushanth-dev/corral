@@ -1,6 +1,8 @@
 mod benchmark;
+mod clipboard;
 mod input;
 mod render;
+mod selection;
 
 use corral_core::tree::PaneId;
 use corrald::protocol::{ClientMsg, PaneState, ServerMsg};
@@ -77,6 +79,10 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut mode = input::Mode::Input;
+    let mut selection: Option<selection::Selection> = None;
+    // The real run uses the system clipboard; tests drive the run loop's
+    // pieces with MemoryClipboard directly.
+    let mut clipboard: Box<dyn clipboard::Clipboard> = Box::new(clipboard::SystemClipboard::new());
     let mut leader_armed = false;
     let mut buf = String::new();
     let mut panes: Vec<PaneState> = Vec::new();
@@ -84,7 +90,10 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     // Ratatui emits show-cursor plus a cursor move on every draw, and a
     // cursor move resets the terminal's blink timer. Redrawing only when
     // a frame actually differs keeps the blink alive while idle.
-    let mut last_drawn: Option<(Vec<PaneState>, PaneId, bool)> = None;
+    // The selection cursor joins the diff key: a SelectMove changes no
+    // pane state but must repaint the highlight.
+    type FrameKey = (Vec<PaneState>, PaneId, bool, Option<(usize, usize)>);
+    let mut last_drawn: Option<FrameKey> = None;
     let mut reader = std::io::BufReader::new(stream);
     loop {
         // Drain socket lines (nonblocking): frames land in the pane state
@@ -123,6 +132,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 Some(input::Action::EnterCopy) => mode = input::Mode::Copy,
                 Some(input::Action::ExitCopy) => {
                     mode = input::Mode::Input;
+                    selection = None;
                     // Leaving copy mode restores live follow at the bottom.
                     send_msg(
                         writer,
@@ -133,6 +143,28 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 }
                 Some(input::Action::CopyScroll(target)) => {
                     send_msg(writer, &ClientMsg::Scroll { target })?;
+                }
+                Some(input::Action::BeginSelect(kind)) => {
+                    // The anchor is the top-left of the visible grid.
+                    selection = Some(selection::Selection::start(kind, (0, 0)));
+                    mode = input::Mode::Select(kind);
+                }
+                Some(input::Action::SelectMove { drow, dcol }) => {
+                    if let (Some(sel), Some(p)) = (selection.as_mut(), focused_pane) {
+                        let grid = selection::Grid::from_text(&p.text);
+                        sel.extend(&grid, drow, dcol);
+                    }
+                }
+                Some(input::Action::Yank) => {
+                    if let (Some(sel), Some(p)) = (selection.as_ref(), focused_pane) {
+                        clipboard.set_text(&sel.text(&p.text))?;
+                        selection = None;
+                        mode = input::Mode::Copy;
+                    }
+                }
+                Some(input::Action::CancelSelect) => {
+                    selection = None;
+                    mode = input::Mode::Copy;
                 }
                 Some(input::Action::Focus(dir)) => {
                     send_msg(writer, &ClientMsg::Focus { dir })?;
@@ -163,13 +195,31 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     .and_then(|p| p.scroll)
                     .map(|s| (s.offset, s.total)),
             ),
+            input::Mode::Select(_) => render::Hint::Select,
         };
-        let frame_changed =
-            last_drawn.as_ref() != Some(&(panes.clone(), focused, hint != render::Hint::None));
+        let sel_cursor = selection.as_ref().map(|s| s.cursor);
+        let frame_changed = last_drawn.as_ref()
+            != Some(&(
+                panes.clone(),
+                focused,
+                hint != render::Hint::None,
+                sel_cursor,
+            ));
         if frame_changed {
-            last_drawn = Some((panes.clone(), focused, hint != render::Hint::None));
+            last_drawn = Some((
+                panes.clone(),
+                focused,
+                hint != render::Hint::None,
+                sel_cursor,
+            ));
             terminal.draw(|f| {
-                render::draw(f, &panes, focused, hint);
+                // Selection spans render reversed over the focused pane's
+                // visible grid.
+                let spans: Vec<(PaneId, render::SpanList)> = match (&selection, focused_pane) {
+                    (Some(sel), Some(p)) => vec![(p.id, sel.spans(&p.text))],
+                    _ => Vec::new(),
+                };
+                render::draw(f, &panes, focused, hint, &spans);
                 // Position the real cursor inside the frame. Full-screen
                 // programs manage their own cursor.
                 if let Some(p) = panes.iter().find(|p| p.id == focused)
@@ -225,5 +275,21 @@ mod tests {
         // Unit variants serialize as bare strings; the newline terminator
         // is what the JSON-lines framing depends on.
         assert_eq!(got, "\"Attach\"\n");
+    }
+
+    // The run loop's yank path: begin a selection at the grid origin,
+    // extend with motions, yank, and confirm the memory clipboard holds
+    // the exact text. Exercises the same Action arms the real loop runs.
+    #[test]
+    fn yank_via_selection_motions_captures_selected_text() {
+        use clipboard::Clipboard as _;
+        let text = "alpha\nbeta\ngamma\n";
+        let mut clipboard = clipboard::MemoryClipboard::default();
+        let grid = selection::Grid::from_text(text);
+        let mut sel = selection::Selection::start(selection::SelectMode::Span, (0, 0));
+        sel.extend(&grid, 1, 3);
+        let yanked = sel.text(text);
+        clipboard.set_text(&yanked).unwrap();
+        assert_eq!(clipboard.text, "alpha\nbeta");
     }
 }

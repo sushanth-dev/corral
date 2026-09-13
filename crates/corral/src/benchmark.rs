@@ -92,7 +92,7 @@ mod bench {
             }
             let snapshot = panes.clone();
             terminal
-                .draw(|frame| render::draw(frame, &snapshot, focused, render::Hint::None))
+                .draw(|frame| render::draw(frame, &snapshot, focused, render::Hint::None, &[]))
                 .expect("draw");
             times.push(start.elapsed().as_millis());
         }
