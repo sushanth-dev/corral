@@ -1,6 +1,15 @@
 use corral_core::tree::{Dir, PaneId, Rect};
 use serde::{Deserialize, Serialize};
 
+/// Where to scroll a pane's viewport. Mirrors
+/// `corral_core::emulation::ScrollTarget` over the wire.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
+pub enum ScrollTarget {
+    Delta(isize),
+    Top,
+    Bottom,
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub enum ClientMsg {
     Attach,
@@ -19,6 +28,9 @@ pub enum ClientMsg {
     },
     Focus {
         dir: Dir,
+    },
+    Scroll {
+        target: ScrollTarget,
     },
 }
 
@@ -45,6 +57,20 @@ pub struct PaneState {
     /// The pane requested application cursor keys (DECCKM); the client
     /// then sends arrows as ESC O A..D instead of ESC [ A..D.
     pub app_cursor: bool,
+    /// The viewport's position inside scrollback, `None` when pinned to
+    /// the bottom (live follow). The client shows a position indicator
+    /// from this and stops forwarding arrow keys to the PTY while set.
+    pub scroll: Option<ScrollPos>,
+}
+
+/// Scroll position of one pane's viewport, mirrored from
+/// `corral_core::emulation::ScrollPos`.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
+pub struct ScrollPos {
+    /// Rows the viewport top is above the bottom of the active screen.
+    pub offset: usize,
+    /// Total scrollback rows.
+    pub total: usize,
 }
 
 #[cfg(test)]
@@ -69,6 +95,15 @@ mod tests {
             ClientMsg::Focus {
                 dir: Dir::Horizontal,
             },
+            ClientMsg::Scroll {
+                target: ScrollTarget::Delta(-10),
+            },
+            ClientMsg::Scroll {
+                target: ScrollTarget::Top,
+            },
+            ClientMsg::Scroll {
+                target: ScrollTarget::Bottom,
+            },
         ];
         for msg in msgs {
             let line = serde_json::to_string(&msg).unwrap();
@@ -91,12 +126,20 @@ mod tests {
                 text: "text".into(),
                 cursor: Some((10, 3)),
                 app_cursor: false,
+                scroll: Some(ScrollPos {
+                    offset: 12,
+                    total: 96,
+                }),
             }],
             focused: 1,
         };
         let line = serde_json::to_string(&msg).unwrap();
         assert!(line.contains("\"panes\":[{\"id\":1,"));
         assert!(line.contains("\"focused\":1"));
+        assert!(
+            line.contains("\"scroll\":{\"offset\":12,\"total\":96}"),
+            "scroll position must ride on the pane state: {line}"
+        );
         let back: ServerMsg = serde_json::from_str(&line).unwrap();
         assert!(matches!(back, ServerMsg::Frame { focused: 1, .. }));
     }
@@ -174,6 +217,7 @@ mod tests {
                 text: "héllo こんにちは \"quoted\" \\\nnewline".into(),
                 cursor: None,
                 app_cursor: true,
+                scroll: None,
             }],
             focused: 1,
         };

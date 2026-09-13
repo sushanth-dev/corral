@@ -1,6 +1,7 @@
 use crate::pane::{PaneCmd, PaneOut, PaneWorker};
 use crate::protocol::{ClientMsg, PaneState, ServerMsg};
 use anyhow::Result;
+use corral_core::emulation::ScrollTarget;
 use corral_core::tree::{Node, PaneId, Rect};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -151,6 +152,16 @@ impl Daemon {
             ClientMsg::Focus { dir } => {
                 if let Some(next) = self.root.focus_dir(self.focused, *dir) {
                     self.focused = next;
+                }
+            }
+            ClientMsg::Scroll { target } => {
+                if let Some(pane) = self.panes.get(&self.focused) {
+                    let target = match target {
+                        crate::protocol::ScrollTarget::Delta(d) => ScrollTarget::Delta(*d),
+                        crate::protocol::ScrollTarget::Top => ScrollTarget::Top,
+                        crate::protocol::ScrollTarget::Bottom => ScrollTarget::Bottom,
+                    };
+                    pane.send(PaneCmd::Scroll(target))?;
                 }
             }
         }
@@ -963,5 +974,83 @@ mod tests {
             !uid.is_empty() && uid.chars().all(|c| c.is_ascii_digit()),
             "uid suffix {uid:?} is not numeric"
         );
+    }
+
+    #[test]
+    fn scroll_command_moves_the_viewport_and_reports_position() {
+        let (sock, handle) = start_daemon("scroll");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "seq 1 60; sleep 30".into()],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut reader = BufReader::new(client);
+        // Pinned to the bottom: scroll is None and the last line shows.
+        let bottom = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.text.contains("60") && p.scroll.is_none()),
+            _ => false,
+        })
+        .expect("bottom frame with line 60 and scroll None within 5s");
+        let ServerMsg::Frame { panes, .. } = bottom else {
+            unreachable!()
+        };
+        let bottom_text = panes[0].text.clone();
+        let last = bottom_text
+            .lines()
+            .rev()
+            .find(|l| !l.is_empty())
+            .expect("bottom frame shows at least one line");
+        assert!(last.contains("60"), "last line {last:?} must be 60");
+
+        send(
+            reader.get_mut(),
+            &ClientMsg::Scroll {
+                target: crate::protocol::ScrollTarget::Delta(-10),
+            },
+        );
+        let scrolled = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.scroll.is_some()),
+            _ => false,
+        })
+        .expect("scrolled frame with a scroll position within 5s");
+        let ServerMsg::Frame { panes, .. } = scrolled else {
+            unreachable!()
+        };
+        let pos = panes[0].scroll.expect("scroll populated after Delta(-10)");
+        assert!(pos.offset > 0, "offset must be positive after scrolling up");
+        assert!(
+            !panes[0].text.contains("60"),
+            "bottom line must not show while scrolled up, got {:?}",
+            panes[0].text
+        );
+
+        send(
+            reader.get_mut(),
+            &ClientMsg::Scroll {
+                target: crate::protocol::ScrollTarget::Bottom,
+            },
+        );
+        let restored = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.scroll.is_none()),
+            _ => false,
+        })
+        .expect("restored frame with scroll None within 5s");
+        let ServerMsg::Frame { panes, .. } = restored else {
+            unreachable!()
+        };
+        assert!(
+            panes[0].text.contains("60"),
+            "bottom shows the latest line again, got {:?}",
+            panes[0].text
+        );
+        drop(reader);
+        let _ = handle.join();
     }
 }

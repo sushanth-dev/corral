@@ -96,6 +96,7 @@ mod tests {
             text: text.into(),
             cursor: None,
             app_cursor: false,
+            scroll: None,
         }
     }
 

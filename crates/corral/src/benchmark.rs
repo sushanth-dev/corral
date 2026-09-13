@@ -74,6 +74,7 @@ mod bench {
                 text,
                 cursor: None,
                 app_cursor: false,
+                scroll: None,
             });
         }
 

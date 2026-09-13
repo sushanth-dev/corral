@@ -4,7 +4,7 @@
 //! routing tree and the latest snapshot per pane.
 
 use crate::pty::{PtyEvent, PtyHandle};
-use corral_core::emulation::Emulator;
+use corral_core::emulation::{Emulator, ScrollTarget};
 use corral_core::tree::{PaneId, Rect};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
@@ -19,6 +19,8 @@ pub enum PaneCmd {
     Key(Vec<u8>),
     /// Resize the PTY and the emulator to the pane's new rect size.
     Resize(u16, u16),
+    /// Move the pane's viewport inside scrollback (S3-2).
+    Scroll(ScrollTarget),
     /// Rebuild and resend the snapshot even if nothing changed.
     #[allow(dead_code)]
     Render,
@@ -95,6 +97,10 @@ fn run_worker(
                         push_snapshot(id, &mut emu, w, h, &out);
                     }
                 }
+                PaneCmd::Scroll(target) => {
+                    emu.scroll(target);
+                    push_snapshot(id, &mut emu, cols, rows, &out);
+                }
                 PaneCmd::Render => {
                     push_snapshot(id, &mut emu, cols, rows, &out);
                 }
@@ -126,6 +132,13 @@ fn run_worker(
 }
 
 fn push_snapshot(id: PaneId, emu: &mut Emulator, cols: u16, rows: u16, out: &Sender<PaneOut>) {
+    let scroll = emu
+        .scroll_position()
+        .unwrap_or(None)
+        .map(|p| crate::protocol::ScrollPos {
+            offset: p.offset,
+            total: p.total,
+        });
     let state = crate::protocol::PaneState {
         id,
         rect: Rect {
@@ -137,6 +150,7 @@ fn push_snapshot(id: PaneId, emu: &mut Emulator, cols: u16, rows: u16, out: &Sen
         text: emu.screen_text().unwrap_or_default(),
         cursor: emu.cursor().unwrap_or(None),
         app_cursor: emu.app_cursor().unwrap_or(false),
+        scroll,
     };
     let _ = out.send(PaneOut::Snapshot { pane: id, state });
 }

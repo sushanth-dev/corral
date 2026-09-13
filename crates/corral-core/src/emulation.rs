@@ -1,5 +1,6 @@
 use anyhow::Result;
 use libghostty_vt::render::{CellIterator, RowIterator};
+use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::terminal::{
     ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
     PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
@@ -7,6 +8,25 @@ use libghostty_vt::terminal::{
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+/// Where to scroll the pane's viewport. Mirrors the protocol type so
+/// the daemon can route a client's scroll request to a pane worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollTarget {
+    Delta(isize),
+    Top,
+    Bottom,
+}
+
+/// The pane's viewport position inside its scrollback. `None` when the
+/// viewport is pinned to the bottom (live-follow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollPos {
+    /// Rows the viewport top is above the bottom of the active screen.
+    pub offset: usize,
+    /// Total scrollback rows.
+    pub total: usize,
+}
 
 /// One pane's terminal state. `Terminal` is !Send: Emulator must be
 /// created and used on a single thread (the daemon core thread in v0.1).
@@ -71,6 +91,34 @@ impl Emulator {
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
         self.terminal.resize(cols, rows, 0, 0)?;
         Ok(())
+    }
+
+    /// Scroll the pane's viewport. libghostty keeps the viewport sticky
+    /// while scrolled up: new output does not force it back down until
+    /// a `Bottom` scroll (verified in `viewport_sticks_while_scrolled_up`).
+    pub fn scroll(&mut self, target: ScrollTarget) {
+        let sv = match target {
+            ScrollTarget::Delta(d) => ScrollViewport::Delta(d),
+            ScrollTarget::Top => ScrollViewport::Top,
+            ScrollTarget::Bottom => ScrollViewport::Bottom,
+        };
+        self.terminal.scroll_viewport(sv);
+    }
+
+    /// The viewport position inside the scrollback, `None` when pinned
+    /// to the bottom (live-follow). libghostty reports the position via
+    /// the scrollbar track geometry.
+    pub fn scroll_position(&mut self) -> Result<Option<ScrollPos>> {
+        let sb = self.terminal.scrollbar()?;
+        // At the bottom the scrollbar offset sits at total - len.
+        if sb.offset + sb.len >= sb.total {
+            return Ok(None);
+        }
+        let total_rows = self.terminal.scrollback_rows()?;
+        Ok(Some(ScrollPos {
+            offset: sb.offset as usize,
+            total: total_rows,
+        }))
     }
 
     /// Whether the pane asked for application cursor keys (DECCKM, mode
@@ -268,5 +316,110 @@ mod tests {
         let mut emu = Emulator::new(80, 24).unwrap();
         emu.feed(b"\x1b[?25l");
         assert_eq!(emu.cursor().unwrap(), None);
+    }
+
+    #[test]
+    fn scroll_up_shows_earlier_lines_and_reports_offset() {
+        let mut emu = Emulator::new(80, 5).unwrap();
+        for i in 1..=100 {
+            emu.feed(format!("line{i}\r\n").as_bytes());
+        }
+        // Pinned to bottom: no scroll offset to report.
+        assert_eq!(
+            emu.scroll_position().unwrap(),
+            None,
+            "fresh feed is at bottom"
+        );
+        emu.scroll(ScrollTarget::Delta(-20));
+        let pos = emu
+            .scroll_position()
+            .unwrap()
+            .expect("scrolled up has a position");
+        assert!(pos.offset > 0, "offset must be positive after scrolling up");
+        assert_eq!(
+            pos.total, 96,
+            "total scrollback rows: 100 fed lines + prompt in 5-row screen"
+        );
+        let text = emu.screen_text().unwrap();
+        assert!(
+            text.lines().any(|l| l.starts_with("line")),
+            "viewport shows history rows, got {text:?}"
+        );
+        assert!(
+            !text.contains("line100"),
+            "bottom row must not show while scrolled up"
+        );
+    }
+
+    #[test]
+    fn scroll_bottom_restores_live_follow() {
+        let mut emu = Emulator::new(80, 5).unwrap();
+        for i in 1..=100 {
+            emu.feed(format!("line{i}\r\n").as_bytes());
+        }
+        emu.scroll(ScrollTarget::Delta(-20));
+        assert!(emu.scroll_position().unwrap().is_some());
+        emu.scroll(ScrollTarget::Bottom);
+        assert_eq!(emu.scroll_position().unwrap(), None);
+        let text = emu.screen_text().unwrap();
+        assert!(
+            text.contains("line100"),
+            "bottom shows the latest line, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn scroll_top_reaches_first_lines() {
+        let mut emu = Emulator::new(80, 5).unwrap();
+        for i in 1..=100 {
+            emu.feed(format!("line{i}\r\n").as_bytes());
+        }
+        emu.scroll(ScrollTarget::Top);
+        let text = emu.screen_text().unwrap();
+        let first = text.lines().next().unwrap();
+        assert!(
+            first.starts_with("line1") || first.starts_with("line2"),
+            "top shows the earliest rows, got {first:?}"
+        );
+    }
+
+    #[test]
+    fn viewport_sticks_while_scrolled_up() {
+        // Record libghostty's stickiness: while the viewport is above the
+        // bottom, new output must not force it back down.
+        let mut emu = Emulator::new(80, 5).unwrap();
+        for i in 1..=50 {
+            emu.feed(format!("line{i}\r\n").as_bytes());
+        }
+        emu.scroll(ScrollTarget::Delta(-10));
+        let before = emu.screen_text().unwrap();
+        for i in 51..=60 {
+            emu.feed(format!("line{i}\r\n").as_bytes());
+        }
+        let after = emu.screen_text().unwrap();
+        assert_eq!(before, after, "new output moved a scrolled-up viewport");
+        let pos = emu.scroll_position().unwrap().unwrap();
+        assert_eq!(
+            pos.offset, 36,
+            "offset unchanged while stuck: got {}",
+            pos.offset
+        );
+    }
+
+    #[test]
+    fn scrolling_above_top_clamps_or_rejects() {
+        // A delta beyond the top must not panic or corrupt state.
+        let mut emu = Emulator::new(80, 5).unwrap();
+        for i in 1..=30 {
+            emu.feed(format!("line{i}\r\n").as_bytes());
+        }
+        emu.scroll(ScrollTarget::Delta(-1000));
+        let pos = emu.scroll_position().unwrap();
+        assert!(pos.is_some(), "scrolled somewhere, position is reportable");
+        let text = emu.screen_text().unwrap();
+        assert!(
+            text.lines().next().unwrap().contains("line1"),
+            "clamped at top"
+        );
     }
 }
