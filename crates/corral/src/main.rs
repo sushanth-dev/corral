@@ -38,6 +38,10 @@ fn send_msg(stream: &mut UnixStream, msg: &ClientMsg) -> anyhow::Result<()> {
 /// Read one ScrollbackDump reply synchronously, skipping frames that
 /// arrive first. Puts the socket back in nonblocking mode afterwards.
 fn read_dump(reader: &mut std::io::BufReader<UnixStream>) -> anyhow::Result<String> {
+    // The socket runs nonblocking for the main loop; a read timeout on a
+    // nonblocking socket never fires (EAGAIN wins), so restore blocking
+    // mode first or every dump read returns immediately.
+    reader.get_mut().set_nonblocking(false)?;
     reader
         .get_mut()
         .set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -106,7 +110,9 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     // Search prompt state: the needle being typed, and the last submitted
     // needle that n/N repeat.
     let mut search_needle = String::new();
+    let mut search_reverse = false;
     let mut last_search: Option<String> = None;
+    let mut last_search_reverse = false;
     // The real run uses the system clipboard; tests drive the run loop's
     // pieces with MemoryClipboard directly.
     let mut clipboard: Box<dyn clipboard::Clipboard> = Box::new(clipboard::SystemClipboard::new());
@@ -119,7 +125,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     // a frame actually differs keeps the blink alive while idle.
     // The selection cursor joins the diff key: a SelectMove changes no
     // pane state but must repaint the highlight.
-    type FrameKey = (Vec<PaneState>, PaneId, bool, Option<(usize, usize)>);
+    type FrameKey = (Vec<PaneState>, PaneId, render::Hint, Option<(usize, usize)>);
     let mut last_drawn: Option<FrameKey> = None;
     let mut reader = std::io::BufReader::new(stream);
     loop {
@@ -204,8 +210,11 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     selection = None;
                     mode = input::Mode::Copy;
                 }
-                Some(input::Action::BeginSearch) => {
+                Some(input::Action::BeginSearch) | Some(input::Action::BeginSearchReverse) => {
                     search_needle.clear();
+                    // Remember the direction so Enter searches the way
+                    // the prompt was opened; n/N keep repeating it.
+                    search_reverse = matches!(action, Some(input::Action::BeginSearchReverse));
                     mode = input::Mode::Search;
                 }
                 Some(input::Action::SearchChar(c)) => search_needle.push(c),
@@ -217,14 +226,16 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                         mode = input::Mode::Copy;
                     } else {
                         last_search = Some(search_needle.clone());
-                        // Forward search starts at the top of scrollback so
-                        // Enter always finds the first match after /.
+                        last_search_reverse = search_reverse;
+                        // Forward search starts at the top of scrollback
+                        // (first match after /); reverse starts from the
+                        // bottom and walks up (first match above ?).
                         send_msg(
                             writer,
                             &ClientMsg::Search {
                                 needle: search_needle.clone(),
                                 from: None,
-                                reverse: false,
+                                reverse: search_reverse,
                             },
                         )?;
                         mode = input::Mode::Copy;
@@ -234,20 +245,29 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 Some(input::Action::SearchNext) | Some(input::Action::SearchPrev) => {
                     if let Some(needle) = last_search.as_ref() {
                         // Resume from the viewport top: the daemon scrolls
-                        // to the next hit at or after that row.
+                        // to the next hit at or after that row. n repeats
+                        // in the direction the search was submitted with.
                         let from = focused_pane.and_then(|p| p.scroll).map(|s| s.offset);
+                        let reverse = if matches!(action, Some(input::Action::SearchNext)) {
+                            last_search_reverse
+                        } else {
+                            !last_search_reverse
+                        };
                         send_msg(
                             writer,
                             &ClientMsg::Search {
                                 needle: needle.clone(),
                                 from,
-                                reverse: matches!(action, Some(input::Action::SearchPrev)),
+                                reverse,
                             },
                         )?;
                     }
                 }
                 Some(input::Action::Focus(dir)) => {
                     send_msg(writer, &ClientMsg::Focus { dir })?;
+                }
+                Some(input::Action::FocusNext) => {
+                    send_msg(writer, &ClientMsg::FocusNext)?;
                 }
                 Some(input::Action::ClearHistory) => {
                     send_msg(writer, &ClientMsg::ClearHistory)?;
@@ -260,7 +280,11 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 }
                 Some(input::Action::EditScrollback) => {
                     send_msg(writer, &ClientMsg::DumpScrollback { pane: None })?;
-                    let dump = read_dump(&mut reader)?;
+                    // A failed dump must not kill the client; the session
+                    // stays usable and the error surfaces in the hint line.
+                    let Ok(dump) = read_dump(&mut reader) else {
+                        continue;
+                    };
                     // Suspend the TUI, hand the dump to the editor, then
                     // restore; the dump file is deleted inside the flow.
                     let _ = crossterm::execute!(
@@ -285,8 +309,9 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     // command visible above the current view.
                     let anchor = focused_pane.and_then(|p| p.scroll).map(|s| s.offset);
                     send_msg(writer, &ClientMsg::YankCommand { anchor })?;
-                    let text = read_dump(&mut reader)?;
-                    clipboard.set_text(&text)?;
+                    if let Ok(text) = read_dump(&mut reader) {
+                        clipboard.set_text(&text)?;
+                    }
                 }
                 Some(input::Action::Split(dir)) => {
                     let (cmd, args) = pane_command();
@@ -318,20 +343,13 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
             input::Mode::Search => render::Hint::Search(search_needle.clone()),
         };
         let sel_cursor = selection.as_ref().map(|s| s.cursor);
-        let frame_changed = last_drawn.as_ref()
-            != Some(&(
-                panes.clone(),
-                focused,
-                hint != render::Hint::None,
-                sel_cursor,
-            ));
+        // The whole hint joins the diff key: collapsing it to a bool
+        // would skip the repaint that reveals the search prompt when a
+        // Copy frame turns into a Search frame.
+        let frame_changed =
+            last_drawn.as_ref() != Some(&(panes.clone(), focused, hint.clone(), sel_cursor));
         if frame_changed {
-            last_drawn = Some((
-                panes.clone(),
-                focused,
-                hint != render::Hint::None,
-                sel_cursor,
-            ));
+            last_drawn = Some((panes.clone(), focused, hint.clone(), sel_cursor));
             terminal.draw(|f| {
                 // Selection spans render reversed over the focused pane's
                 // visible grid.

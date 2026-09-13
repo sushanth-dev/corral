@@ -156,11 +156,16 @@ fn run_worker(
                 }
                 PaneCmd::PromptJump { up } => {
                     let prompts = emu.prompt_rows().unwrap_or_default();
-                    let from = emu.scroll_position().unwrap_or(None).map(|p| p.offset);
+                    // The raw viewport top, not the collapsed scroll
+                    // position: a Row scroll to a prompt inside the
+                    // visible screen clamps to the bottom, and reading
+                    // the pinned state as "no history" would restart
+                    // the walk at the bottom-most prompt forever.
+                    let from = emu.viewport_offset().unwrap_or(0);
                     let target = if up {
-                        prompts.iter().rev().find(|&&r| from.is_none_or(|o| r < o))
+                        prompts.iter().rev().find(|&&r| r < from)
                     } else {
-                        prompts.iter().find(|&&r| from.is_some_and(|o| r > o))
+                        prompts.iter().find(|&&r| r > from)
                     };
                     if let Some(&row) = target {
                         emu.scroll(ScrollTarget::Row(row));

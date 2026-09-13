@@ -126,6 +126,15 @@ impl Emulator {
         }))
     }
 
+    /// The viewport top row in screen space, even when pinned to the
+    /// bottom. `scroll_position` collapses that case to `None`, but
+    /// prompt jumps need the real resume row: a `Row` scroll to a
+    /// prompt inside the visible screen clamps to the bottom, and the
+    /// next jump must not restart from "no history".
+    pub fn viewport_offset(&mut self) -> Result<usize> {
+        Ok(self.terminal.scrollbar()?.offset as usize)
+    }
+
     /// Whether the pane asked for application cursor keys (DECCKM, mode
     /// 1). Arrows must arrive as ESC O A..D instead of ESC [ A..D then,
     /// or vim and friends ignore them.

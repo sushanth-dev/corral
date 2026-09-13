@@ -154,6 +154,7 @@ impl Daemon {
                     self.focused = next;
                 }
             }
+            ClientMsg::FocusNext => self.focus_next(),
             ClientMsg::Scroll { target } => {
                 if let Some(pane) = self.panes.get(&self.focused) {
                     let target = match target {
@@ -201,6 +202,20 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    /// Cycle focus through the panes in tree order, wrapping at the end.
+    fn focus_next(&mut self) {
+        let ids = self.root.leaf_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        let pos = ids.iter().position(|&id| id == self.focused);
+        let next = match pos {
+            Some(p) => ids[(p + 1) % ids.len()],
+            None => ids[0],
+        };
+        self.focused = next;
     }
 
     fn rects(&self) -> Vec<(PaneId, Rect)> {

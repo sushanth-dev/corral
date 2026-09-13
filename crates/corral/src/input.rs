@@ -40,6 +40,8 @@ pub enum Action {
     CancelSelect,
     /// `/` in copy mode: open the search prompt.
     BeginSearch,
+    /// `?` in copy mode: search prompt, first match found upward.
+    BeginSearchReverse,
     /// A printable character typed into the search prompt.
     SearchChar(char),
     /// Backspace in the search prompt.
@@ -60,8 +62,10 @@ pub enum Action {
     PromptPrev,
     /// `}` in copy mode: jump to the next prompt row.
     PromptNext,
-    /// `c` in copy mode: yank the current command's output.
+    /// `C-o` in copy mode: yank the current command's output.
     YankCommand,
+    /// Leader `o`: move focus to the next pane, wrapping.
+    FocusNext,
 }
 
 // The Ctrl+a leader is the only key corral consumes in input mode. In
@@ -87,26 +91,29 @@ pub fn handle(
     }
     if *mode == Mode::Copy {
         return match (ev.code, ev.modifiers) {
+            // libghostty's ScrollViewport::Delta is "up is negative": k
+            // (earlier lines) is negative, j (later lines) is positive.
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
-                Some(Action::CopyScroll(ScrollTarget::Delta(-1)))
-            }
-            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
                 Some(Action::CopyScroll(ScrollTarget::Delta(1)))
             }
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => Some(Action::CopyScroll(
-                ScrollTarget::Delta(-(half_page as isize)),
-            )),
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
+                Some(Action::CopyScroll(ScrollTarget::Delta(-1)))
+            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 Some(Action::CopyScroll(ScrollTarget::Delta(half_page as isize)))
             }
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => Some(Action::CopyScroll(
+                ScrollTarget::Delta(-(half_page as isize)),
+            )),
             (KeyCode::Char('g'), _) => Some(Action::CopyScroll(ScrollTarget::Top)),
             (KeyCode::Char('G'), _) => Some(Action::CopyScroll(ScrollTarget::Bottom)),
             (KeyCode::Char('/'), _) => Some(Action::BeginSearch),
+            (KeyCode::Char('?'), _) => Some(Action::BeginSearchReverse),
             (KeyCode::Char('n'), _) => Some(Action::SearchNext),
             (KeyCode::Char('N'), _) => Some(Action::SearchPrev),
             (KeyCode::Char('{'), _) => Some(Action::PromptPrev),
             (KeyCode::Char('}'), _) => Some(Action::PromptNext),
-            (KeyCode::Char('c'), _) => Some(Action::YankCommand),
+            (KeyCode::Char('o'), KeyModifiers::CONTROL) => Some(Action::YankCommand),
             (KeyCode::Char('v'), _) => Some(Action::BeginSelect(SelectMode::Span)),
             (KeyCode::Char('V'), _) => Some(Action::BeginSelect(SelectMode::Rect)),
             (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => Some(Action::ExitCopy),
@@ -145,8 +152,16 @@ pub fn handle(
             (KeyCode::Char('l'), _) => Some(Action::Focus(Dir::Horizontal)),
             (KeyCode::Char('j'), _) => Some(Action::Focus(Dir::Vertical)),
             (KeyCode::Char('k'), _) => Some(Action::Focus(Dir::Vertical)),
-            (KeyCode::Char('s'), _) => Some(Action::Split(Dir::Vertical)),
-            (KeyCode::Char('v'), _) => Some(Action::Split(Dir::Horizontal)),
+            // tmux geometry: % splits right (side by side, cut in width
+            // = Dir::Horizontal here), " splits below (stacked =
+            // Dir::Vertical).
+            (KeyCode::Char('%'), _) => Some(Action::Split(Dir::Horizontal)),
+            (KeyCode::Char('"'), _) => Some(Action::Split(Dir::Vertical)),
+            (KeyCode::Char('o'), _) => Some(Action::FocusNext),
+            (KeyCode::Left, _) => Some(Action::Focus(Dir::Horizontal)),
+            (KeyCode::Right, _) => Some(Action::Focus(Dir::Horizontal)),
+            (KeyCode::Up, _) => Some(Action::Focus(Dir::Vertical)),
+            (KeyCode::Down, _) => Some(Action::Focus(Dir::Vertical)),
             (KeyCode::Char('['), _) => Some(Action::EnterCopy),
             (KeyCode::Char('c'), _) => Some(Action::ClearHistory),
             (KeyCode::Char('e'), _) => Some(Action::EditScrollback),
@@ -329,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn leader_then_j_focuses_down_and_s_v_split() {
+    fn leader_then_j_focuses_down_and_percent_quote_split() {
         let mut armed = false;
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
@@ -355,9 +370,11 @@ mod tests {
             false,
             0,
         );
+        // tmux: % splits right (Dir::Horizontal cuts width), " splits
+        // below (Dir::Vertical cuts height).
         assert!(matches!(
             handle(
-                key(KeyCode::Char('v'), KeyModifiers::NONE),
+                key(KeyCode::Char('%'), KeyModifiers::SHIFT),
                 &mut armed,
                 &Mode::Input,
                 false,
@@ -374,13 +391,29 @@ mod tests {
         );
         assert!(matches!(
             handle(
-                key(KeyCode::Char('s'), KeyModifiers::NONE),
+                key(KeyCode::Char('"'), KeyModifiers::SHIFT),
                 &mut armed,
                 &Mode::Input,
                 false,
                 0
             ),
             Some(Action::Split(Dir::Vertical))
+        ));
+    }
+
+    #[test]
+    fn leader_then_o_cycles_focus_and_arrows_focus() {
+        assert!(matches!(
+            leader_then(KeyCode::Char('o'), KeyModifiers::NONE),
+            Some(Action::FocusNext)
+        ));
+        assert!(matches!(
+            leader_then(KeyCode::Left, KeyModifiers::NONE),
+            Some(Action::Focus(Dir::Horizontal))
+        ));
+        assert!(matches!(
+            leader_then(KeyCode::Up, KeyModifiers::NONE),
+            Some(Action::Focus(Dir::Vertical))
         ));
     }
 
@@ -673,11 +706,8 @@ mod tests {
             (KeyCode::Char('k'), |a: &Action| {
                 matches!(a, Action::Focus(Dir::Vertical))
             }),
-            (KeyCode::Char('s'), |a: &Action| {
-                matches!(a, Action::Split(Dir::Vertical))
-            }),
-            (KeyCode::Char('v'), |a: &Action| {
-                matches!(a, Action::Split(Dir::Horizontal))
+            (KeyCode::Char('o'), |a: &Action| {
+                matches!(a, Action::FocusNext)
             }),
             (KeyCode::Char('c'), |a: &Action| {
                 matches!(a, Action::ClearHistory)
@@ -756,13 +786,15 @@ mod tests {
 
     #[test]
     fn copy_mode_j_and_k_scroll_one_line() {
+        // k means earlier lines (up), and libghostty's Delta documents
+        // "up is negative".
         assert_eq!(
             copy_action(KeyCode::Char('j'), KeyModifiers::NONE),
-            Action::CopyScroll(ScrollTarget::Delta(-1))
+            Action::CopyScroll(ScrollTarget::Delta(1))
         );
         assert_eq!(
             copy_action(KeyCode::Char('k'), KeyModifiers::NONE),
-            Action::CopyScroll(ScrollTarget::Delta(1))
+            Action::CopyScroll(ScrollTarget::Delta(-1))
         );
     }
 
@@ -770,23 +802,24 @@ mod tests {
     fn copy_mode_arrows_scroll_like_jk() {
         assert_eq!(
             copy_action(KeyCode::Down, KeyModifiers::NONE),
-            Action::CopyScroll(ScrollTarget::Delta(-1))
+            Action::CopyScroll(ScrollTarget::Delta(1))
         );
         assert_eq!(
             copy_action(KeyCode::Up, KeyModifiers::NONE),
-            Action::CopyScroll(ScrollTarget::Delta(1))
+            Action::CopyScroll(ScrollTarget::Delta(-1))
         );
     }
 
     #[test]
     fn copy_mode_ctrl_d_u_scroll_half_the_pane() {
+        // Ctrl+d = down the buffer (later lines, positive).
         assert_eq!(
             copy_action(KeyCode::Char('d'), KeyModifiers::CONTROL),
-            Action::CopyScroll(ScrollTarget::Delta(-12))
+            Action::CopyScroll(ScrollTarget::Delta(12))
         );
         assert_eq!(
             copy_action(KeyCode::Char('u'), KeyModifiers::CONTROL),
-            Action::CopyScroll(ScrollTarget::Delta(12))
+            Action::CopyScroll(ScrollTarget::Delta(-12))
         );
     }
 
@@ -944,10 +977,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_mode_slash_opens_search_and_n_n_repeat() {
+    fn copy_mode_slash_and_question_open_search_n_n_repeat() {
         assert_eq!(
             copy_action(KeyCode::Char('/'), KeyModifiers::NONE),
             Action::BeginSearch
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            Action::BeginSearchReverse
         );
         assert_eq!(
             copy_action(KeyCode::Char('n'), KeyModifiers::NONE),
@@ -960,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_mode_braces_jump_prompts_and_c_yanks() {
+    fn copy_mode_braces_jump_prompts_and_ctrl_o_yanks() {
         assert_eq!(
             copy_action(KeyCode::Char('{'), KeyModifiers::NONE),
             Action::PromptPrev
@@ -970,7 +1007,7 @@ mod tests {
             Action::PromptNext
         );
         assert_eq!(
-            copy_action(KeyCode::Char('c'), KeyModifiers::NONE),
+            copy_action(KeyCode::Char('o'), KeyModifiers::CONTROL),
             Action::YankCommand
         );
     }

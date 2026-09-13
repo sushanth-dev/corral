@@ -145,7 +145,7 @@ impl Node {
         }
     }
 
-    fn leaf_ids(&self) -> Vec<PaneId> {
+    pub fn leaf_ids(&self) -> Vec<PaneId> {
         let mut out = Vec::new();
         self.collect_leaves(&mut out);
         out

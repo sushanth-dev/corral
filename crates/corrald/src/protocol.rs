@@ -31,6 +31,8 @@ pub enum ClientMsg {
     Focus {
         dir: Dir,
     },
+    /// Move focus to the next pane in tree order, wrapping.
+    FocusNext,
     Scroll {
         target: ScrollTarget,
     },
@@ -135,6 +137,7 @@ mod tests {
             ClientMsg::Focus {
                 dir: Dir::Horizontal,
             },
+            ClientMsg::FocusNext,
             ClientMsg::Scroll {
                 target: ScrollTarget::Delta(-10),
             },
