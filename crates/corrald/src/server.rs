@@ -158,10 +158,24 @@ impl Daemon {
                 if let Some(pane) = self.panes.get(&self.focused) {
                     let target = match target {
                         crate::protocol::ScrollTarget::Delta(d) => ScrollTarget::Delta(*d),
+                        crate::protocol::ScrollTarget::Row(r) => ScrollTarget::Row(*r),
                         crate::protocol::ScrollTarget::Top => ScrollTarget::Top,
                         crate::protocol::ScrollTarget::Bottom => ScrollTarget::Bottom,
                     };
                     pane.send(PaneCmd::Scroll(target))?;
+                }
+            }
+            ClientMsg::Search {
+                needle,
+                from,
+                reverse,
+            } => {
+                if let Some(pane) = self.panes.get(&self.focused) {
+                    pane.send(PaneCmd::Search {
+                        needle: needle.clone(),
+                        from: *from,
+                        reverse: *reverse,
+                    })?;
                 }
             }
         }
@@ -187,6 +201,11 @@ impl Daemon {
                 Ok(PaneOut::Snapshot { pane, state }) => {
                     self.snapshots.insert(pane, state);
                     changed = true;
+                }
+                Ok(PaneOut::SearchResult { pane, rows }) => {
+                    // A search reply goes straight to the client, outside
+                    // the normal frame cadence.
+                    write_msg(writer, &ServerMsg::SearchResult { pane, rows })?;
                 }
                 Ok(PaneOut::Exited { pane }) => {
                     // The worker also reports Exited when its command
@@ -1049,6 +1068,90 @@ mod tests {
             panes[0].text.contains("60"),
             "bottom shows the latest line again, got {:?}",
             panes[0].text
+        );
+        drop(reader);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn search_finds_rows_and_the_viewport_jumps_to_the_first_hit() {
+        let (sock, handle) = start_daemon("search");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "for i in 1 2 3; do echo MARKER line $i; done; seq 1 60; sleep 30".into(),
+                ],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut reader = BufReader::new(client);
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("60")),
+            _ => false,
+        })
+        .expect("bottom frame showing line 60 within 5s");
+
+        // Forward search from the top: three hits, and the viewport jumps
+        // to the first one so the marker is on screen.
+        send(
+            reader.get_mut(),
+            &ClientMsg::Search {
+                needle: "MARKER".into(),
+                from: None,
+                reverse: false,
+            },
+        );
+        let reply = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::SearchResult { .. }))
+            .expect("SearchResult within 5s");
+        let ServerMsg::SearchResult { pane, rows } = reply else {
+            unreachable!()
+        };
+        assert_eq!(rows.len(), 3, "three marker lines, got {rows:?}");
+        assert!(pane > 0, "reply names the pane it searched");
+
+        let jumped = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.scroll.is_some() && p.text.contains("MARKER")),
+            _ => false,
+        })
+        .expect("frame scrolled to the first marker within 5s");
+        let ServerMsg::Frame { panes, .. } = jumped else {
+            unreachable!()
+        };
+        let pos = panes[0].scroll.expect("scroll set after search jump");
+        assert!(
+            panes[0].text.contains("MARKER"),
+            "viewport shows the match, got {:?}",
+            panes[0].text
+        );
+
+        // n resumes past the viewport top: the second marker, not the
+        // same one again.
+        send(
+            reader.get_mut(),
+            &ClientMsg::Search {
+                needle: "MARKER".into(),
+                from: Some(pos.offset),
+                reverse: false,
+            },
+        );
+        let again = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::SearchResult { .. }))
+            .expect("second SearchResult within 5s");
+        let ServerMsg::SearchResult {
+            rows: next_rows, ..
+        } = again
+        else {
+            unreachable!()
+        };
+        assert!(
+            next_rows.first().copied() > rows.first().copied(),
+            "resume must skip the first hit, got {next_rows:?} after {rows:?}"
         );
         drop(reader);
         let _ = handle.join();

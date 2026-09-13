@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
 pub enum ScrollTarget {
     Delta(isize),
+    /// Absolute screen-space row from the top of scrollback.
+    Row(usize),
     Top,
     Bottom,
 }
@@ -32,6 +34,13 @@ pub enum ClientMsg {
     Scroll {
         target: ScrollTarget,
     },
+    Search {
+        needle: String,
+        /// Screen-space row to resume after (forward) or before
+        /// (reverse); `None` starts from the top or bottom.
+        from: Option<usize>,
+        reverse: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -42,6 +51,12 @@ pub enum ServerMsg {
     },
     Exited {
         pane: PaneId,
+    },
+    /// Rows (screen space) in the requested pane whose text contains
+    /// the search needle.
+    SearchResult {
+        pane: PaneId,
+        rows: Vec<usize>,
     },
 }
 
@@ -104,6 +119,16 @@ mod tests {
             ClientMsg::Scroll {
                 target: ScrollTarget::Bottom,
             },
+            ClientMsg::Search {
+                needle: "make build".into(),
+                from: None,
+                reverse: false,
+            },
+            ClientMsg::Search {
+                needle: "error".into(),
+                from: Some(41),
+                reverse: true,
+            },
         ];
         for msg in msgs {
             let line = serde_json::to_string(&msg).unwrap();
@@ -150,6 +175,22 @@ mod tests {
         assert!(line.contains("\"pane\":4"));
         let back: ServerMsg = serde_json::from_str(&line).unwrap();
         assert!(matches!(back, ServerMsg::Exited { pane: 4 }));
+    }
+
+    #[test]
+    fn search_result_round_trips_with_empty_rows() {
+        for rows in [vec![0usize, 10, 27], vec![]] {
+            let msg = ServerMsg::SearchResult { pane: 2, rows };
+            let line = serde_json::to_string(&msg).unwrap();
+            let back: ServerMsg = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, msg);
+        }
+        let empty = serde_json::to_string(&ServerMsg::SearchResult {
+            pane: 2,
+            rows: vec![],
+        })
+        .unwrap();
+        assert!(empty.contains("\"rows\":[]"), "got {empty}");
     }
 
     #[test]

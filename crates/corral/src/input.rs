@@ -6,12 +6,14 @@ use crate::selection::SelectMode;
 
 /// Client input mode. Copy mode (Ctrl+a [) routes keys to scrollback
 /// navigation and swallows everything else; nothing binds a bare key in
-/// input mode. Select is copy mode with an active v/V selection.
+/// input mode. Select is copy mode with an active v/V selection. Search
+/// is the `/` prompt: typed characters build the needle, Enter submits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Input,
     Copy,
     Select(SelectMode),
+    Search,
 }
 
 #[derive(Debug, PartialEq)]
@@ -36,6 +38,20 @@ pub enum Action {
     },
     Yank,
     CancelSelect,
+    /// `/` in copy mode: open the search prompt.
+    BeginSearch,
+    /// A printable character typed into the search prompt.
+    SearchChar(char),
+    /// Backspace in the search prompt.
+    SearchBackspace,
+    /// Enter in the search prompt: submit the needle.
+    SearchSubmit,
+    /// Esc in the search prompt: drop the needle, back to copy mode.
+    SearchCancel,
+    /// `n` in copy mode: repeat the last search forward.
+    SearchNext,
+    /// `N` in copy mode: repeat the last search backward.
+    SearchPrev,
 }
 
 // The Ctrl+a leader is the only key corral consumes in input mode. In
@@ -50,6 +66,15 @@ pub fn handle(
     app_cursor: bool,
     half_page: u16,
 ) -> Option<Action> {
+    if *mode == Mode::Search {
+        return match ev.code {
+            KeyCode::Char(c) => Some(Action::SearchChar(c)),
+            KeyCode::Backspace => Some(Action::SearchBackspace),
+            KeyCode::Enter => Some(Action::SearchSubmit),
+            KeyCode::Esc => Some(Action::SearchCancel),
+            _ => None,
+        };
+    }
     if *mode == Mode::Copy {
         return match (ev.code, ev.modifiers) {
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
@@ -66,6 +91,9 @@ pub fn handle(
             }
             (KeyCode::Char('g'), _) => Some(Action::CopyScroll(ScrollTarget::Top)),
             (KeyCode::Char('G'), _) => Some(Action::CopyScroll(ScrollTarget::Bottom)),
+            (KeyCode::Char('/'), _) => Some(Action::BeginSearch),
+            (KeyCode::Char('n'), _) => Some(Action::SearchNext),
+            (KeyCode::Char('N'), _) => Some(Action::SearchPrev),
             (KeyCode::Char('v'), _) => Some(Action::BeginSelect(SelectMode::Span)),
             (KeyCode::Char('V'), _) => Some(Action::BeginSelect(SelectMode::Rect)),
             (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => Some(Action::ExitCopy),
@@ -892,5 +920,70 @@ mod tests {
             .is_none()
         );
         assert!(!armed, "copy mode armed the leader");
+    }
+
+    #[test]
+    fn copy_mode_slash_opens_search_and_n_n_repeat() {
+        assert_eq!(
+            copy_action(KeyCode::Char('/'), KeyModifiers::NONE),
+            Action::BeginSearch
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('n'), KeyModifiers::NONE),
+            Action::SearchNext
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('N'), KeyModifiers::NONE),
+            Action::SearchPrev
+        );
+    }
+
+    fn search_action(code: KeyCode, mods: KeyModifiers) -> Action {
+        let mut armed = false;
+        handle(key(code, mods), &mut armed, &Mode::Search, false, 12)
+            .unwrap_or_else(|| panic!("{code:?} {mods:?} produced no action in search mode"))
+    }
+
+    #[test]
+    fn search_mode_types_backspace_submits_and_cancels() {
+        assert_eq!(
+            search_action(KeyCode::Char('e'), KeyModifiers::NONE),
+            Action::SearchChar('e')
+        );
+        assert_eq!(
+            search_action(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            Action::SearchChar('R')
+        );
+        assert_eq!(
+            search_action(KeyCode::Backspace, KeyModifiers::NONE),
+            Action::SearchBackspace
+        );
+        assert_eq!(
+            search_action(KeyCode::Enter, KeyModifiers::NONE),
+            Action::SearchSubmit
+        );
+        assert_eq!(
+            search_action(KeyCode::Esc, KeyModifiers::NONE),
+            Action::SearchCancel
+        );
+    }
+
+    #[test]
+    fn search_mode_swallows_everything_else() {
+        let mut armed = false;
+        for code in [KeyCode::Tab, KeyCode::F(5), KeyCode::Up] {
+            assert!(
+                handle(
+                    key(code, KeyModifiers::NONE),
+                    &mut armed,
+                    &Mode::Search,
+                    false,
+                    0
+                )
+                .is_none(),
+                "{code:?} produced an action in search mode"
+            );
+        }
+        assert!(!armed, "search mode armed the leader");
     }
 }

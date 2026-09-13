@@ -80,6 +80,10 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut mode = input::Mode::Input;
     let mut selection: Option<selection::Selection> = None;
+    // Search prompt state: the needle being typed, and the last submitted
+    // needle that n/N repeat.
+    let mut search_needle = String::new();
+    let mut last_search: Option<String> = None;
     // The real run uses the system clipboard; tests drive the run loop's
     // pieces with MemoryClipboard directly.
     let mut clipboard: Box<dyn clipboard::Clipboard> = Box::new(clipboard::SystemClipboard::new());
@@ -119,6 +123,11 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     focused = f;
                 }
                 ServerMsg::Exited { .. } => {}
+                ServerMsg::SearchResult { .. } => {
+                    // The worker already scrolled to the match; the frame
+                    // carrying the new viewport follows right behind. No
+                    // highlight in v0.2 (plan Task 5 known gap).
+                }
             }
         }
         let focused_pane = panes.iter().find(|p| p.id == focused);
@@ -127,7 +136,8 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
         if crossterm::event::poll(POLL)?
             && let crossterm::event::Event::Key(ev) = crossterm::event::read()?
         {
-            match input::handle(ev, &mut leader_armed, &mode, app_cursor, half_page) {
+            let action = input::handle(ev, &mut leader_armed, &mode, app_cursor, half_page);
+            match action {
                 Some(input::Action::Quit) => break,
                 Some(input::Action::EnterCopy) => mode = input::Mode::Copy,
                 Some(input::Action::ExitCopy) => {
@@ -166,6 +176,48 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     selection = None;
                     mode = input::Mode::Copy;
                 }
+                Some(input::Action::BeginSearch) => {
+                    search_needle.clear();
+                    mode = input::Mode::Search;
+                }
+                Some(input::Action::SearchChar(c)) => search_needle.push(c),
+                Some(input::Action::SearchBackspace) => {
+                    search_needle.pop();
+                }
+                Some(input::Action::SearchSubmit) => {
+                    if search_needle.is_empty() {
+                        mode = input::Mode::Copy;
+                    } else {
+                        last_search = Some(search_needle.clone());
+                        // Forward search starts at the top of scrollback so
+                        // Enter always finds the first match after /.
+                        send_msg(
+                            writer,
+                            &ClientMsg::Search {
+                                needle: search_needle.clone(),
+                                from: None,
+                                reverse: false,
+                            },
+                        )?;
+                        mode = input::Mode::Copy;
+                    }
+                }
+                Some(input::Action::SearchCancel) => mode = input::Mode::Copy,
+                Some(input::Action::SearchNext) | Some(input::Action::SearchPrev) => {
+                    if let Some(needle) = last_search.as_ref() {
+                        // Resume from the viewport top: the daemon scrolls
+                        // to the next hit at or after that row.
+                        let from = focused_pane.and_then(|p| p.scroll).map(|s| s.offset);
+                        send_msg(
+                            writer,
+                            &ClientMsg::Search {
+                                needle: needle.clone(),
+                                from,
+                                reverse: matches!(action, Some(input::Action::SearchPrev)),
+                            },
+                        )?;
+                    }
+                }
                 Some(input::Action::Focus(dir)) => {
                     send_msg(writer, &ClientMsg::Focus { dir })?;
                 }
@@ -196,6 +248,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     .map(|s| (s.offset, s.total)),
             ),
             input::Mode::Select(_) => render::Hint::Select,
+            input::Mode::Search => render::Hint::Search(search_needle.clone()),
         };
         let sel_cursor = selection.as_ref().map(|s| s.cursor);
         let frame_changed = last_drawn.as_ref()

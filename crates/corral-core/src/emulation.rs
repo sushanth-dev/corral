@@ -14,6 +14,8 @@ use std::rc::Rc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollTarget {
     Delta(isize),
+    /// Absolute row offset from the top of scrollback (search jump).
+    Row(usize),
     Top,
     Bottom,
 }
@@ -31,7 +33,9 @@ pub struct ScrollPos {
 /// One pane's terminal state. `Terminal` is !Send: Emulator must be
 /// created and used on a single thread (the daemon core thread in v0.1).
 pub struct Emulator {
-    terminal: Terminal<'static, 'static>,
+    // pub(crate) so sibling modules (search) can walk the grid without
+    // Emulator re-exporting every Terminal method.
+    pub(crate) terminal: Terminal<'static, 'static>,
     /// Reply bytes the emulator wants written back to the pane's PTY
     /// (terminal query responses such as DA1). The on_pty_write callback
     /// appends here; the daemon drains via take_pty_writes.
@@ -99,6 +103,7 @@ impl Emulator {
     pub fn scroll(&mut self, target: ScrollTarget) {
         let sv = match target {
             ScrollTarget::Delta(d) => ScrollViewport::Delta(d),
+            ScrollTarget::Row(r) => ScrollViewport::Row(r),
             ScrollTarget::Top => ScrollViewport::Top,
             ScrollTarget::Bottom => ScrollViewport::Bottom,
         };

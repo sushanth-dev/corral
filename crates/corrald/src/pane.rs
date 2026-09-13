@@ -21,6 +21,13 @@ pub enum PaneCmd {
     Resize(u16, u16),
     /// Move the pane's viewport inside scrollback (S3-2).
     Scroll(ScrollTarget),
+    /// Find rows containing a needle (S3-5). The reply rides PaneOut as
+    /// a SearchResult the daemon core forwards to the client.
+    Search {
+        needle: String,
+        from: Option<usize>,
+        reverse: bool,
+    },
     /// Rebuild and resend the snapshot even if nothing changed.
     #[allow(dead_code)]
     Render,
@@ -30,6 +37,11 @@ pub enum PaneOut {
     Snapshot {
         pane: PaneId,
         state: crate::protocol::PaneState,
+    },
+    /// Reply to PaneCmd::Search; rows are screen-space row indexes.
+    SearchResult {
+        pane: PaneId,
+        rows: Vec<usize>,
     },
     Exited {
         pane: PaneId,
@@ -100,6 +112,23 @@ fn run_worker(
                 PaneCmd::Scroll(target) => {
                     emu.scroll(target);
                     push_snapshot(id, &mut emu, cols, rows, &out);
+                }
+                PaneCmd::Search {
+                    needle,
+                    from,
+                    reverse,
+                } => {
+                    let hits = emu.search(&needle, from, reverse).unwrap_or_default();
+                    // Jump to the first hit so the match is on screen;
+                    // the client's n/N walk keeps its own resume offset.
+                    if let Some(&row) = hits.first() {
+                        emu.scroll(ScrollTarget::Row(row));
+                        push_snapshot(id, &mut emu, cols, rows, &out);
+                    }
+                    let _ = out.send(PaneOut::SearchResult {
+                        pane: id,
+                        rows: hits,
+                    });
                 }
                 PaneCmd::Render => {
                     push_snapshot(id, &mut emu, cols, rows, &out);
@@ -174,6 +203,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !(got_hello && got_world) && std::time::Instant::now() < deadline {
             match out_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(PaneOut::SearchResult { .. }) => {}
                 Ok(PaneOut::Snapshot { pane, state }) => {
                     assert!(pane == 7 || pane == 9, "unknown pane id {pane}");
                     if state.text.contains("hello") {

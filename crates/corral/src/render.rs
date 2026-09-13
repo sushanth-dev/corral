@@ -15,7 +15,7 @@ const FOCUSED_GUTTER: Color = Color::Indexed(245);
 /// inclusive) in text-grid coordinates.
 pub type SpanList = Vec<(usize, usize, usize)>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hint {
     None,
     /// Copy mode active; carries the focused pane's viewport position
@@ -23,6 +23,8 @@ pub enum Hint {
     Copy(Option<(usize, usize)>),
     /// Copy mode with an active selection.
     Select,
+    /// Search prompt active; carries the needle typed so far.
+    Search(String),
 }
 
 pub fn draw(
@@ -93,6 +95,7 @@ fn draw_hint(frame: &mut Frame, hint: Hint) {
             format!(" copy mode {offset}/{total} ")
         }
         Hint::Select => " copy mode select ".to_string(),
+        Hint::Search(needle) => format!(" search: {needle} "),
     };
     let style = Style::new().fg(Color::Black).bg(Color::Indexed(245));
     let width = text.len() as u16;
