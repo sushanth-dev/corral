@@ -159,7 +159,14 @@ fn run_worker(
                     });
                 }
                 PaneCmd::ClearHistory => {
+                    // Erase scrollback (3J), then the visible screen
+                    // (2J) and home the cursor: the pane comes back
+                    // blank with the shell's next prompt at the top.
+                    // Feeding the sequences to the emulator only, not
+                    // the PTY: the shell keeps running, but everything
+                    // it had drawn is gone from the view.
                     emu.clear_history();
+                    emu.feed(b"\x1b[2J\x1b[H");
                     push_snapshot(id, &mut emu, cols, rows, &out);
                 }
                 PaneCmd::DumpScrollback => {
@@ -167,7 +174,12 @@ fn run_worker(
                     let _ = out.send(PaneOut::ScrollbackDump { pane: id, text });
                 }
                 PaneCmd::PromptJump { up, cursor_row } => {
-                    let prompts = emu.prompt_rows().unwrap_or_default();
+                    // Visible prompt rows, not raw marker rows: fish and
+                    // zsh emit OSC 133 A on the blank line above the
+                    // drawn prompt, so jumping to the marker lands one
+                    // line high. prompt_text_rows shifts each blank
+                    // marker to the first non-empty row below it.
+                    let prompts = emu.prompt_text_rows().unwrap_or_default();
                     // Anchor at the copy cursor, not the viewport top:
                     // a Row scroll to a prompt inside the visible
                     // screen clamps to the bottom, so a viewport-top
@@ -228,13 +240,18 @@ fn run_worker(
                     // The editor's result replaces the pane's history:
                     // erase scrollback, pin to the bottom, and feed the
                     // text through the emulator so styling and prompt
-                    // markers rebuild from the new content.
+                    // markers rebuild from the new content. The rebuilt
+                    // view ends where the dump ended, so nudge the
+                    // shell with a bare Enter: it draws a fresh prompt
+                    // and the user lands back at a usable command line
+                    // without pressing anything.
                     emu.clear_history();
                     emu.scroll(ScrollTarget::Bottom);
                     emu.feed(text.as_bytes());
                     for reply in emu.take_pty_writes() {
                         let _ = pty.write_all(&reply);
                     }
+                    let _ = pty.write_all(b"\r");
                     push_snapshot(id, &mut emu, cols, rows, &out);
                 }
                 PaneCmd::Render => {

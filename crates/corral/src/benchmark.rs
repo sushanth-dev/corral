@@ -101,6 +101,7 @@ mod bench {
                         render::Hint::None,
                         &[],
                         &[],
+                        &[],
                         None,
                     )
                 })

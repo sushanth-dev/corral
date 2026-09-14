@@ -17,6 +17,9 @@ const CURSOR_BG: Color = Color::Indexed(245);
 // Search matches: yellow on black, distinct from the reversed
 // selection highlight.
 const SEARCH_BG: Color = Color::Indexed(3);
+// The current search match: magenta on white, visibly distinct from
+// the yellow so the n/N walk is readable.
+const CURRENT_HIT_BG: Color = Color::Indexed(5);
 
 /// Selection highlight spans for one pane: (row, first col, last col
 /// inclusive) in text-grid coordinates.
@@ -34,6 +37,7 @@ pub enum Hint {
     Search(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame,
     panes: &[PaneState],
@@ -41,6 +45,7 @@ pub fn draw(
     hint: Hint,
     spans: &[(PaneId, SpanList)],
     search: &[(PaneId, SpanList)],
+    current: &[(PaneId, SpanList)],
     cursor: Option<(usize, usize)>,
 ) {
     for pane in panes {
@@ -76,6 +81,19 @@ pub fn draw(
             p,
             hit_spans,
             Style::new().fg(Color::Black).bg(SEARCH_BG),
+        );
+    }
+    // The current match paints over the yellow with its own color so
+    // the user can tell which hit the cursor is on.
+    for (pane_id, hit_spans) in current {
+        let Some(p) = panes.iter().find(|p| p.id == *pane_id) else {
+            continue;
+        };
+        paint_spans(
+            frame,
+            p,
+            hit_spans,
+            Style::new().fg(Color::White).bg(CURRENT_HIT_BG),
         );
     }
     if let Some(p) = panes.iter().find(|p| p.id == focused) {
@@ -177,6 +195,30 @@ pub fn search_spans(text: &str, needle: &str) -> SpanList {
             } else {
                 col += 1;
             }
+        }
+    }
+    spans
+}
+
+/// The current match's span: occurrences of `needle` on `row` only,
+/// painted by the caller with the distinct current-hit style.
+pub fn current_hit_spans(text: &str, needle: &str, row: usize) -> SpanList {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let Some(line) = text.lines().nth(row) else {
+        return Vec::new();
+    };
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let chars: Vec<char> = line.chars().collect();
+    let mut spans = Vec::new();
+    let mut col = 0;
+    while col + needle_chars.len() <= chars.len() {
+        if chars[col..col + needle_chars.len()] == needle_chars[..] {
+            spans.push((row, col, col + needle_chars.len() - 1));
+            col += needle_chars.len();
+        } else {
+            col += 1;
         }
     }
     spans
@@ -331,6 +373,7 @@ mod tests {
         draw_full(width, height, panes, focused, hint, spans, &[], None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_full(
         width: u16,
         height: u16,
@@ -343,7 +386,7 @@ mod tests {
     ) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, panes, focused, hint, spans, search, cursor))
+        term.draw(|f| draw(f, panes, focused, hint, spans, search, &[], cursor))
             .unwrap();
         term.backend().buffer().clone()
     }
@@ -458,8 +501,19 @@ mod tests {
         let panes = panes();
         let backend = TestBackend::new(101, 10);
         let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, &panes, 1, Hint::Copy(Some((12, 96))), &[], &[], None))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &panes,
+                1,
+                Hint::Copy(Some((12, 96))),
+                &[],
+                &[],
+                &[],
+                None,
+            )
+        })
+        .unwrap();
         let buf = term.backend().buffer().clone();
         assert!(row(&buf, 9, 101).contains("copy mode"));
         assert!(row(&buf, 9, 101).contains("12/96"));
@@ -472,7 +526,7 @@ mod tests {
         let panes = panes();
         let backend = TestBackend::new(101, 10);
         let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, &panes, 1, Hint::Copy(None), &[], &[], None))
+        term.draw(|f| draw(f, &panes, 1, Hint::Copy(None), &[], &[], &[], None))
             .unwrap();
         let buf = term.backend().buffer().clone();
         assert!(row(&buf, 9, 101).contains("copy mode"));
@@ -654,5 +708,40 @@ mod tests {
         let style = Style::new().fg(Color::Black).bg(SEARCH_BG);
         assert_eq!(style.bg, Some(SEARCH_BG));
         assert!(!style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn current_hit_spans_matches_one_row_only() {
+        let spans = current_hit_spans("abc abc\nxabcx\nnope", "abc", 1);
+        assert_eq!(spans, vec![(1, 1, 3)], "only row one's match");
+        assert!(current_hit_spans("abc abc", "abc", 2).is_empty());
+        assert!(current_hit_spans("abc abc", "", 0).is_empty());
+    }
+
+    #[test]
+    fn current_hit_paints_magenta_over_the_search_yellow() {
+        let panes = panes();
+        let hit_spans = search_spans(&panes[0].text, "pane");
+        let current = current_hit_spans(&panes[0].text, "pane", 0);
+        let backend = TestBackend::new(101, 10);
+        let mut term = TuiTerminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &panes,
+                1,
+                Hint::None,
+                &[],
+                &[(1, hit_spans)],
+                &[(1, current)],
+                None,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            term.backend().buffer()[(0, 0)].bg,
+            CURRENT_HIT_BG,
+            "the hit the user is on paints the active color, not the plain search color"
+        );
     }
 }

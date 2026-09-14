@@ -110,22 +110,52 @@ fn pane_command() -> (String, Vec<String>) {
 
 fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     send_msg(writer, &ClientMsg::Attach)?;
-    // Size the daemon to the real terminal and spawn the first shell; the
-    // daemon starts at 80x24 and never resizes until told.
+    // Size the daemon to the real terminal. The daemon answers Attach
+    // with the current layout immediately, so this first read tells us
+    // whether the session already has panes: rejoining must attach to
+    // them, not spawn another shell.
     let (cols, rows) = crossterm::terminal::size()?;
-    let (shell, args) = pane_command();
-    let cwd = std::env::current_dir()?.to_string_lossy().to_string();
     send_msg(writer, &ClientMsg::Resize { cols, rows })?;
-    send_msg(
-        writer,
-        &ClientMsg::CreatePane {
-            cmd: shell,
-            args,
-            cwd,
-            // The first pane fills the screen; the direction is unused.
-            dir: corral_core::tree::Dir::Horizontal,
-        },
-    )?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut first_frame: Option<Vec<PaneState>> = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    reader.get_mut().set_nonblocking(false)?;
+    while first_frame.is_none() && std::time::Instant::now() < deadline {
+        let mut line = String::new();
+        match std::io::BufRead::read_line(&mut reader, &mut line) {
+            Ok(0) => anyhow::bail!("daemon closed during attach"),
+            Ok(_) => {
+                if let Ok(ServerMsg::Frame { panes: p, .. }) =
+                    serde_json::from_str::<ServerMsg>(line.trim())
+                {
+                    first_frame = Some(p);
+                }
+            }
+            Err(e) => anyhow::bail!("no attach frame from daemon: {e}"),
+        }
+    }
+    let Some(initial_panes) = first_frame else {
+        anyhow::bail!("daemon sent no layout within 2s");
+    };
+    // The main loop drains the socket nonblocking; the attach read ran
+    // blocking, so restore the mode it expects.
+    reader.get_mut().set_nonblocking(true)?;
+    if initial_panes.is_empty() {
+        // Fresh session: the daemon starts at 80x24 with no panes, so
+        // spawn the first shell now that the size is applied.
+        let (shell, args) = pane_command();
+        let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+        send_msg(
+            writer,
+            &ClientMsg::CreatePane {
+                cmd: shell,
+                args,
+                cwd,
+                // The first pane fills the screen; the direction is unused.
+                dir: corral_core::tree::Dir::Horizontal,
+            },
+        )?;
+    }
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut mode = input::Mode::Input;
@@ -163,7 +193,6 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
         Option<(PaneId, Vec<usize>)>,
     );
     let mut last_drawn: Option<FrameKey> = None;
-    let mut reader = std::io::BufReader::new(stream);
     loop {
         // Drain socket lines (nonblocking): frames land in the pane state
         // used by the draw below. A daemon streaming frames can keep this
@@ -283,10 +312,34 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 }
                 Some(input::Action::CopyScroll(target)) => {
                     send_msg(writer, &ClientMsg::Scroll { target })?;
+                    // g/G and Ctrl+u/Ctrl+d move the view; the copy
+                    // cursor rides it instead of staying behind. Top
+                    // pins the cursor at the viewport top, bottom at
+                    // the last row; half-page moves it by the same
+                    // delta and clamps inside the view.
+                    let height = focused_pane.map(|p| p.rect.h as usize).unwrap_or(1);
+                    match target {
+                        corrald::protocol::ScrollTarget::Top => {
+                            copy_cursor = Some((0, copy_cursor.map_or(0, |c| c.1)));
+                        }
+                        corrald::protocol::ScrollTarget::Bottom => {
+                            copy_cursor = Some((height - 1, copy_cursor.map_or(0, |c| c.1)));
+                        }
+                        corrald::protocol::ScrollTarget::Delta(d) => {
+                            if let Some((r, c)) = copy_cursor {
+                                let new_r = (r as isize + d).clamp(0, height as isize - 1);
+                                copy_cursor = Some((new_r as usize, c));
+                            }
+                        }
+                        corrald::protocol::ScrollTarget::Row(_) => {}
+                    }
                 }
                 Some(input::Action::BeginSelect(kind)) => {
-                    // The anchor is the top-left of the visible grid.
-                    selection = Some(selection::Selection::start(kind, (0, 0)));
+                    // The anchor is the copy cursor: selection starts
+                    // where the user is looking, not the viewport
+                    // top-left. Copy mode always sets a cursor first.
+                    let anchor = copy_cursor.unwrap_or((0, 0));
+                    selection = Some(selection::Selection::start(kind, anchor));
                     mode = input::Mode::Select(kind);
                 }
                 Some(input::Action::SelectMove { drow, dcol }) => {
@@ -462,6 +515,30 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
             Some((*pane, render::search_spans(&p.text, needle)))
                 .filter(|(_, spans)| !spans.is_empty() || !rows.is_empty())
         });
+        // The current match paints differently from the rest: the
+        // daemon's first hit row is the one the viewport jumped to, so
+        // it maps to a viewport row by the same arithmetic the worker
+        // used to land there.
+        let current_hit: Option<(PaneId, render::SpanList)> =
+            match (search_hits.as_ref(), last_search.as_ref()) {
+                (Some((pane, rows)), Some(needle)) if !rows.is_empty() => {
+                    let Some(p) = panes.iter().find(|p| p.id == *pane) else {
+                        continue;
+                    };
+                    let hit_row = rows[0];
+                    let row_in_view =
+                        hit_row.saturating_sub(p.scroll.map(|s| s.offset).unwrap_or(hit_row));
+                    if row_in_view < p.rect.h as usize {
+                        Some((
+                            *pane,
+                            render::current_hit_spans(&p.text, needle, row_in_view),
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
         // The whole hint joins the diff key: collapsing it to a bool
         // would skip the repaint that reveals the search prompt when a
         // Copy frame turns into a Search frame.
@@ -496,7 +573,21 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 let search: Vec<(PaneId, render::SpanList)> = active_search
                     .map(|(pane, spans)| vec![(pane, spans)])
                     .unwrap_or_default();
-                render::draw(f, &panes, focused, hint, &spans, &search, visible_cursor);
+                // The current match paints over the yellow: a distinct
+                // background marks which hit n would land on next.
+                let current: Vec<(PaneId, render::SpanList)> = current_hit
+                    .map(|(pane, spans)| vec![(pane, spans)])
+                    .unwrap_or_default();
+                render::draw(
+                    f,
+                    &panes,
+                    focused,
+                    hint,
+                    &spans,
+                    &search,
+                    &current,
+                    visible_cursor,
+                );
                 // Position the real cursor inside the frame. Full-screen
                 // programs manage their own cursor.
                 if let Some(p) = panes.iter().find(|p| p.id == focused)

@@ -145,6 +145,17 @@ impl Daemon {
                     );
                 }
                 self.focused = id;
+                // The tree changed shape: every pane's rect shrank to
+                // make room. Reflow each pane's PTY and emulator so
+                // output wraps at the pane width, not the old full
+                // width. Covers the first pane too, which the client
+                // resized before this CreatePane landed.
+                let rects = self.rects();
+                for (id, rect) in &rects {
+                    if let Some(pane) = self.panes.get(id) {
+                        pane.send(PaneCmd::Resize(rect.w, rect.h))?;
+                    }
+                }
             }
             ClientMsg::Key { bytes } => {
                 if let Some(pane) = self.panes.get(&self.focused) {
@@ -979,7 +990,7 @@ mod tests {
         drop(first);
 
         // The same daemon serves the next connection with the live pane.
-        let mut second = UnixStream::connect(&_sock).unwrap();
+        let second = UnixStream::connect(&_sock).unwrap();
         let mut reader = BufReader::new(second);
         let frame = wait_for_msg(&mut reader, |m| match m {
             ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("kept")),
@@ -1294,11 +1305,12 @@ mod tests {
         let ServerMsg::Frame { panes, .. } = cleared else {
             unreachable!()
         };
-        // The active screen (last 24 of the 60 lines) survives the clear;
-        // scroll is None because the viewport is pinned back to the bottom.
+        // The clear wipes the viewport too (2J after the 3J): the pane
+        // comes back blank, not showing the last 24 of the 60 lines.
+        // scroll is None because the viewport is pinned to the bottom.
         assert!(
-            panes[0].text.contains("60"),
-            "active screen survives the clear, got {:?}",
+            panes[0].text.trim().is_empty(),
+            "viewport is wiped by the clear, got {:?}",
             panes[0].text
         );
 
@@ -1314,7 +1326,7 @@ mod tests {
         let still_bottom = wait_for_msg(&mut reader, |m| match m {
             ServerMsg::Frame { panes, .. } => panes
                 .iter()
-                .any(|p| p.scroll.is_none() && p.text.contains("60")),
+                .any(|p| p.scroll.is_none() && p.text.trim().is_empty()),
             _ => false,
         })
         .expect("post-clear scroll up cannot leave the bottom within 5s");

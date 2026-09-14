@@ -65,6 +65,13 @@ impl Emulator {
     /// Screen-space rows whose semantic prompt state is `Prompt` (S3-8).
     /// Shell-integrated shells emit OSC 133 A at each prompt; rows
     /// without markers report `None` and yield no prompt rows.
+    ///
+    /// The marker row is usually blank: fish and zsh print OSC 133 A
+    /// before drawing the prompt, so the shell's prompt text lives on
+    /// the marker row or the one below. `prompt_rows` reports the
+    /// marker row; callers that need the visible prompt use
+    /// `prompt_text_rows`, which shifts a marker to the next
+    /// non-empty row when the marker row itself is blank.
     pub fn prompt_rows(&mut self) -> Result<Vec<usize>> {
         let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
         let mut rows = Vec::new();
@@ -81,14 +88,38 @@ impl Emulator {
         Ok(rows)
     }
 
+    /// Prompt rows with blank marker rows shifted to the visible
+    /// prompt: a marker on an empty row maps to the next non-empty row
+    /// (the shell's prompt text); markers already on text map to
+    /// themselves. Rows resolve through `row_text`, so an all-blank
+    /// tail keeps its marker as-is.
+    pub fn prompt_text_rows(&mut self) -> Result<Vec<usize>> {
+        let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
+        let mut out = Vec::new();
+        for row in self.prompt_rows()? {
+            let mut mapped = row;
+            for r in row..total {
+                if !self.row_text(r)?.is_empty() {
+                    mapped = r;
+                    break;
+                }
+            }
+            out.push(mapped);
+        }
+        out.dedup();
+        Ok(out)
+    }
+
     /// The text of the command whose prompt is the last one at or above
     /// `anchor`: prompt row through the row before the next prompt
     /// (S3-8). `anchor` is a screen-space row; `None` means the bottom
-    /// of scrollback.
+    /// of scrollback. Prompt rows resolve through `prompt_text_rows`
+    /// so the block starts at the visible prompt, not the blank
+    /// marker row above it.
     pub fn command_text(&mut self, anchor: Option<usize>) -> Result<String> {
         let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
         let anchor = anchor.unwrap_or(total.saturating_sub(1));
-        let prompts = self.prompt_rows()?;
+        let prompts = self.prompt_text_rows()?;
         let start = prompts.iter().rev().find(|&&r| r <= anchor).copied();
         let Some(start) = start else {
             return Ok(String::new());
@@ -246,6 +277,26 @@ mod tests {
         }
         let rows = emu.prompt_rows().unwrap();
         assert_eq!(rows, vec![0, 15, 30], "markers land on those rows");
+    }
+
+    #[test]
+    fn prompt_text_rows_shifts_blank_markers_to_the_prompt() {
+        // fish and zsh emit the OSC133 A marker on the blank line
+        // above the drawn prompt, so the raw marker row is not where
+        // the user sees the prompt. prompt_text_rows moves each blank
+        // marker down to the first non-empty row below it.
+        let mut emu = Emulator::new(80, 24).unwrap();
+        for i in 0..3 {
+            // Marker row is blank: the marker sits on its own line and
+            // the prompt text follows on the next row, like fish does.
+            emu.feed(b"\x1b]133;A\x1b\\\r\n");
+            emu.feed(format!("$ prompt {i}\r\n").as_bytes());
+            for j in 0..14 {
+                emu.feed(format!("output {i}.{j}\r\n").as_bytes());
+            }
+        }
+        let rows = emu.prompt_text_rows().unwrap();
+        assert_eq!(rows, vec![1, 17, 33], "each marker shifted to its text row");
     }
 
     #[test]
