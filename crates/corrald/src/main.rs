@@ -1,3 +1,4 @@
+mod pane;
 mod protocol;
 mod pty;
 mod server;

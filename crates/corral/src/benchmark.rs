@@ -74,6 +74,8 @@ mod bench {
                 text,
                 cursor: None,
                 app_cursor: false,
+                scroll: None,
+                lines: vec![],
             });
         }
 
@@ -91,7 +93,18 @@ mod bench {
             }
             let snapshot = panes.clone();
             terminal
-                .draw(|frame| render::draw(frame, &snapshot, focused))
+                .draw(|frame| {
+                    render::draw(
+                        frame,
+                        &snapshot,
+                        focused,
+                        render::Hint::None,
+                        &[],
+                        &[],
+                        &[],
+                        None,
+                    )
+                })
                 .expect("draw");
             times.push(start.elapsed().as_millis());
         }

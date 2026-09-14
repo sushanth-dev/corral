@@ -1,7 +1,22 @@
 use corral_core::tree::Dir;
+use corrald::protocol::ScrollTarget;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-#[derive(Debug)]
+use crate::selection::SelectMode;
+
+/// Client input mode. Copy mode (Ctrl+a [) routes keys to scrollback
+/// navigation and swallows everything else; nothing binds a bare key in
+/// input mode. Select is copy mode with an active v/V selection. Search
+/// is the `/` prompt: typed characters build the needle, Enter submits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Input,
+    Copy,
+    Select(SelectMode),
+    Search,
+}
+
+#[derive(Debug, PartialEq)]
 pub enum Action {
     Focus(Dir),
     // s splits vertically, v horizontally; the daemon splits the focused
@@ -9,27 +24,194 @@ pub enum Action {
     Split(Dir),
     Quit,
     Send(Vec<u8>),
+    EnterCopy,
+    CopyScroll(ScrollTarget),
+    ExitCopy,
+    BeginSelect(SelectMode),
+    /// Motion while a selection is active: move the selection cursor by
+    /// (drow, dcol) within the visible grid. Coordinates are
+    /// viewport-relative; the recorded simplification means no scrolling
+    /// mid-selection.
+    SelectMove {
+        drow: isize,
+        dcol: isize,
+    },
+    /// Copy-mode cursor motion (h/j/k/l and arrows). The client moves
+    /// its viewport cursor and scrolls the pane when the cursor pushes
+    /// past the top or bottom edge.
+    CopyCursorMove {
+        drow: isize,
+        dcol: isize,
+    },
+    Yank,
+    CancelSelect,
+    /// `/` in copy mode: open the search prompt.
+    BeginSearch,
+    /// `?` in copy mode: search prompt, first match found upward.
+    BeginSearchReverse,
+    /// A printable character typed into the search prompt.
+    SearchChar(char),
+    /// Backspace in the search prompt.
+    SearchBackspace,
+    /// Enter in the search prompt: submit the needle.
+    SearchSubmit,
+    /// Esc in the search prompt: drop the needle, back to copy mode.
+    SearchCancel,
+    /// `n` in copy mode: repeat the last search forward.
+    SearchNext,
+    /// `N` in copy mode: repeat the last search backward.
+    SearchPrev,
+    /// Leader `c`: erase the focused pane's scrollback.
+    ClearHistory,
+    /// Leader `e`: open the focused pane's scrollback in an editor.
+    EditScrollback,
+    /// `{` in copy mode: jump to the previous prompt row.
+    PromptPrev,
+    /// `}` in copy mode: jump to the next prompt row.
+    PromptNext,
+    /// `C-o` in copy mode: yank the current command's output.
+    YankCommand,
+    /// Leader `o`: move focus to the next pane, wrapping.
+    FocusNext,
 }
 
-// The Ctrl+a leader is the only key corral consumes. Everything else
-// forwards to the focused pane exactly as a plain terminal would deliver
-// it: control bytes, escape sequences, modifier chords and all.
+// The Ctrl+a leader is the only key corral consumes in input mode. In
+// copy mode the leader still arms (tmux-style) so Ctrl+a c and Ctrl+a e
+// reach their actions from scrollback; every other copy key is
+// consumed: vi keys move the cursor, everything else does nothing, and
+// no byte ever reaches the pane. `half_page` is the pane height for
+// Ctrl+d/Ctrl+u; it only matters in copy mode.
 
-pub fn handle(ev: KeyEvent, armed: &mut bool, app_cursor: bool) -> Option<Action> {
-    if *armed {
-        *armed = false;
-        return match (ev.code, ev.modifiers) {
-            // Ctrl+a Ctrl+a passes a real 0x01 through, tmux-style.
-            (KeyCode::Char('a'), KeyModifiers::CONTROL) => Some(Action::Send(vec![0x01])),
-            (KeyCode::Char('h'), _) => Some(Action::Focus(Dir::Horizontal)),
-            (KeyCode::Char('l'), _) => Some(Action::Focus(Dir::Horizontal)),
-            (KeyCode::Char('j'), _) => Some(Action::Focus(Dir::Vertical)),
-            (KeyCode::Char('k'), _) => Some(Action::Focus(Dir::Vertical)),
-            (KeyCode::Char('s'), _) => Some(Action::Split(Dir::Vertical)),
-            (KeyCode::Char('v'), _) => Some(Action::Split(Dir::Horizontal)),
-            (KeyCode::Char('d'), _) => Some(Action::Quit),
+/// The shared leader table: the key after Ctrl+a. Used by input mode
+/// and, since the leader arms there too, by copy mode.
+fn leader_action(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
+    match (code, mods) {
+        (KeyCode::Char('h'), _) => Some(Action::Focus(Dir::Horizontal)),
+        (KeyCode::Char('l'), _) => Some(Action::Focus(Dir::Horizontal)),
+        (KeyCode::Char('j'), _) => Some(Action::Focus(Dir::Vertical)),
+        (KeyCode::Char('k'), _) => Some(Action::Focus(Dir::Vertical)),
+        // tmux geometry: % splits right (side by side, cut in width =
+        // Dir::Horizontal here), " splits below (stacked =
+        // Dir::Vertical).
+        (KeyCode::Char('%'), _) => Some(Action::Split(Dir::Horizontal)),
+        (KeyCode::Char('"'), _) => Some(Action::Split(Dir::Vertical)),
+        (KeyCode::Char('o'), _) => Some(Action::FocusNext),
+        (KeyCode::Left, _) => Some(Action::Focus(Dir::Horizontal)),
+        (KeyCode::Right, _) => Some(Action::Focus(Dir::Horizontal)),
+        (KeyCode::Up, _) => Some(Action::Focus(Dir::Vertical)),
+        (KeyCode::Down, _) => Some(Action::Focus(Dir::Vertical)),
+        (KeyCode::Char('['), _) => Some(Action::EnterCopy),
+        (KeyCode::Char('c'), _) => Some(Action::ClearHistory),
+        (KeyCode::Char('e'), _) => Some(Action::EditScrollback),
+        (KeyCode::Char('d'), _) => Some(Action::Quit),
+        _ => None,
+    }
+}
+
+pub fn handle(
+    ev: KeyEvent,
+    armed: &mut bool,
+    mode: &Mode,
+    app_cursor: bool,
+    half_page: u16,
+) -> Option<Action> {
+    if *mode == Mode::Search {
+        return match ev.code {
+            KeyCode::Char(c) => Some(Action::SearchChar(c)),
+            KeyCode::Backspace => Some(Action::SearchBackspace),
+            KeyCode::Enter => Some(Action::SearchSubmit),
+            KeyCode::Esc => Some(Action::SearchCancel),
             _ => None,
         };
+    }
+    if *mode == Mode::Copy {
+        // The leader works in copy mode (tmux-style): Ctrl+a arms, the
+        // next key goes through the shared leader table (Ctrl+a c clear
+        // history and Ctrl+a e edit scrollback both land from here).
+        if matches!(
+            (ev.code, ev.modifiers),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL)
+        ) {
+            *armed = true;
+            return None;
+        }
+        if *armed {
+            *armed = false;
+            return leader_action(ev.code, ev.modifiers);
+        }
+        return match (ev.code, ev.modifiers) {
+            // libghostty's ScrollViewport::Delta is "up is negative": k
+            // (earlier lines) is negative, j (later lines) is positive.
+            // h/j/k/l and arrows move the copy cursor instead of raw
+            // scrolling; the cursor drags the viewport at the edges.
+            (KeyCode::Char('h'), _) | (KeyCode::Left, _) => {
+                Some(Action::CopyCursorMove { drow: 0, dcol: -1 })
+            }
+            (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
+                Some(Action::CopyCursorMove { drow: 0, dcol: 1 })
+            }
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
+                Some(Action::CopyCursorMove { drow: 1, dcol: 0 })
+            }
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
+                Some(Action::CopyCursorMove { drow: -1, dcol: 0 })
+            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                Some(Action::CopyScroll(ScrollTarget::Delta(half_page as isize)))
+            }
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => Some(Action::CopyScroll(
+                ScrollTarget::Delta(-(half_page as isize)),
+            )),
+            (KeyCode::Char('g'), _) => Some(Action::CopyScroll(ScrollTarget::Top)),
+            (KeyCode::Char('G'), _) => Some(Action::CopyScroll(ScrollTarget::Bottom)),
+            (KeyCode::Char('/'), _) => Some(Action::BeginSearch),
+            (KeyCode::Char('?'), _) => Some(Action::BeginSearchReverse),
+            (KeyCode::Char('n'), _) => Some(Action::SearchNext),
+            (KeyCode::Char('N'), _) => Some(Action::SearchPrev),
+            (KeyCode::Char('{'), _) => Some(Action::PromptPrev),
+            (KeyCode::Char('}'), _) => Some(Action::PromptNext),
+            (KeyCode::Char('o'), KeyModifiers::CONTROL) => Some(Action::YankCommand),
+            (KeyCode::Char('v'), _) => Some(Action::BeginSelect(SelectMode::Span)),
+            (KeyCode::Char('V'), _) => Some(Action::BeginSelect(SelectMode::Rect)),
+            (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => Some(Action::ExitCopy),
+            // Typing, focus keys: swallowed, never forwarded.
+            _ => None,
+        };
+    }
+    if matches!(mode, Mode::Select(_)) {
+        return match (ev.code, ev.modifiers) {
+            (KeyCode::Char('v'), _) => Some(Action::CancelSelect),
+            (KeyCode::Char('V'), _) => Some(Action::CancelSelect),
+            (KeyCode::Char('y'), _) | (KeyCode::Enter, _) => Some(Action::Yank),
+            (KeyCode::Esc, _) => Some(Action::CancelSelect),
+            (KeyCode::Char('q'), _) => Some(Action::ExitCopy),
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
+                Some(Action::SelectMove { drow: 1, dcol: 0 })
+            }
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
+                Some(Action::SelectMove { drow: -1, dcol: 0 })
+            }
+            (KeyCode::Char('h'), _) | (KeyCode::Left, _) => {
+                Some(Action::SelectMove { drow: 0, dcol: -1 })
+            }
+            (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
+                Some(Action::SelectMove { drow: 0, dcol: 1 })
+            }
+            _ => None,
+        };
+    }
+    if *armed {
+        *armed = false;
+        // Ctrl+a Ctrl+a passes a real 0x01 through, tmux-style; it only
+        // exists in input mode, where Ctrl+a means "send".
+        if matches!(
+            (ev.code, ev.modifiers),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL)
+        ) && *mode == Mode::Input
+        {
+            return Some(Action::Send(vec![0x01]));
+        }
+        return leader_action(ev.code, ev.modifiers);
     }
     match (ev.code, ev.modifiers) {
         (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
@@ -159,10 +341,23 @@ mod tests {
 
     fn sent_ac(code: KeyCode, mods: KeyModifiers, app_cursor: bool) -> Vec<u8> {
         let mut armed = false;
-        match handle(key(code, mods), &mut armed, app_cursor) {
+        match handle(key(code, mods), &mut armed, &Mode::Input, app_cursor, 0) {
             Some(Action::Send(b)) => b,
             other => panic!("{code:?} {mods:?} produced {other:?}, expected Send"),
         }
+    }
+
+    /// Arms the leader then presses `code` in input mode.
+    fn leader_then(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
+        let mut armed = false;
+        handle(
+            key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut armed,
+            &Mode::Input,
+            false,
+            0,
+        );
+        handle(key(code, mods), &mut armed, &Mode::Input, false, 0)
     }
 
     #[test]
@@ -172,7 +367,9 @@ mod tests {
             handle(
                 key(KeyCode::Char('a'), KeyModifiers::CONTROL),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             )
             .is_none()
         );
@@ -181,7 +378,9 @@ mod tests {
             handle(
                 key(KeyCode::Char('h'), KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             ),
             Some(Action::Focus(Dir::Horizontal))
         ));
@@ -189,46 +388,76 @@ mod tests {
     }
 
     #[test]
-    fn leader_then_j_focuses_down_and_s_v_split() {
+    fn leader_then_j_focuses_down_and_percent_quote_split() {
         let mut armed = false;
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(matches!(
             handle(
                 key(KeyCode::Char('j'), KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             ),
             Some(Action::Focus(Dir::Vertical))
         ));
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
+        // tmux: % splits right (Dir::Horizontal cuts width), " splits
+        // below (Dir::Vertical cuts height).
         assert!(matches!(
             handle(
-                key(KeyCode::Char('v'), KeyModifiers::NONE),
+                key(KeyCode::Char('%'), KeyModifiers::SHIFT),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             ),
             Some(Action::Split(Dir::Horizontal))
         ));
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(matches!(
             handle(
-                key(KeyCode::Char('s'), KeyModifiers::NONE),
+                key(KeyCode::Char('"'), KeyModifiers::SHIFT),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             ),
             Some(Action::Split(Dir::Vertical))
+        ));
+    }
+
+    #[test]
+    fn leader_then_o_cycles_focus_and_arrows_focus() {
+        assert!(matches!(
+            leader_then(KeyCode::Char('o'), KeyModifiers::NONE),
+            Some(Action::FocusNext)
+        ));
+        assert!(matches!(
+            leader_then(KeyCode::Left, KeyModifiers::NONE),
+            Some(Action::Focus(Dir::Horizontal))
+        ));
+        assert!(matches!(
+            leader_then(KeyCode::Up, KeyModifiers::NONE),
+            Some(Action::Focus(Dir::Vertical))
         ));
     }
 
@@ -238,13 +467,17 @@ mod tests {
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(matches!(
             handle(
                 key(KeyCode::Char('d'), KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             ),
             Some(Action::Quit)
         ));
@@ -255,7 +488,7 @@ mod tests {
     fn plain_typing_sends_bytes_and_is_not_eaten() {
         let mut armed = false;
         assert!(matches!(
-            handle(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut armed, false),
+            handle(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut armed, &Mode::Input, false, 0),
             Some(Action::Send(b)) if b == b"x"
         ));
         assert!(!armed);
@@ -267,13 +500,17 @@ mod tests {
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(
             handle(
                 key(KeyCode::Char('z'), KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             )
             .is_none()
         );
@@ -323,11 +560,13 @@ mod tests {
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(armed);
         assert!(matches!(
-            handle(key(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut armed, false),
+            handle(key(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut armed, &Mode::Input, false, 0),
             Some(Action::Send(b)) if b == vec![0x01]
         ));
         assert!(!armed);
@@ -335,14 +574,18 @@ mod tests {
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(armed);
         assert!(matches!(
             handle(
                 key(KeyCode::Char('d'), KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             ),
             Some(Action::Quit)
         ));
@@ -471,11 +714,22 @@ mod tests {
             handle(
                 key(KeyCode::CapsLock, KeyModifiers::NONE),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             )
             .is_none()
         );
-        assert!(handle(key(KeyCode::F(13), KeyModifiers::NONE), &mut armed, false).is_none());
+        assert!(
+            handle(
+                key(KeyCode::F(13), KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Input,
+                false,
+                0
+            )
+            .is_none()
+        );
         assert!(!armed);
     }
 
@@ -496,11 +750,14 @@ mod tests {
             (KeyCode::Char('k'), |a: &Action| {
                 matches!(a, Action::Focus(Dir::Vertical))
             }),
-            (KeyCode::Char('s'), |a: &Action| {
-                matches!(a, Action::Split(Dir::Vertical))
+            (KeyCode::Char('o'), |a: &Action| {
+                matches!(a, Action::FocusNext)
             }),
-            (KeyCode::Char('v'), |a: &Action| {
-                matches!(a, Action::Split(Dir::Horizontal))
+            (KeyCode::Char('c'), |a: &Action| {
+                matches!(a, Action::ClearHistory)
+            }),
+            (KeyCode::Char('e'), |a: &Action| {
+                matches!(a, Action::EditScrollback)
             }),
             (KeyCode::Char('d'), |a: &Action| matches!(a, Action::Quit)),
         ];
@@ -509,10 +766,18 @@ mod tests {
             handle(
                 key(KeyCode::Char('a'), KeyModifiers::CONTROL),
                 &mut armed,
+                &Mode::Input,
                 false,
+                0,
             );
-            let action = handle(key(code, KeyModifiers::NONE), &mut armed, false)
-                .unwrap_or_else(|| panic!("{code:?} produced no action"));
+            let action = handle(
+                key(code, KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Input,
+                false,
+                0,
+            )
+            .unwrap_or_else(|| panic!("{code:?} produced no action"));
             assert!(check(&action), "{code:?} produced {action:?}");
             assert!(!armed, "{code:?} left the leader armed");
         }
@@ -526,17 +791,405 @@ mod tests {
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             &mut armed,
+            &Mode::Input,
             false,
+            0,
         );
         assert!(
             handle(
                 key(KeyCode::Char('H'), KeyModifiers::SHIFT),
                 &mut armed,
-                false
+                &Mode::Input,
+                false,
+                0
             )
             .is_none(),
             "uppercase H must not focus or send"
         );
         assert!(!armed);
+    }
+
+    fn copy_action(code: KeyCode, mods: KeyModifiers) -> Action {
+        let mut armed = false;
+        handle(key(code, mods), &mut armed, &Mode::Copy, false, 12)
+            .unwrap_or_else(|| panic!("{code:?} {mods:?} produced no action in copy mode"))
+    }
+
+    fn select_action(code: KeyCode, mods: KeyModifiers, mode: Mode) -> Option<Action> {
+        let mut armed = false;
+        handle(key(code, mods), &mut armed, &mode, false, 12)
+    }
+
+    #[test]
+    fn leader_bracket_enters_copy_mode_from_input() {
+        assert!(matches!(
+            leader_then(KeyCode::Char('['), KeyModifiers::NONE),
+            Some(Action::EnterCopy)
+        ));
+    }
+
+    #[test]
+    fn copy_mode_j_and_k_move_the_cursor() {
+        assert_eq!(
+            copy_action(KeyCode::Char('j'), KeyModifiers::NONE),
+            Action::CopyCursorMove { drow: 1, dcol: 0 }
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('k'), KeyModifiers::NONE),
+            Action::CopyCursorMove { drow: -1, dcol: 0 }
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('h'), KeyModifiers::NONE),
+            Action::CopyCursorMove { drow: 0, dcol: -1 }
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('l'), KeyModifiers::NONE),
+            Action::CopyCursorMove { drow: 0, dcol: 1 }
+        );
+    }
+
+    #[test]
+    fn copy_mode_arrows_move_the_cursor_like_hjkl() {
+        assert_eq!(
+            copy_action(KeyCode::Down, KeyModifiers::NONE),
+            Action::CopyCursorMove { drow: 1, dcol: 0 }
+        );
+        assert_eq!(
+            copy_action(KeyCode::Up, KeyModifiers::NONE),
+            Action::CopyCursorMove { drow: -1, dcol: 0 }
+        );
+        assert_eq!(
+            copy_action(KeyCode::Left, KeyModifiers::NONE),
+            Action::CopyCursorMove { drow: 0, dcol: -1 }
+        );
+        assert_eq!(
+            copy_action(KeyCode::Right, KeyModifiers::NONE),
+            Action::CopyCursorMove { drow: 0, dcol: 1 }
+        );
+    }
+
+    #[test]
+    fn leader_arms_in_copy_mode_and_clear_history_and_edit_work() {
+        // tmux allows the prefix inside copy mode; Ctrl+a c (clear
+        // history) and Ctrl+a e (edit scrollback) must land from here.
+        let mut armed = false;
+        handle(
+            key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut armed,
+            &Mode::Copy,
+            false,
+            0,
+        );
+        assert!(armed, "copy mode must arm the leader");
+        assert!(matches!(
+            handle(
+                key(KeyCode::Char('c'), KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            ),
+            Some(Action::ClearHistory)
+        ));
+        assert!(!armed);
+        handle(
+            key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut armed,
+            &Mode::Copy,
+            false,
+            0,
+        );
+        assert!(matches!(
+            handle(
+                key(KeyCode::Char('e'), KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            ),
+            Some(Action::EditScrollback)
+        ));
+        // An unknown leader key disarms and swallows.
+        handle(
+            key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut armed,
+            &Mode::Copy,
+            false,
+            0,
+        );
+        assert!(
+            handle(
+                key(KeyCode::Char('z'), KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            )
+            .is_none()
+        );
+        assert!(!armed);
+    }
+
+    #[test]
+    fn copy_mode_ctrl_d_u_scroll_half_the_pane() {
+        // Ctrl+d = down the buffer (later lines, positive).
+        assert_eq!(
+            copy_action(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            Action::CopyScroll(ScrollTarget::Delta(12))
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            Action::CopyScroll(ScrollTarget::Delta(-12))
+        );
+    }
+
+    #[test]
+    fn copy_mode_g_and_g_jump_to_top_and_bottom() {
+        assert_eq!(
+            copy_action(KeyCode::Char('g'), KeyModifiers::NONE),
+            Action::CopyScroll(ScrollTarget::Top)
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('G'), KeyModifiers::NONE),
+            Action::CopyScroll(ScrollTarget::Bottom)
+        );
+    }
+
+    #[test]
+    fn copy_mode_v_and_v_begin_selection() {
+        assert_eq!(
+            copy_action(KeyCode::Char('v'), KeyModifiers::NONE),
+            Action::BeginSelect(SelectMode::Span)
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('V'), KeyModifiers::NONE),
+            Action::BeginSelect(SelectMode::Rect)
+        );
+    }
+
+    #[test]
+    fn select_mode_motions_move_the_cursor() {
+        let mode = Mode::Select(SelectMode::Span);
+        assert_eq!(
+            select_action(KeyCode::Char('j'), KeyModifiers::NONE, mode),
+            Some(Action::SelectMove { drow: 1, dcol: 0 })
+        );
+        assert_eq!(
+            select_action(KeyCode::Char('k'), KeyModifiers::NONE, mode),
+            Some(Action::SelectMove { drow: -1, dcol: 0 })
+        );
+        assert_eq!(
+            select_action(KeyCode::Char('h'), KeyModifiers::NONE, mode),
+            Some(Action::SelectMove { drow: 0, dcol: -1 })
+        );
+        assert_eq!(
+            select_action(KeyCode::Char('l'), KeyModifiers::NONE, mode),
+            Some(Action::SelectMove { drow: 0, dcol: 1 })
+        );
+        assert_eq!(
+            select_action(KeyCode::Left, KeyModifiers::NONE, mode),
+            Some(Action::SelectMove { drow: 0, dcol: -1 })
+        );
+        assert_eq!(
+            select_action(KeyCode::Right, KeyModifiers::NONE, mode),
+            Some(Action::SelectMove { drow: 0, dcol: 1 })
+        );
+    }
+
+    #[test]
+    fn select_mode_y_and_enter_yank() {
+        let mode = Mode::Select(SelectMode::Rect);
+        assert_eq!(
+            select_action(KeyCode::Char('y'), KeyModifiers::NONE, mode),
+            Some(Action::Yank)
+        );
+        assert_eq!(
+            select_action(KeyCode::Enter, KeyModifiers::NONE, mode),
+            Some(Action::Yank)
+        );
+    }
+
+    #[test]
+    fn select_mode_v_esc_cancel_and_q_exit() {
+        let mode = Mode::Select(SelectMode::Span);
+        assert_eq!(
+            select_action(KeyCode::Char('v'), KeyModifiers::NONE, mode),
+            Some(Action::CancelSelect)
+        );
+        assert_eq!(
+            select_action(KeyCode::Char('V'), KeyModifiers::NONE, mode),
+            Some(Action::CancelSelect)
+        );
+        assert_eq!(
+            select_action(KeyCode::Esc, KeyModifiers::NONE, mode),
+            Some(Action::CancelSelect)
+        );
+        assert_eq!(
+            select_action(KeyCode::Char('q'), KeyModifiers::NONE, mode),
+            Some(Action::ExitCopy)
+        );
+    }
+
+    #[test]
+    fn copy_mode_q_and_esc_exit() {
+        let mut armed = false;
+        assert!(matches!(
+            handle(
+                key(KeyCode::Char('q'), KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            ),
+            Some(Action::ExitCopy)
+        ));
+        assert!(matches!(
+            handle(
+                key(KeyCode::Esc, KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            ),
+            Some(Action::ExitCopy)
+        ));
+    }
+
+    #[test]
+    fn copy_mode_swallows_typing_and_focus_keys() {
+        for (code, mods) in [
+            (KeyCode::Char('x'), KeyModifiers::NONE),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL),
+            (KeyCode::Char('h'), KeyModifiers::NONE),
+            (KeyCode::Char('s'), KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::NONE),
+        ] {
+            let mut armed = false;
+            let got = handle(key(code, mods), &mut armed, &Mode::Copy, false, 0);
+            assert!(
+                !matches!(got, Some(Action::Send(_))),
+                "{code:?} leaked bytes to the pane in copy mode: {got:?}"
+            );
+            assert!(
+                !matches!(got, Some(Action::Focus(_)) | Some(Action::Split(_))),
+                "{code:?} changed layout in copy mode: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_mode_swallows_the_leader_itself() {
+        // Ctrl+a in copy mode arms the leader (tmux-style) but sends
+        // nothing; Ctrl+a Ctrl+a does not pass a literal 0x01 from copy
+        // mode because nothing there is ever forwarded to the pane.
+        let mut armed = false;
+        assert!(
+            handle(
+                key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            )
+            .is_none()
+        );
+        assert!(armed, "copy mode did not arm the leader");
+        assert!(
+            handle(
+                key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                &mut armed,
+                &Mode::Copy,
+                false,
+                0
+            )
+            .is_none(),
+            "leader-leader in copy mode must not send bytes"
+        );
+    }
+
+    #[test]
+    fn copy_mode_slash_and_question_open_search_n_n_repeat() {
+        assert_eq!(
+            copy_action(KeyCode::Char('/'), KeyModifiers::NONE),
+            Action::BeginSearch
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            Action::BeginSearchReverse
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('n'), KeyModifiers::NONE),
+            Action::SearchNext
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('N'), KeyModifiers::NONE),
+            Action::SearchPrev
+        );
+    }
+
+    #[test]
+    fn copy_mode_braces_jump_prompts_and_ctrl_o_yanks() {
+        assert_eq!(
+            copy_action(KeyCode::Char('{'), KeyModifiers::NONE),
+            Action::PromptPrev
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('}'), KeyModifiers::NONE),
+            Action::PromptNext
+        );
+        assert_eq!(
+            copy_action(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            Action::YankCommand
+        );
+    }
+
+    fn search_action(code: KeyCode, mods: KeyModifiers) -> Action {
+        let mut armed = false;
+        handle(key(code, mods), &mut armed, &Mode::Search, false, 12)
+            .unwrap_or_else(|| panic!("{code:?} {mods:?} produced no action in search mode"))
+    }
+
+    #[test]
+    fn search_mode_types_backspace_submits_and_cancels() {
+        assert_eq!(
+            search_action(KeyCode::Char('e'), KeyModifiers::NONE),
+            Action::SearchChar('e')
+        );
+        assert_eq!(
+            search_action(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            Action::SearchChar('R')
+        );
+        assert_eq!(
+            search_action(KeyCode::Backspace, KeyModifiers::NONE),
+            Action::SearchBackspace
+        );
+        assert_eq!(
+            search_action(KeyCode::Enter, KeyModifiers::NONE),
+            Action::SearchSubmit
+        );
+        assert_eq!(
+            search_action(KeyCode::Esc, KeyModifiers::NONE),
+            Action::SearchCancel
+        );
+    }
+
+    #[test]
+    fn search_mode_swallows_everything_else() {
+        let mut armed = false;
+        for code in [KeyCode::Tab, KeyCode::F(5), KeyCode::Up] {
+            assert!(
+                handle(
+                    key(code, KeyModifiers::NONE),
+                    &mut armed,
+                    &Mode::Search,
+                    false,
+                    0
+                )
+                .is_none(),
+                "{code:?} produced an action in search mode"
+            );
+        }
+        assert!(!armed, "search mode armed the leader");
     }
 }
