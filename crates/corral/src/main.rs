@@ -13,6 +13,12 @@ use std::time::Duration;
 
 const POLL: Duration = Duration::from_millis(16);
 
+// Upper bound on one drain pass over the socket. The drain loop exits on
+// WouldBlock, but a daemon streaming frames continuously can keep it fed
+// forever, starving the key poll and the draw below. The budget forces a
+// yield so typed keys and rendering always make progress.
+const DRAIN_BUDGET: Duration = Duration::from_millis(100);
+
 fn socket_path() -> std::path::PathBuf {
     // corrald owns this helper; the client mirrors the env-over-UID rule.
     if let Ok(p) = std::env::var("CORRAL_SOCKET") {
@@ -30,7 +36,24 @@ fn socket_path() -> std::path::PathBuf {
 fn send_msg(stream: &mut UnixStream, msg: &ClientMsg) -> anyhow::Result<()> {
     let mut line = serde_json::to_string(msg)?;
     line.push('\n');
-    stream.write_all(line.as_bytes())?;
+    // The socket is nonblocking; a full send buffer returns WouldBlock,
+    // which is retryable, not fatal. Retry briefly so a keystroke is not
+    // dropped when the daemon is streaming frames.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut bytes = line.as_bytes();
+    while !bytes.is_empty() {
+        match stream.write(bytes) {
+            Ok(0) => anyhow::bail!("write returned zero"),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() > deadline {
+                    anyhow::bail!("socket send buffer stayed full for 1s");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
     stream.flush()?;
     Ok(())
 }
@@ -143,12 +166,21 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     let mut reader = std::io::BufReader::new(stream);
     loop {
         // Drain socket lines (nonblocking): frames land in the pane state
-        // used by the draw below.
+        // used by the draw below. A daemon streaming frames can keep this
+        // loop fed forever, so a time budget bounds the pass and lets the
+        // key poll and draw below run.
+        let deadline = std::time::Instant::now() + DRAIN_BUDGET;
         loop {
             let mut chunk = String::new();
             match std::io::BufRead::read_line(&mut reader, &mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => buf.push_str(&chunk),
+                Ok(0) => break,
+                Err(_) => break,
+                Ok(_) => {
+                    buf.push_str(&chunk);
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
             }
         }
         while let Some(pos) = buf.find('\n') {
