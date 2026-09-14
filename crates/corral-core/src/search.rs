@@ -5,6 +5,7 @@
 //! this kind of one-shot lookup. Case-sensitive for v0.2.
 
 use anyhow::Result;
+use libghostty_vt::screen::CellSemanticContent;
 use libghostty_vt::terminal::{Point, PointCoordinate};
 
 use crate::emulation::Emulator;
@@ -107,6 +108,53 @@ impl Emulator {
             out.push(mapped);
         }
         out.dedup();
+        Ok(out)
+    }
+
+    /// Screen-space (row, col) of each prompt's command input, from OSC
+    /// 133;B. fish and zsh mark the exact cell where typed input starts
+    /// with `CellSemanticContent::Input`; a shell theme (Tide) can wrap
+    /// the prompt in a multi-row box, so scanning cell-by-cell from each
+    /// OSC 133;A marker to the next finds the real command position
+    /// instead of the marker row or the box-drawing glyphs.
+    pub fn prompt_input_positions(&mut self) -> Result<Vec<(usize, u16)>> {
+        let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
+        let cols = self.terminal.cols()?;
+        let markers = self.prompt_rows()?;
+        let mut out = Vec::with_capacity(markers.len());
+        for (i, &start) in markers.iter().enumerate() {
+            let end = markers.get(i + 1).copied().unwrap_or(total);
+            let mut input_cell = None;
+            'scan: for row in start..end {
+                for col in 0..cols {
+                    let grid = self.terminal.grid_ref(Point::Screen(PointCoordinate {
+                        x: col,
+                        y: row as u32,
+                    }))?;
+                    if grid.cell()?.semantic_content()? == CellSemanticContent::Input {
+                        input_cell = Some((row, col));
+                        break 'scan;
+                    }
+                }
+            }
+            let pos = match input_cell {
+                Some(p) => p,
+                None => {
+                    // No OSC 133;B seen: fall back to the first
+                    // non-empty row (prompt_text_rows' heuristic), left
+                    // column.
+                    let mut mapped = (start, 0);
+                    for r in start..end {
+                        if !self.row_text(r)?.is_empty() {
+                            mapped = (r, 0);
+                            break;
+                        }
+                    }
+                    mapped
+                }
+            };
+            out.push(pos);
+        }
         Ok(out)
     }
 
@@ -297,6 +345,43 @@ mod tests {
         }
         let rows = emu.prompt_text_rows().unwrap();
         assert_eq!(rows, vec![1, 17, 33], "each marker shifted to its text row");
+    }
+
+    #[test]
+    fn prompt_input_positions_lands_on_the_command_not_the_wrapper() {
+        // A Tide-style two-row prompt: OSC 133;A marks a blank row, a
+        // decorative wrapper line follows, and OSC 133;B marks the exact
+        // cell (row, col) where the command text starts on the third
+        // row. prompt_input_positions must resolve to that cell, not
+        // the marker row or the wrapper row.
+        let mut emu = Emulator::new(80, 24).unwrap();
+        for i in 0..3 {
+            emu.feed(b"\x1b]133;A\x1b\\\r\n");
+            emu.feed(b"almost-a-prompt-wrapper\r\n");
+            emu.feed(b"$ ");
+            emu.feed(b"\x1b]133;B\x1b\\");
+            emu.feed(format!("cmd {i}\r\n").as_bytes());
+            for j in 0..5 {
+                emu.feed(format!("out {i}.{j}\r\n").as_bytes());
+            }
+        }
+        let positions = emu.prompt_input_positions().unwrap();
+        assert_eq!(
+            positions,
+            vec![(2, 2), (10, 2), (18, 2)],
+            "each command starts two rows below its marker, at column 2"
+        );
+    }
+
+    #[test]
+    fn prompt_input_positions_without_osc133b_falls_back_to_the_text_row() {
+        // No OSC 133;B: fall back to the first non-empty row, column 0,
+        // same as prompt_text_rows.
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]133;A\x1b\\\r\n");
+        emu.feed(b"$ plain prompt\r\n");
+        let positions = emu.prompt_input_positions().unwrap();
+        assert_eq!(positions, vec![(1, 0)]);
     }
 
     #[test]

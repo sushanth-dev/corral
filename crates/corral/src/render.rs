@@ -100,9 +100,7 @@ pub fn draw(
         paint_cursor(frame, p, cursor);
     }
     paint_gutters(frame, panes, focused);
-    if hint != Hint::None {
-        draw_hint(frame, hint);
-    }
+    draw_hint(frame, hint);
 }
 
 /// The pane's visible rows as styled ratatui lines. Falls back to plain
@@ -245,31 +243,37 @@ fn paint_spans(frame: &mut Frame, pane: &PaneState, spans: &SpanList, style: Sty
     }
 }
 
-// One status row on the last screen line, over everything else. Shows
-// the active mode and, in copy mode, the scroll position when the
-// viewport is off the bottom.
+// Key hints shown alongside "copy mode": the client reserves the last
+// terminal row for this bar (see the client's initial Resize), so it
+// always has somewhere to draw and never gets overwritten by pane
+// content.
+const COPY_KEYS: &str = "hjkl move | { } prompt | ctrl+o yank cmd | v select | q exit";
+
+// One status row on the last screen line, over everything else. Always
+// on, with the active mode leftmost so it is never the part that gets
+// cut off; in copy mode it also carries the scroll position and the
+// key hints above (including ctrl+o, which has no other affordance).
 fn draw_hint(frame: &mut Frame, hint: Hint) {
     let area = frame.area();
     let row = area.height.saturating_sub(1);
     let text = match hint {
-        Hint::None => return,
-        Hint::Copy(None) => " copy mode ".to_string(),
+        Hint::None => " input mode  ctrl+a leader ".to_string(),
+        Hint::Copy(None) => format!(" copy mode  {COPY_KEYS} "),
         Hint::Copy(Some((offset, total))) => {
-            format!(" copy mode {offset}/{total} ")
+            format!(" copy mode {offset}/{total}  {COPY_KEYS} ")
         }
-        Hint::Select => " copy mode select ".to_string(),
+        Hint::Select => " copy mode select  y yank | esc cancel ".to_string(),
         Hint::Search(needle) => format!(" search: {needle} "),
     };
     let style = Style::new().fg(Color::Black).bg(Color::Indexed(245));
-    let width = text.len() as u16;
     let line = Line::from(vec![Span::styled(text, style)]);
-    let para = Paragraph::new(line);
+    let para = Paragraph::new(line).style(style);
     frame.render_widget(
         para,
         RRect {
             x: 0,
             y: row,
-            width,
+            width: area.width,
             height: 1,
         },
     );
@@ -490,7 +494,10 @@ mod tests {
     fn focused_gutter_fills_the_full_height() {
         let panes = panes();
         let buf = draw_at(101, 10, &panes, 2);
-        for y in 0..10u16 {
+        // Row 9 is the always-on status line, which paints over the
+        // gutter on the last row; the client reserves that row so no
+        // pane or gutter is ever expected to draw there.
+        for y in 0..9u16 {
             assert_eq!(buf[(50, y)].symbol(), "│");
             assert_eq!(buf[(50, y)].fg, ratatui::style::Color::Indexed(245));
         }

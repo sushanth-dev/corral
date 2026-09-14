@@ -85,10 +85,12 @@ pub enum ServerMsg {
         pane: PaneId,
     },
     /// Rows (screen space) in the requested pane whose text contains
-    /// the search needle.
+    /// the search needle, plus the viewport top after the daemon
+    /// scrolled to the current hit.
     SearchResult {
         pane: PaneId,
         rows: Vec<usize>,
+        top: usize,
     },
     /// The named pane's full scrollback as plain text (S3-7), one
     /// screen-space row per line.
@@ -96,11 +98,14 @@ pub enum ServerMsg {
         pane: PaneId,
         text: String,
     },
-    /// Reply to a prompt jump: the prompt now sits at this row inside
-    /// the viewport. The client moves its copy cursor there.
+    /// Reply to a prompt jump: the prompt's command text now sits at
+    /// this row and column inside the viewport (not the shell theme's
+    /// decorative prompt wrapper). The client moves its copy cursor
+    /// there.
     PromptLanded {
         pane: PaneId,
         row: usize,
+        col: usize,
     },
 }
 
@@ -245,7 +250,11 @@ mod tests {
     #[test]
     fn search_result_round_trips_with_empty_rows() {
         for rows in [vec![0usize, 10, 27], vec![]] {
-            let msg = ServerMsg::SearchResult { pane: 2, rows };
+            let msg = ServerMsg::SearchResult {
+                pane: 2,
+                rows,
+                top: 7,
+            };
             let line = serde_json::to_string(&msg).unwrap();
             let back: ServerMsg = serde_json::from_str(&line).unwrap();
             assert_eq!(back, msg);
@@ -253,6 +262,7 @@ mod tests {
         let empty = serde_json::to_string(&ServerMsg::SearchResult {
             pane: 2,
             rows: vec![],
+            top: 0,
         })
         .unwrap();
         assert!(empty.contains("\"rows\":[]"), "got {empty}");
@@ -270,7 +280,11 @@ mod tests {
 
     #[test]
     fn prompt_landed_round_trips() {
-        let msg = ServerMsg::PromptLanded { pane: 3, row: 41 };
+        let msg = ServerMsg::PromptLanded {
+            pane: 3,
+            row: 41,
+            col: 6,
+        };
         let line = serde_json::to_string(&msg).unwrap();
         let back: ServerMsg = serde_json::from_str(&line).unwrap();
         assert_eq!(back, msg);

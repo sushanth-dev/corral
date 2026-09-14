@@ -115,7 +115,16 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     // whether the session already has panes: rejoining must attach to
     // them, not spawn another shell.
     let (cols, rows) = crossterm::terminal::size()?;
-    send_msg(writer, &ClientMsg::Resize { cols, rows })?;
+    // Reserve the bottom row for the status bar: the daemon lays out
+    // panes to fill whatever size it is told, so panes never draw into
+    // the row render.rs paints the status line on.
+    send_msg(
+        writer,
+        &ClientMsg::Resize {
+            cols,
+            rows: rows.saturating_sub(1),
+        },
+    )?;
     let mut reader = std::io::BufReader::new(stream);
     let mut first_frame: Option<Vec<PaneState>> = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -169,9 +178,10 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     let mut search_reverse = false;
     let mut last_search: Option<String> = None;
     let mut last_search_reverse = false;
-    // The last search reply: hits as screen-space rows, highlighted in
-    // the viewport until a new search replaces them.
-    let mut search_hits: Option<(PaneId, Vec<usize>)> = None;
+    // The last search reply: hits as screen-space rows plus the
+    // viewport top the daemon landed on, highlighted in the viewport
+    // until a new search replaces them.
+    let mut search_hits: Option<(PaneId, Vec<usize>, usize)> = None;
     // The real run uses the system clipboard; tests drive the run loop's
     // pieces with MemoryClipboard directly.
     let mut clipboard: Box<dyn clipboard::Clipboard> = Box::new(clipboard::SystemClipboard::new());
@@ -190,7 +200,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
         render::Hint,
         Option<(usize, usize)>,
         Option<(usize, usize)>,
-        Option<(PaneId, Vec<usize>)>,
+        Option<(PaneId, Vec<usize>, usize)>,
     );
     let mut last_drawn: Option<FrameKey> = None;
     loop {
@@ -233,18 +243,19 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     focused = f;
                 }
                 ServerMsg::Exited { .. } => {}
-                ServerMsg::SearchResult { pane, rows } => {
+                ServerMsg::SearchResult { pane, rows, top } => {
                     // The worker already scrolled to the first match; the
                     // frame carrying the new viewport follows right
                     // behind. Hits stay highlighted until the next search.
-                    search_hits = Some((pane, rows));
+                    search_hits = Some((pane, rows, top));
                 }
-                ServerMsg::PromptLanded { pane, row } => {
-                    // The prompt now sits `row` rows below the viewport
-                    // top: put the copy cursor on it. The frame carrying
-                    // the new viewport follows behind this reply.
+                ServerMsg::PromptLanded { pane, row, col } => {
+                    // The prompt's command text now sits at (row, col)
+                    // in the viewport: put the copy cursor there. The
+                    // frame carrying the new viewport follows behind
+                    // this reply.
                     if pane == focused {
-                        copy_cursor = Some((row, 0));
+                        copy_cursor = Some((row, col));
                     }
                 }
                 ServerMsg::ScrollbackDump { .. } => {
@@ -312,11 +323,12 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 }
                 Some(input::Action::CopyScroll(target)) => {
                     send_msg(writer, &ClientMsg::Scroll { target })?;
-                    // g/G and Ctrl+u/Ctrl+d move the view; the copy
-                    // cursor rides it instead of staying behind. Top
-                    // pins the cursor at the viewport top, bottom at
-                    // the last row; half-page moves it by the same
-                    // delta and clamps inside the view.
+                    // g/G pin the copy cursor to the new viewport edge.
+                    // Ctrl+u/Ctrl+d (Delta) scroll the content under a
+                    // stationary cursor instead, like vim/tmux: the
+                    // cursor's row inside the viewport does not change,
+                    // so it stays centered rather than snapping to an
+                    // edge.
                     let height = focused_pane.map(|p| p.rect.h as usize).unwrap_or(1);
                     match target {
                         corrald::protocol::ScrollTarget::Top => {
@@ -325,12 +337,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                         corrald::protocol::ScrollTarget::Bottom => {
                             copy_cursor = Some((height - 1, copy_cursor.map_or(0, |c| c.1)));
                         }
-                        corrald::protocol::ScrollTarget::Delta(d) => {
-                            if let Some((r, c)) = copy_cursor {
-                                let new_r = (r as isize + d).clamp(0, height as isize - 1);
-                                copy_cursor = Some((new_r as usize, c));
-                            }
-                        }
+                        corrald::protocol::ScrollTarget::Delta(_) => {}
                         corrald::protocol::ScrollTarget::Row(_) => {}
                     }
                 }
@@ -509,7 +516,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
         let visible_cursor = matches!(mode, input::Mode::Copy | input::Mode::Select(_))
             .then_some(copy_cursor)
             .flatten();
-        let active_search = search_hits.as_ref().and_then(|(pane, rows)| {
+        let active_search = search_hits.as_ref().and_then(|(pane, rows, _top)| {
             let p = panes.iter().find(|p| p.id == *pane)?;
             let needle = last_search.as_ref()?;
             Some((*pane, render::search_spans(&p.text, needle)))
@@ -521,13 +528,12 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
         // used to land there.
         let current_hit: Option<(PaneId, render::SpanList)> =
             match (search_hits.as_ref(), last_search.as_ref()) {
-                (Some((pane, rows)), Some(needle)) if !rows.is_empty() => {
+                (Some((pane, rows, top)), Some(needle)) if !rows.is_empty() => {
                     let Some(p) = panes.iter().find(|p| p.id == *pane) else {
                         continue;
                     };
                     let hit_row = rows[0];
-                    let row_in_view =
-                        hit_row.saturating_sub(p.scroll.map(|s| s.offset).unwrap_or(hit_row));
+                    let row_in_view = hit_row.saturating_sub(*top);
                     if row_in_view < p.rect.h as usize {
                         Some((
                             *pane,

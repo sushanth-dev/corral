@@ -269,18 +269,18 @@ impl Daemon {
                     self.snapshots.insert(pane, state);
                     changed = true;
                 }
-                Ok(PaneOut::SearchResult { pane, rows }) => {
+                Ok(PaneOut::SearchResult { pane, rows, top }) => {
                     // A search reply goes straight to the client, outside
                     // the normal frame cadence.
-                    write_msg(writer, &ServerMsg::SearchResult { pane, rows })?;
+                    write_msg(writer, &ServerMsg::SearchResult { pane, rows, top })?;
                 }
                 Ok(PaneOut::ScrollbackDump { pane, text }) => {
                     // Same out-of-band path as the search reply (S3-7).
                     write_msg(writer, &ServerMsg::ScrollbackDump { pane, text })?;
                 }
-                Ok(PaneOut::PromptLanded { pane, row }) => {
-                    // The client moves its copy cursor onto the prompt.
-                    write_msg(writer, &ServerMsg::PromptLanded { pane, row })?;
+                Ok(PaneOut::PromptLanded { pane, row, col }) => {
+                    // The client moves its copy cursor onto the command.
+                    write_msg(writer, &ServerMsg::PromptLanded { pane, row, col })?;
                 }
                 Ok(PaneOut::Exited { pane }) => {
                     // The worker also reports Exited when its command
@@ -314,6 +314,16 @@ impl Daemon {
             write_msg(writer, &ServerMsg::Exited { pane: *id })?;
         }
         if !exited.is_empty() {
+            // The tree collapsed: surviving panes' rects grew to fill
+            // the closed pane's space. Reflow each PTY and emulator to
+            // the new size, same as CreatePane's split does, so the
+            // remaining panes unwrap back to full width.
+            let rects = self.rects();
+            for (id, rect) in &rects {
+                if let Some(pane) = self.panes.get(id) {
+                    pane.send(PaneCmd::Resize(rect.w, rect.h))?;
+                }
+            }
             self.push_frame(writer)?;
         }
         Ok(())
@@ -747,6 +757,98 @@ mod tests {
         };
         assert_eq!(panes.len(), 1);
         assert_eq!(focused, panes[0].id, "last live pane holds focus");
+        drop(reader);
+    }
+
+    #[test]
+    fn surviving_pane_unwraps_to_fill_the_closed_sibling_space() {
+        // A pane that closes must free its space back to its sibling, and
+        // the sibling's PTY must actually resize to it, not just the
+        // frame's rect metadata: `stty size` reports what the pane's own
+        // shell sees, so a stale PTY size shows up here even though the
+        // rect already looks right.
+        let sock = start_daemon("unwrap");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "while true; do stty size; sleep 0.05; done".into(),
+                ],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                // A pane that exits instantly races the daemon's own
+                // collapse-and-reflow: it can vanish before any frame
+                // ever shows the split (narrowed) state. Stay alive
+                // briefly so the split is actually observable first.
+                args: vec!["-c".into(), "sleep 0.5; printf closing".into()],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut reader = BufReader::new(client);
+        // The loop's very first stty line can still show the pre-split
+        // width (spawned at 80 before CreatePane's reflow lands), so
+        // read the most recent line in the pane, not the first.
+        fn last_stty_cols(text: &str) -> Option<u32> {
+            text.lines()
+                .rev()
+                .find_map(|l| l.split_whitespace().nth(1)?.parse().ok())
+        }
+        let split = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| last_stty_cols(&p.text).is_some_and(|cols| cols < 80)),
+            _ => false,
+        })
+        .expect("split frame with narrowed stty output within 5s");
+        let ServerMsg::Frame { panes, .. } = split else {
+            unreachable!()
+        };
+        let narrow_pane = panes
+            .iter()
+            .find(|p| last_stty_cols(&p.text).is_some_and(|cols| cols < 80))
+            .expect("stty size line narrower than 80");
+        let narrow_id = narrow_pane.id;
+
+        // The second pane exits; its space must unwrap back onto the
+        // first, and the first pane's PTY must actually widen to match.
+        let unwrapped = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.len() == 1,
+            _ => false,
+        })
+        .expect("collapsed frame with one pane within 5s");
+        let ServerMsg::Frame { panes, .. } = unwrapped else {
+            unreachable!()
+        };
+        assert_eq!(
+            panes[0].id, narrow_id,
+            "the surviving pane is the stty loop"
+        );
+
+        let wide = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => {
+                panes.iter().any(|p| last_stty_cols(&p.text) == Some(80))
+            }
+            _ => false,
+        })
+        .expect("stty size reports the full 80 cols after unwrap within 5s");
+        let ServerMsg::Frame { panes, .. } = wide else {
+            unreachable!()
+        };
+        assert_eq!(
+            last_stty_cols(&panes[0].text),
+            Some(80),
+            "surviving pane's PTY must actually resize to the freed width"
+        );
         drop(reader);
     }
 
@@ -1214,11 +1316,15 @@ mod tests {
         );
         let reply = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::SearchResult { .. }))
             .expect("SearchResult within 5s");
-        let ServerMsg::SearchResult { pane, rows } = reply else {
+        let ServerMsg::SearchResult { pane, rows, top } = reply else {
             unreachable!()
         };
         assert_eq!(rows.len(), 3, "three marker lines, got {rows:?}");
         assert!(pane > 0, "reply names the pane it searched");
+        assert_eq!(
+            top, rows[0],
+            "reported viewport top must match the row the daemon scrolled to"
+        );
 
         let jumped = wait_for_msg(&mut reader, |m| match m {
             ServerMsg::Frame { panes, .. } => panes
@@ -1263,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_history_empties_scrollback_while_the_screen_survives() {
+    fn clear_history_empties_scrollback_but_leaves_the_live_screen_alone() {
         let sock = start_daemon("clear");
         let mut client = UnixStream::connect(&sock).unwrap();
         send(
@@ -1276,14 +1382,18 @@ mod tests {
             },
         );
         let mut reader = BufReader::new(client);
-        wait_for_msg(&mut reader, |m| match m {
+        let bottom = wait_for_msg(&mut reader, |m| match m {
             ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("60")),
             _ => false,
         })
         .expect("bottom frame showing line 60 within 5s");
+        let ServerMsg::Frame { panes, .. } = bottom else {
+            unreachable!()
+        };
+        let live_text = panes[0].text.clone();
 
         // Scrolled up first so the viewport is not pinned to the bottom;
-        // the clear must also restore live follow.
+        // the clear only touches scrollback, not the copy-mode position.
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
@@ -1297,45 +1407,26 @@ mod tests {
         .expect("frame scrolled away from the bottom within 5s");
 
         send(reader.get_mut(), &ClientMsg::ClearHistory);
-        let cleared = wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.scroll.is_none()),
-            _ => false,
-        })
-        .expect("frame after clear with scroll None within 5s");
-        let ServerMsg::Frame { panes, .. } = cleared else {
-            unreachable!()
-        };
-        // The clear wipes the viewport too (2J after the 3J): the pane
-        // comes back blank, not showing the last 24 of the 60 lines.
-        // scroll is None because the viewport is pinned to the bottom.
-        assert!(
-            panes[0].text.trim().is_empty(),
-            "viewport is wiped by the clear, got {:?}",
-            panes[0].text
-        );
-
-        // Scrolling up now has nothing to reach: the frame stays pinned at
-        // the bottom with the same text. That is the proof the scrollback
-        // is empty.
+        // Scrolling up now has nothing to reach: with the scrollback gone,
+        // any further Top scroll lands right back on the live screen.
+        // That is the proof the scrollback (not the screen) was cleared.
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
                 target: crate::protocol::ScrollTarget::Top,
             },
         );
-        let still_bottom = wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes
-                .iter()
-                .any(|p| p.scroll.is_none() && p.text.trim().is_empty()),
+        let settled = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text == live_text),
             _ => false,
         })
-        .expect("post-clear scroll up cannot leave the bottom within 5s");
-        let ServerMsg::Frame { panes, .. } = still_bottom else {
+        .expect("frame back on the live screen within 5s");
+        let ServerMsg::Frame { panes, .. } = settled else {
             unreachable!()
         };
-        assert!(
-            panes[0].scroll.is_none(),
-            "scrollback is empty: viewport cannot move"
+        assert_eq!(
+            panes[0].text, live_text,
+            "the live screen survives ClearHistory unchanged"
         );
         drop(reader);
     }
@@ -1420,12 +1511,16 @@ mod tests {
         );
         let landed = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::PromptLanded { .. }))
             .expect("PromptLanded reply within 5s");
-        let ServerMsg::PromptLanded { pane, row } = landed else {
+        let ServerMsg::PromptLanded { pane, row, col } = landed else {
             unreachable!()
         };
         assert!(
             pane > 0 && row < 24,
             "landing row is viewport-relative: {row}"
+        );
+        assert_eq!(
+            col, 0,
+            "sh never emits OSC 133;B, so the fallback lands at column 0"
         );
         wait_for_msg(&mut reader, |m| match m {
             ServerMsg::Frame { panes, .. } => panes

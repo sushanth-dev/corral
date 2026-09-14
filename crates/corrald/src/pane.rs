@@ -55,21 +55,24 @@ pub enum PaneOut {
         pane: PaneId,
         state: crate::protocol::PaneState,
     },
-    /// Reply to PaneCmd::Search; rows are screen-space row indexes.
+    /// Reply to PaneCmd::Search; rows are screen-space row indexes, top
+    /// is the viewport top after scrolling to the current hit.
     SearchResult {
         pane: PaneId,
         rows: Vec<usize>,
+        top: usize,
     },
     /// Reply to PaneCmd::DumpScrollback (S3-7).
     ScrollbackDump {
         pane: PaneId,
         text: String,
     },
-    /// Reply to PaneCmd::PromptJump: the prompt landed at this row
-    /// inside the viewport.
+    /// Reply to PaneCmd::PromptJump: the prompt's command text landed
+    /// at this row and column inside the viewport.
     PromptLanded {
         pane: PaneId,
         row: usize,
+        col: usize,
     },
     Exited {
         pane: PaneId,
@@ -153,20 +156,23 @@ fn run_worker(
                         emu.scroll(ScrollTarget::Row(row));
                         push_snapshot(id, &mut emu, cols, rows, &out);
                     }
+                    // Report the true viewport top alongside the hits:
+                    // scroll_position() returns None when the viewport
+                    // is pinned to the bottom, which the client can't
+                    // tell apart from "viewport top is 0".
+                    // viewport_offset() always reflects the real top.
+                    let top = emu.viewport_offset().unwrap_or(0);
                     let _ = out.send(PaneOut::SearchResult {
                         pane: id,
                         rows: hits,
+                        top,
                     });
                 }
                 PaneCmd::ClearHistory => {
-                    // Erase scrollback (3J), then the visible screen
-                    // (2J) and home the cursor: the pane comes back
-                    // blank with the shell's next prompt at the top.
-                    // Feeding the sequences to the emulator only, not
-                    // the PTY: the shell keeps running, but everything
-                    // it had drawn is gone from the view.
+                    // Erase scrollback only (3J); the live screen and
+                    // whatever the user has typed at the prompt stay
+                    // exactly as they are.
                     emu.clear_history();
-                    emu.feed(b"\x1b[2J\x1b[H");
                     push_snapshot(id, &mut emu, cols, rows, &out);
                 }
                 PaneCmd::DumpScrollback => {
@@ -174,12 +180,13 @@ fn run_worker(
                     let _ = out.send(PaneOut::ScrollbackDump { pane: id, text });
                 }
                 PaneCmd::PromptJump { up, cursor_row } => {
-                    // Visible prompt rows, not raw marker rows: fish and
-                    // zsh emit OSC 133 A on the blank line above the
-                    // drawn prompt, so jumping to the marker lands one
-                    // line high. prompt_text_rows shifts each blank
-                    // marker to the first non-empty row below it.
-                    let prompts = emu.prompt_text_rows().unwrap_or_default();
+                    // Command input positions, not raw OSC 133;A marker
+                    // rows: a shell theme (Tide) draws a decorative box
+                    // around the marker row, so jumping to the marker
+                    // lands on the box instead of the typed command.
+                    // prompt_input_positions resolves the exact
+                    // (row, col) of each command via OSC 133;B.
+                    let prompts = emu.prompt_input_positions().unwrap_or_default();
                     // Anchor at the copy cursor, not the viewport top:
                     // a Row scroll to a prompt inside the visible
                     // screen clamps to the bottom, so a viewport-top
@@ -197,14 +204,14 @@ fn run_worker(
                         .unwrap_or(total.saturating_sub(rows as usize));
                     let anchor = top + cursor_row.unwrap_or(rows as usize - 1);
                     let target = if up {
-                        prompts.iter().rev().find(|&&r| r < anchor)
+                        prompts.iter().rev().find(|&&(r, _)| r < anchor)
                     } else {
-                        prompts.iter().find(|&&r| r > anchor)
+                        prompts.iter().find(|&&(r, _)| r > anchor)
                     };
                     let landed = match target {
-                        Some(&row) => {
+                        Some(&(row, col)) => {
                             emu.scroll(ScrollTarget::Row(row));
-                            Some(row)
+                            Some((row, col))
                         }
                         None if up => {
                             // No prompt above: pin to the top like tmux.
@@ -220,17 +227,17 @@ fn run_worker(
                     push_snapshot(id, &mut emu, cols, rows, &out);
                     // Report where the prompt landed relative to the
                     // new viewport top so the client puts its copy
-                    // cursor on the prompt row.
-                    let row = match landed {
-                        Some(prompt_row) => {
+                    // cursor on the command's row and column.
+                    let (row, col) = match landed {
+                        Some((prompt_row, prompt_col)) => {
                             let top_after = emu
                                 .viewport_offset()
                                 .unwrap_or(total.saturating_sub(rows as usize));
-                            prompt_row.saturating_sub(top_after)
+                            (prompt_row.saturating_sub(top_after), prompt_col as usize)
                         }
-                        None => cursor_row.unwrap_or(rows as usize - 1),
+                        None => (cursor_row.unwrap_or(rows as usize - 1), 0),
                     };
-                    let _ = out.send(PaneOut::PromptLanded { pane: id, row });
+                    let _ = out.send(PaneOut::PromptLanded { pane: id, row, col });
                 }
                 PaneCmd::YankCommand { anchor } => {
                     let text = emu.command_text(anchor).unwrap_or_default();
