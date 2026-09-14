@@ -174,7 +174,14 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
             let mut chunk = String::new();
             match std::io::BufRead::read_line(&mut reader, &mut chunk) {
                 Ok(0) => break,
-                Err(_) => break,
+                // EAGAIN can land after read_line consumed a partial
+                // frame: the bytes are already in `chunk`, so dropping
+                // it corrupts the stream (the frame's tail arrives on a
+                // later pass and never parses). Keep the partial head.
+                Err(_) => {
+                    buf.push_str(&chunk);
+                    break;
+                }
                 Ok(_) => {
                     buf.push_str(&chunk);
                     if std::time::Instant::now() >= deadline {
