@@ -121,6 +121,7 @@ impl Emulator {
         let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
         let cols = self.terminal.cols()?;
         let markers = self.prompt_rows()?;
+        let live_cursor = self.live_cursor_position()?;
         let mut out = Vec::with_capacity(markers.len());
         for (i, &start) in markers.iter().enumerate() {
             let end = markers.get(i + 1).copied().unwrap_or(total);
@@ -139,50 +140,61 @@ impl Emulator {
             }
             let pos = match input_cell {
                 Some(p) => p,
-                None => {
-                    // No OSC 133;B seen: fall back to the first
-                    // non-empty row (prompt_text_rows' heuristic), left
-                    // column.
-                    let mut mapped = (start, 0);
-                    for r in start..end {
-                        if !self.row_text(r)?.is_empty() {
-                            mapped = (r, 0);
-                            break;
-                        }
-                    }
-                    mapped
-                }
+                None => self.unresolved_input_position(start, end, live_cursor)?,
             };
             out.push(pos);
         }
         Ok(out)
     }
 
-    /// The text of the command whose prompt is the last one at or above
-    /// `anchor`: prompt row through the row before the next prompt
-    /// (S3-8). `anchor` is a screen-space row; `None` means the bottom
-    /// of scrollback. Prompt rows resolve through `prompt_text_rows`
-    /// so the block starts at the visible prompt, not the blank
-    /// marker row above it.
-    pub fn command_text(&mut self, anchor: Option<usize>) -> Result<String> {
-        let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
-        let anchor = anchor.unwrap_or(total.saturating_sub(1));
-        let prompts = self.prompt_text_rows()?;
-        let start = prompts.iter().rev().find(|&&r| r <= anchor).copied();
-        let Some(start) = start else {
-            return Ok(String::new());
-        };
-        let end = prompts
-            .iter()
-            .find(|&&r| r > start)
-            .copied()
-            .unwrap_or(total);
-        let mut out = String::new();
-        for row in start..end {
-            out.push_str(&self.row_text(row)?);
-            out.push('\n');
+    /// The real PTY cursor's screen-space position, or `None` when it
+    /// is hidden. `cursor_x`/`cursor_y` are active-screen relative
+    /// (unaffected by scrollback), so the screen-space row is
+    /// scrollback rows plus `cursor_y`.
+    fn live_cursor_position(&mut self) -> Result<Option<(usize, u16)>> {
+        if !self.terminal.is_cursor_visible()? {
+            return Ok(None);
         }
-        Ok(out)
+        let row = self.terminal.scrollback_rows()? + self.terminal.cursor_y()? as usize;
+        Ok(Some((row, self.terminal.cursor_x()?)))
+    }
+
+    /// Resolves a prompt block with no `Input`-tagged cell: OSC 133;B
+    /// fired but nothing has been typed there yet, so no cell carries a
+    /// semantic tag to scan for. When the real cursor sits right after
+    /// prompt content on its own row (the "$ |" shape), nothing has
+    /// moved it since the prompt drew, so it marks the exact input
+    /// start even though the cell itself is untagged; a themed
+    /// prompt's wrapper row never has the cursor sitting directly after
+    /// its own text, so this does not fire there. Otherwise falls back
+    /// to the first non-empty row, left column (prompt_text_rows'
+    /// heuristic) - the case where OSC 133;B was never seen at all.
+    fn unresolved_input_position(
+        &mut self,
+        start: usize,
+        end: usize,
+        live_cursor: Option<(usize, u16)>,
+    ) -> Result<(usize, u16)> {
+        if let Some((row, col)) = live_cursor
+            && (start..end).contains(&row)
+            && col > 0
+        {
+            let grid = self.terminal.grid_ref(Point::Screen(PointCoordinate {
+                x: col - 1,
+                y: row as u32,
+            }))?;
+            if grid.cell()?.semantic_content()? == CellSemanticContent::Prompt {
+                return Ok((row, col));
+            }
+        }
+        let mut mapped = (start, 0);
+        for r in start..end {
+            if !self.row_text(r)?.is_empty() {
+                mapped = (r, 0);
+                break;
+            }
+        }
+        Ok(mapped)
     }
 
     /// One screen-space row as plain text. Each cell resolves through
@@ -374,6 +386,22 @@ mod tests {
     }
 
     #[test]
+    fn prompt_input_positions_uses_the_live_cursor_when_nothing_is_typed_yet() {
+        // Same Tide fixture, but the live prompt never had anything
+        // typed at it: OSC 133;B fired and then nothing followed, so no
+        // cell carries CellSemanticContent::Input yet. The real cursor
+        // sits right after "$ " and must resolve to the command's real
+        // input cell, not the wrapper row above it.
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]133;A\x1b\\\r\n");
+        emu.feed(b"almost-a-prompt-wrapper\r\n");
+        emu.feed(b"$ ");
+        emu.feed(b"\x1b]133;B\x1b\\");
+        let positions = emu.prompt_input_positions().unwrap();
+        assert_eq!(positions, vec![(2, 2)]);
+    }
+
+    #[test]
     fn prompt_input_positions_without_osc133b_falls_back_to_the_text_row() {
         // No OSC 133;B: fall back to the first non-empty row, column 0,
         // same as prompt_text_rows.
@@ -391,36 +419,5 @@ mod tests {
             emu.prompt_rows().unwrap().is_empty(),
             "plain output yields no prompt rows"
         );
-    }
-
-    #[test]
-    fn command_text_returns_prompt_through_last_output_row() {
-        let mut emu = Emulator::new(80, 24).unwrap();
-        for i in 0..3 {
-            emu.feed(b"\x1b]133;A\x1b\\");
-            emu.feed(format!("cmd {i}\r\n").as_bytes());
-            for j in 0..5 {
-                emu.feed(format!("out {i}-{j}\r\n").as_bytes());
-            }
-        }
-        // Anchor at the bottom: the third command's block.
-        let text = emu.command_text(None).unwrap();
-        assert!(text.contains("cmd 2"), "got {text:?}");
-        assert!(text.contains("out 2-4"), "got {text:?}");
-        assert!(
-            !text.contains("out 1-"),
-            "block must stop at the next prompt, got {text:?}"
-        );
-        // Anchor inside the first block: cmd 0's output only.
-        let first = emu.command_text(Some(3)).unwrap();
-        assert!(first.contains("cmd 0"), "got {first:?}");
-        assert!(first.contains("out 0-4"), "got {first:?}");
-        assert!(!first.contains("cmd 1"), "got {first:?}");
-    }
-
-    #[test]
-    fn command_text_without_prompts_is_empty() {
-        let mut emu = marker_emulator();
-        assert_eq!(emu.command_text(None).unwrap(), "");
     }
 }

@@ -69,8 +69,6 @@ pub enum Action {
     PromptPrev,
     /// `}` in copy mode: jump to the next prompt row.
     PromptNext,
-    /// `C-o` in copy mode: yank the current command's output.
-    YankCommand,
     /// Leader `o`: move focus to the next pane, wrapping.
     FocusNext,
 }
@@ -170,7 +168,6 @@ pub fn handle(
             (KeyCode::Char('N'), _) => Some(Action::SearchPrev),
             (KeyCode::Char('{'), _) => Some(Action::PromptPrev),
             (KeyCode::Char('}'), _) => Some(Action::PromptNext),
-            (KeyCode::Char('o'), KeyModifiers::CONTROL) => Some(Action::YankCommand),
             (KeyCode::Char('v'), _) => Some(Action::BeginSelect(SelectMode::Span)),
             (KeyCode::Char('V'), _) => Some(Action::BeginSelect(SelectMode::Rect)),
             (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => Some(Action::ExitCopy),
@@ -1129,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_mode_braces_jump_prompts_and_ctrl_o_yanks() {
+    fn copy_mode_braces_jump_prompts() {
         assert_eq!(
             copy_action(KeyCode::Char('{'), KeyModifiers::NONE),
             Action::PromptPrev
@@ -1137,10 +1134,6 @@ mod tests {
         assert_eq!(
             copy_action(KeyCode::Char('}'), KeyModifiers::NONE),
             Action::PromptNext
-        );
-        assert_eq!(
-            copy_action(KeyCode::Char('o'), KeyModifiers::CONTROL),
-            Action::YankCommand
         );
     }
 

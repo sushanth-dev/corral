@@ -60,13 +60,6 @@ pub enum ClientMsg {
         up: bool,
         cursor_row: Option<usize>,
     },
-    /// Extract the current command's output (S3-8): from the prompt row
-    /// above `anchor` (a screen-space row; `None` pins to the bottom) to
-    /// the row before the next prompt. The text rides back on
-    /// ServerMsg::ScrollbackDump.
-    YankCommand {
-        anchor: Option<usize>,
-    },
     /// Replace a pane's scrollback with edited text (S3-7 write-back):
     /// the daemon erases the pane's history and feeds `text` through the
     /// emulator, so the terminal view reflects the editor's changes.
@@ -193,8 +186,6 @@ mod tests {
                 up: false,
                 cursor_row: Some(11),
             },
-            ClientMsg::YankCommand { anchor: None },
-            ClientMsg::YankCommand { anchor: Some(7) },
             ClientMsg::LoadScrollback {
                 text: "edited\nlines".into(),
             },

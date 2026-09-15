@@ -221,11 +221,6 @@ impl Daemon {
                     })?;
                 }
             }
-            ClientMsg::YankCommand { anchor } => {
-                if let Some(pane) = self.panes.get(&self.focused) {
-                    pane.send(PaneCmd::YankCommand { anchor: *anchor })?;
-                }
-            }
             ClientMsg::LoadScrollback { text } => {
                 if let Some(pane) = self.panes.get(&self.focused) {
                     pane.send(PaneCmd::LoadScrollback { text: text.clone() })?;
@@ -1562,6 +1557,32 @@ mod tests {
             .unwrap_or_else(|| panic!("frame showing {needle} after {label} within 5s"));
         }
 
+        // Jumping up past the first command stays on it rather than
+        // overshooting into the blank space above its marker.
+        send(
+            reader.get_mut(),
+            &ClientMsg::PromptJump {
+                up: true,
+                cursor_row: Some(cursor_row),
+            },
+        );
+        let landed = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::PromptLanded { .. }))
+            .expect("PromptLanded reply within 5s");
+        let ServerMsg::PromptLanded { row: r, .. } = landed else {
+            unreachable!()
+        };
+        assert_eq!(
+            r, cursor_row,
+            "up-jump past the first command must stay put"
+        );
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.scroll.is_some() && p.text.contains("prompt one")),
+            _ => false,
+        })
+        .expect("frame still showing prompt one after the boundary up-jump within 5s");
+
         // Down returns to the next prompt.
         send(
             reader.get_mut(),
@@ -1578,25 +1599,6 @@ mod tests {
         })
         .expect("frame showing prompt two after down-jump within 5s");
 
-        // `c` yanks the current command's block: from the bottom, the
-        // third prompt through its last output row.
-        send(reader.get_mut(), &ClientMsg::YankCommand { anchor: None });
-        let yank = wait_for_msg(&mut reader, |m| {
-            matches!(m, ServerMsg::ScrollbackDump { .. })
-        })
-        .expect("ScrollbackDump for yank within 5s");
-        let ServerMsg::ScrollbackDump { text, .. } = yank else {
-            unreachable!()
-        };
-        assert!(text.contains("prompt three"), "got {text:?}");
-        assert!(
-            text.contains("100"),
-            "last output row in the block, got {text:?}"
-        );
-        assert!(
-            !text.contains("prompt two") && !text.contains("prompt one"),
-            "block stops at the next prompt, got {text:?}"
-        );
         drop(reader);
     }
 }

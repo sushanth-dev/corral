@@ -33,6 +33,21 @@ fn socket_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("corral-{uid}.sock"))
 }
 
+/// The copy cursor's starting position on entering copy mode: the real
+/// terminal cursor's row when visible, so the first `{` jumps past the
+/// live prompt instead of landing on it (a themed prompt like Tide can
+/// still be drawing its live prompt without a resolvable OSC 133;B
+/// position, so anchoring at the viewport bottom re-finds it instead of
+/// the previous completed command). Falls back to the viewport's bottom
+/// row when the cursor is hidden (alt-screen programs, or a program
+/// that conceals it).
+fn initial_copy_cursor(pane_cursor: Option<(u16, u16)>, height: usize) -> (usize, usize) {
+    match pane_cursor {
+        Some((col, row)) => (row as usize, col as usize),
+        None => (height.saturating_sub(1), 0),
+    }
+}
+
 fn send_msg(stream: &mut UnixStream, msg: &ClientMsg) -> anyhow::Result<()> {
     let mut line = serde_json::to_string(msg)?;
     line.push('\n');
@@ -276,10 +291,11 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                 Some(input::Action::Quit) => break,
                 Some(input::Action::EnterCopy) => {
                     mode = input::Mode::Copy;
-                    // The cursor starts at the bottom-left of the view,
-                    // where the user's eyes already are.
                     let bottom = focused_pane.map(|p| p.rect.h as usize).unwrap_or(1);
-                    copy_cursor = Some((bottom - 1, 0));
+                    copy_cursor = Some(initial_copy_cursor(
+                        focused_pane.and_then(|p| p.cursor),
+                        bottom,
+                    ));
                 }
                 Some(input::Action::ExitCopy) => {
                     mode = input::Mode::Input;
@@ -474,15 +490,6 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                         send_msg(writer, &ClientMsg::LoadScrollback { text: edited })?;
                     }
                 }
-                Some(input::Action::YankCommand) => {
-                    // The viewport top anchors the block: `c` copies the
-                    // command visible above the current view.
-                    let anchor = focused_pane.and_then(|p| p.scroll).map(|s| s.offset);
-                    send_msg(writer, &ClientMsg::YankCommand { anchor })?;
-                    if let Ok(text) = read_dump(&mut reader) {
-                        clipboard.set_text(&text)?;
-                    }
-                }
                 Some(input::Action::Split(dir)) => {
                     let (cmd, args) = pane_command();
                     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
@@ -665,5 +672,16 @@ mod tests {
         let yanked = sel.text(text);
         clipboard.set_text(&yanked).unwrap();
         assert_eq!(clipboard.text, "alpha\nbeta");
+    }
+
+    #[test]
+    fn initial_copy_cursor_uses_the_real_pty_cursor_when_visible() {
+        // (col, row) from the pane, as PaneState::cursor reports it.
+        assert_eq!(initial_copy_cursor(Some((2, 10)), 24), (10, 2));
+    }
+
+    #[test]
+    fn initial_copy_cursor_falls_back_to_the_viewport_bottom_when_hidden() {
+        assert_eq!(initial_copy_cursor(None, 24), (23, 0));
     }
 }
