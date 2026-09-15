@@ -5,7 +5,7 @@ mod input;
 mod render;
 mod selection;
 
-use corral_core::tree::PaneId;
+use corral_core::tree::{PaneId, Rect};
 use corrald::protocol::{ClientMsg, PaneState, ServerMsg};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -46,6 +46,25 @@ fn initial_copy_cursor(pane_cursor: Option<(u16, u16)>, height: usize) -> (usize
         Some((col, row)) => (row as usize, col as usize),
         None => (height.saturating_sub(1), 0),
     }
+}
+
+/// Where to put the terminal's native cursor this frame, or `None` to
+/// leave it hidden. Only input mode positions it: copy and select mode
+/// paint their own cursor cell (`render::paint_cursor` via
+/// `visible_cursor`), so positioning the native cursor as well puts a
+/// second one on screen at the live shell cursor's unrelated spot. The
+/// client-drawn search prompt is the same case.
+fn native_cursor_position(
+    mode: &input::Mode,
+    rect: Rect,
+    pane_cursor: Option<(u16, u16)>,
+) -> Option<(u16, u16)> {
+    if !matches!(mode, input::Mode::Input) {
+        return None;
+    }
+    let (cx, cy) = pane_cursor?;
+    let (x, y) = (rect.x + cx, rect.y + cy);
+    (x < rect.x + rect.w && y < rect.y + rect.h).then_some((x, y))
 }
 
 fn send_msg(stream: &mut UnixStream, msg: &ClientMsg) -> anyhow::Result<()> {
@@ -602,14 +621,12 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     visible_cursor,
                 );
                 // Position the real cursor inside the frame. Full-screen
-                // programs manage their own cursor.
+                // programs manage their own cursor; copy and select mode
+                // paint their own.
                 if let Some(p) = panes.iter().find(|p| p.id == focused)
-                    && let Some((cx, cy)) = p.cursor
+                    && let Some((x, y)) = native_cursor_position(&mode, p.rect, p.cursor)
                 {
-                    let (x, y) = (p.rect.x + cx, p.rect.y + cy);
-                    if x < p.rect.x + p.rect.w && y < p.rect.y + p.rect.h {
-                        f.set_cursor_position(ratatui::layout::Position::new(x, y));
-                    }
+                    f.set_cursor_position(ratatui::layout::Position::new(x, y));
                 }
             })?;
         }
@@ -683,5 +700,34 @@ mod tests {
     #[test]
     fn initial_copy_cursor_falls_back_to_the_viewport_bottom_when_hidden() {
         assert_eq!(initial_copy_cursor(None, 24), (23, 0));
+    }
+
+    #[test]
+    fn native_cursor_is_positioned_only_in_input_mode() {
+        let rect = Rect {
+            x: 2,
+            y: 3,
+            w: 80,
+            h: 24,
+        };
+        // Input mode: the pane's live shell cursor, offset into the pane's
+        // rect.
+        assert_eq!(
+            native_cursor_position(&input::Mode::Input, rect, Some((4, 5))),
+            Some((6, 8))
+        );
+        // Copy and select mode paint their own cursor cell, so the native
+        // one would show up twice; the search prompt draws its own line.
+        for mode in [
+            input::Mode::Copy,
+            input::Mode::Select(selection::SelectMode::Span),
+            input::Mode::Search,
+        ] {
+            assert_eq!(
+                native_cursor_position(&mode, rect, Some((4, 5))),
+                None,
+                "{mode:?} must not position the native cursor"
+            );
+        }
     }
 }
