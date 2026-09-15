@@ -221,11 +221,6 @@ impl Daemon {
                     })?;
                 }
             }
-            ClientMsg::LoadScrollback { text } => {
-                if let Some(pane) = self.panes.get(&self.focused) {
-                    pane.send(PaneCmd::LoadScrollback { text: text.clone() })?;
-                }
-            }
         }
         Ok(())
     }

@@ -1,6 +1,8 @@
 //! Edit-in-nvim flow (S3-7): write a scrollback dump to a private temp
 //! file, hand it to the editor, and remove the file no matter how the
-//! editor call ends. The TUI suspend and restore around this live in the
+//! editor call ends. The pane's own contents are never modified - the
+//! editor works on a copy, so whatever the user types there is
+//! discarded. The TUI suspend and restore around this live in the
 //! client's run loop; everything here is testable without a terminal.
 
 use std::fs;
@@ -29,21 +31,17 @@ fn write_dump_file(text: &str) -> io::Result<PathBuf> {
 }
 
 /// Run the editor over a fresh dump file and always delete the file
-/// afterwards, success or failure. Returns the edited contents read back
-/// from the file before deletion, so the caller can write them back into
-/// the pane. `run` receives the file path; the real client passes an
-/// editor spawner, tests pass a fake.
-pub fn edit_scrollback(
-    text: &str,
-    run: &mut dyn FnMut(&Path) -> io::Result<()>,
-) -> io::Result<String> {
+/// afterwards, success or failure. The dump is a copy the pane never
+/// reads back, so the editor's result is dropped: `Ctrl+a e` is a view
+/// of the scrollback to read and copy from, not an edit of the shell.
+/// `run` receives the file path; the real client passes an editor
+/// spawner, tests pass a fake.
+pub fn edit_scrollback(text: &str, run: &mut dyn FnMut(&Path) -> io::Result<()>) -> io::Result<()> {
     let path = write_dump_file(text)?;
     let result = run(&path);
-    // Read back before deleting: the editor may have changed the file.
-    let edited = fs::read_to_string(&path).unwrap_or_else(|_| text.to_string());
     // Delete on every exit path: the dump holds pane contents.
     let _ = fs::remove_file(&path);
-    result.map(|_| edited)
+    result
 }
 
 /// Spawn the editor on `path`: $EDITOR when set, else nvim, then vi.

@@ -38,10 +38,6 @@ pub enum PaneCmd {
     /// cursor inside the viewport; `None` anchors at the viewport
     /// bottom.
     PromptJump { up: bool, cursor_row: Option<usize> },
-    /// Erase the pane's scrollback and feed `text` back through the
-    /// emulator (S3-7 write-back): the terminal view shows the editor's
-    /// result.
-    LoadScrollback { text: String },
     /// Rebuild and resend the snapshot even if nothing changed.
     #[allow(dead_code)]
     Render,
@@ -256,24 +252,6 @@ fn run_worker(
                         None => (cursor_row.unwrap_or(rows as usize - 1), 0),
                     };
                     let _ = out.send(PaneOut::PromptLanded { pane: id, row, col });
-                }
-                PaneCmd::LoadScrollback { text } => {
-                    // The editor's result replaces the pane's history:
-                    // erase scrollback, pin to the bottom, and feed the
-                    // text through the emulator so styling and prompt
-                    // markers rebuild from the new content. The rebuilt
-                    // view ends where the dump ended, so nudge the
-                    // shell with a bare Enter: it draws a fresh prompt
-                    // and the user lands back at a usable command line
-                    // without pressing anything.
-                    emu.clear_history();
-                    emu.scroll(ScrollTarget::Bottom);
-                    emu.feed(text.as_bytes());
-                    for reply in emu.take_pty_writes() {
-                        let _ = pty.write_all(&reply);
-                    }
-                    let _ = pty.write_all(b"\r");
-                    push_snapshot(id, &mut emu, cols, rows, &out);
                 }
                 PaneCmd::Render => {
                     push_snapshot(id, &mut emu, cols, rows, &out);

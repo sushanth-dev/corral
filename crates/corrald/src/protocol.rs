@@ -60,12 +60,6 @@ pub enum ClientMsg {
         up: bool,
         cursor_row: Option<usize>,
     },
-    /// Replace a pane's scrollback with edited text (S3-7 write-back):
-    /// the daemon erases the pane's history and feeds `text` through the
-    /// emulator, so the terminal view reflects the editor's changes.
-    LoadScrollback {
-        text: String,
-    },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -198,9 +192,6 @@ mod tests {
             ClientMsg::PromptJump {
                 up: false,
                 cursor_row: Some(11),
-            },
-            ClientMsg::LoadScrollback {
-                text: "edited\nlines".into(),
             },
         ];
         for msg in msgs {

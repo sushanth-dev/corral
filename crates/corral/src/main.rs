@@ -540,12 +540,14 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     };
                     // Suspend the TUI, hand the dump to the editor, then
                     // restore; the dump file is deleted inside the flow.
+                    // Nothing comes back: the editor works on a copy of
+                    // the pane, and the pane keeps running throughout.
                     let _ = crossterm::execute!(
                         std::io::stdout(),
                         crossterm::terminal::LeaveAlternateScreen
                     );
                     crossterm::terminal::disable_raw_mode()?;
-                    let edit_result = edit::edit_scrollback(&dump, &mut edit::spawn_editor);
+                    let _ = edit::edit_scrollback(&dump, &mut edit::spawn_editor);
                     crossterm::terminal::enable_raw_mode()?;
                     let _ = crossterm::execute!(
                         std::io::stdout(),
@@ -555,9 +557,6 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     // screen behind ratatui's diff cache.
                     terminal.clear()?;
                     last_drawn = None;
-                    if let Ok(edited) = edit_result {
-                        send_msg(writer, &ClientMsg::LoadScrollback { text: edited })?;
-                    }
                 }
                 Some(input::Action::Split(dir)) => {
                     let (cmd, args) = pane_command();
