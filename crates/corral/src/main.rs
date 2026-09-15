@@ -69,19 +69,17 @@ fn native_cursor_position(
 
 /// The copy cursor's row after a Ctrl+u/Ctrl+d half-page scroll.
 ///
-/// The cursor tracks the full request, not the viewport's actual
-/// movement. With room left in the scrollback the two agree and the
-/// cursor holds its row while the content slides under it. At either
-/// end the viewport clamps, so the cursor keeps travelling by the rows
-/// the viewport could not deliver; holding it still there would stick
-/// it to the edge the viewport pinned against (S3-3).
-fn copy_cursor_row_after_scroll(
-    row: usize,
-    requested: isize,
-    moved: isize,
-    height: usize,
-) -> usize {
-    let row = row as isize + requested - moved;
+/// The scroll lands the cursor on the pane's middle row, not where it
+/// started: copy mode's cursor is a reading position on the pane, and
+/// half-page scrolling is only useful if the content just scrolled to
+/// has room above and below it. With scrollback left to travel the
+/// viewport delivers the full request and the cursor sits on that
+/// middle row while the content slides under it. At either end the
+/// viewport clamps, so the cursor takes up the rows it could not
+/// deliver; holding it still there would stick it to the edge the
+/// viewport pinned against (S3-3).
+fn copy_cursor_row_after_half_page_scroll(requested: isize, moved: isize, height: usize) -> usize {
+    let row = (height / 2) as isize + requested - moved;
     row.clamp(0, height as isize - 1).max(0) as usize
 }
 
@@ -315,10 +313,11 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     }
                 }
                 ServerMsg::ScrollLanded { pane, moved } => {
-                    // Half-page scroll: move the cursor by the rest of
-                    // the request the viewport could not follow. The
-                    // reply always arrives before the next key, so the
-                    // cursor is still where the scroll left it.
+                    // Half-page scroll: put the cursor on the pane's
+                    // middle row, less the rows the viewport could not
+                    // follow. The reply always arrives before the next
+                    // key, so the cursor is still where the scroll left
+                    // it.
                     if pane == focused
                         && let (Some(requested), Some(cur)) =
                             (copy_scroll_pending.take(), copy_cursor)
@@ -329,7 +328,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                             .map(|p| p.rect.h as usize)
                             .unwrap_or(1);
                         copy_cursor = Some((
-                            copy_cursor_row_after_scroll(cur.0, requested, moved, height),
+                            copy_cursor_row_after_half_page_scroll(requested, moved, height),
                             cur.1,
                         ));
                     }
@@ -403,9 +402,9 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     send_msg(writer, &ClientMsg::Scroll { target })?;
                     // g/G pin the copy cursor to the new viewport edge.
                     // Ctrl+u/Ctrl+d (Delta) scroll the content under a
-                    // cursor that follows the full request instead: with
-                    // scrollback left to travel the viewport keeps up and
-                    // the cursor holds its row, but at either end the
+                    // cursor that lands on the pane's middle row instead:
+                    // with scrollback left to travel the viewport keeps up
+                    // and the cursor holds that row, but at either end the
                     // viewport clamps and the cursor must take up the
                     // slack, or it sticks to the pinned edge (S3-3). The
                     // reply says how far the viewport really moved.
@@ -754,29 +753,29 @@ mod tests {
     }
 
     #[test]
-    fn half_page_scroll_holds_the_cursor_row_when_the_viewport_keeps_up() {
-        // 20-row pane, half page 10, cursor on the bottom row, plenty of
-        // scrollback: the viewport moves the full 10 and the content
-        // slides under a cursor that does not budge.
-        assert_eq!(copy_cursor_row_after_scroll(19, -10, -10, 20), 19);
-        assert_eq!(copy_cursor_row_after_scroll(19, 10, 10, 20), 19);
+    fn half_page_scroll_centers_the_cursor_when_the_viewport_keeps_up() {
+        // 20-row pane, half page 10, plenty of scrollback: the viewport
+        // moves the full 10 and the cursor lands on the middle row,
+        // wherever it was before the scroll.
+        assert_eq!(copy_cursor_row_after_half_page_scroll(-10, -10, 20), 10);
+        assert_eq!(copy_cursor_row_after_half_page_scroll(10, 10, 20), 10);
     }
 
     #[test]
     fn half_page_scroll_moves_the_cursor_by_the_rows_the_viewport_could_not() {
         // Scrollback shorter than a half page (5 rows against a 10-row
         // request): the viewport clamps after 5, so the cursor takes the
-        // remaining 5 rather than staying stuck on the bottom row.
-        assert_eq!(copy_cursor_row_after_scroll(19, -10, -5, 20), 14);
+        // remaining 5 rather than staying on the middle row.
+        assert_eq!(copy_cursor_row_after_half_page_scroll(-10, -5, 20), 5);
     }
 
     #[test]
     fn half_page_scroll_clamps_the_cursor_inside_the_viewport() {
         // Ctrl+d at the live prompt: the viewport cannot move at all, so
         // all 10 rows land on the cursor, which stops at the last row.
-        assert_eq!(copy_cursor_row_after_scroll(19, 10, 0, 20), 19);
+        assert_eq!(copy_cursor_row_after_half_page_scroll(10, 0, 20), 19);
         // Same at the top edge, going the other way.
-        assert_eq!(copy_cursor_row_after_scroll(0, -10, 0, 20), 0);
+        assert_eq!(copy_cursor_row_after_half_page_scroll(-10, 0, 20), 0);
     }
 
     #[test]
