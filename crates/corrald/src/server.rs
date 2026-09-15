@@ -1542,7 +1542,9 @@ mod tests {
             unreachable!()
         };
         assert!(pane > 0, "reply names the pane it dumped");
-        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        // Every line here carries text, so the count is also the check
+        // that the dump holds no blank filler from the screen's tail.
+        let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines.len(),
             60,
