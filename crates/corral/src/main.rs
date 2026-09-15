@@ -490,15 +490,6 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                         send_msg(writer, &ClientMsg::LoadScrollback { text: edited })?;
                     }
                 }
-                Some(input::Action::YankCommand) => {
-                    // The viewport top anchors the block: `c` copies the
-                    // command visible above the current view.
-                    let anchor = focused_pane.and_then(|p| p.scroll).map(|s| s.offset);
-                    send_msg(writer, &ClientMsg::YankCommand { anchor })?;
-                    if let Ok(text) = read_dump(&mut reader) {
-                        clipboard.set_text(&text)?;
-                    }
-                }
                 Some(input::Action::Split(dir)) => {
                     let (cmd, args) = pane_command();
                     let cwd = std::env::current_dir()?.to_string_lossy().to_string();

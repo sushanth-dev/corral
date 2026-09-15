@@ -42,9 +42,6 @@ pub enum PaneCmd {
     /// emulator (S3-7 write-back): the terminal view shows the editor's
     /// result.
     LoadScrollback { text: String },
-    /// Extract the command block ending at or before `anchor` (S3-8);
-    /// the reply rides PaneOut as a ScrollbackDump.
-    YankCommand { anchor: Option<usize> },
     /// Rebuild and resend the snapshot even if nothing changed.
     #[allow(dead_code)]
     Render,
@@ -242,10 +239,6 @@ fn run_worker(
                         None => (cursor_row.unwrap_or(rows as usize - 1), 0),
                     };
                     let _ = out.send(PaneOut::PromptLanded { pane: id, row, col });
-                }
-                PaneCmd::YankCommand { anchor } => {
-                    let text = emu.command_text(anchor).unwrap_or_default();
-                    let _ = out.send(PaneOut::ScrollbackDump { pane: id, text });
                 }
                 PaneCmd::LoadScrollback { text } => {
                     // The editor's result replaces the pane's history:

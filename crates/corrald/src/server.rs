@@ -221,11 +221,6 @@ impl Daemon {
                     })?;
                 }
             }
-            ClientMsg::YankCommand { anchor } => {
-                if let Some(pane) = self.panes.get(&self.focused) {
-                    pane.send(PaneCmd::YankCommand { anchor: *anchor })?;
-                }
-            }
             ClientMsg::LoadScrollback { text } => {
                 if let Some(pane) = self.panes.get(&self.focused) {
                     pane.send(PaneCmd::LoadScrollback { text: text.clone() })?;
@@ -1604,25 +1599,6 @@ mod tests {
         })
         .expect("frame showing prompt two after down-jump within 5s");
 
-        // `c` yanks the current command's block: from the bottom, the
-        // third prompt through its last output row.
-        send(reader.get_mut(), &ClientMsg::YankCommand { anchor: None });
-        let yank = wait_for_msg(&mut reader, |m| {
-            matches!(m, ServerMsg::ScrollbackDump { .. })
-        })
-        .expect("ScrollbackDump for yank within 5s");
-        let ServerMsg::ScrollbackDump { text, .. } = yank else {
-            unreachable!()
-        };
-        assert!(text.contains("prompt three"), "got {text:?}");
-        assert!(
-            text.contains("100"),
-            "last output row in the block, got {text:?}"
-        );
-        assert!(
-            !text.contains("prompt two") && !text.contains("prompt one"),
-            "block stops at the next prompt, got {text:?}"
-        );
         drop(reader);
     }
 }
