@@ -147,6 +147,45 @@ impl Emulator {
         Ok(out)
     }
 
+    /// How many rows above the live cursor belong to the prompt block
+    /// the cursor is inside, and so must survive a history clear.
+    ///
+    /// A themed prompt (Tide) is several rows tall: OSC 133 A marks a
+    /// blank row, then the shell draws its decoration row (directory
+    /// and time) and the input row, all tagged `Prompt` or
+    /// `Continuation` by the VT layer until the next marker. The erase
+    /// stops at the top of that block, so the visible prompt keeps the
+    /// line the user reads it on.
+    ///
+    /// Zero when the cursor's own row is not part of a prompt: a
+    /// running command's output, or a shell that emits no markers. A
+    /// submitted prompt block further up is tagged output by then, so
+    /// neither case preserves anything above the cursor's row.
+    pub(crate) fn prompt_rows_above_live_cursor(&mut self) -> Result<u16> {
+        if !self.terminal.is_cursor_visible()? {
+            return Ok(0);
+        }
+        let cursor_row = self.terminal.scrollback_rows()? + self.terminal.cursor_y()? as usize;
+        let mut block = 0usize;
+        for row in (0..=cursor_row).rev() {
+            let grid = self.terminal.grid_ref(Point::Screen(PointCoordinate {
+                x: 0,
+                y: row as u32,
+            }))?;
+            let prompt = grid.row()?.semantic_prompt()?;
+            if matches!(
+                prompt,
+                libghostty_vt::screen::RowSemanticPrompt::Prompt
+                    | libghostty_vt::screen::RowSemanticPrompt::Continuation
+            ) {
+                block += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(block.saturating_sub(1) as u16)
+    }
+
     /// The real PTY cursor's screen-space position, or `None` when it
     /// is hidden. `cursor_x`/`cursor_y` are active-screen relative
     /// (unaffected by scrollback), so the screen-space row is

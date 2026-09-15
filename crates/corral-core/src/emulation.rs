@@ -181,15 +181,24 @@ impl Emulator {
 
     /// Erase every scrollback line (CSI 3 J) and, since real terminal
     /// semantics never touch the visible grid, also erase the visible
-    /// screen above the cursor's row so content that scrolled onto
-    /// screen just before the clear does not linger (plan Task 10). The
-    /// cursor's row and everything below it, including an in-progress
-    /// typed command, stays untouched.
+    /// screen above the prompt the cursor sits in so content that
+    /// scrolled onto screen just before the clear does not linger (plan
+    /// Task 10). The prompt block and everything below it, including an
+    /// in-progress typed command, stays untouched.
+    ///
+    /// The erase stops at the top of the prompt block rather than at the
+    /// cursor's row: a themed prompt (Tide) draws a decoration row above
+    /// the input row the cursor sits on, and erasing up to the cursor
+    /// took that decoration with it. The block height is measured before
+    /// CSI 3 J runs, since the prompt rows are addressed in screen space
+    /// (scrollback plus cursor row) and the clear rebases the screen
+    /// onto an empty scrollback.
     ///
     /// The cursor's row comes from `cursor_x`/`cursor_y`, which are
     /// active-screen relative - the same frame CSI H addresses - so this
     /// is independent of where the viewport happens to be scrolled.
     pub fn clear_history(&mut self) {
+        let keep_above = self.prompt_rows_above_live_cursor().unwrap_or(0);
         self.terminal.vt_write(b"\x1b[3J");
         if !self.terminal.is_cursor_visible().unwrap_or(false) {
             return;
@@ -197,7 +206,7 @@ impl Emulator {
         let (Ok(col), Ok(row)) = (self.terminal.cursor_x(), self.terminal.cursor_y()) else {
             return;
         };
-        for r in 0..row {
+        for r in 0..row.saturating_sub(keep_above) {
             self.terminal
                 .vt_write(format!("\x1b[{};1H\x1b[2K", r + 1).as_bytes());
         }
@@ -536,6 +545,45 @@ mod tests {
             assert!(
                 row.is_empty(),
                 "rows above the cursor must be cleared, got {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_history_keeps_the_themed_prompt_block_above_the_cursor() {
+        // Tide draws a two-row prompt: OSC 133 A marks a blank row, the
+        // shell draws a decoration row (directory and time), and the
+        // input row follows with OSC 133 B. Erasing every row above the
+        // cursor's row took the decoration with it, so the visible
+        // prompt lost the line the user reads it on.
+        let mut emu = Emulator::new(80, 5).unwrap();
+        for i in 1..=40 {
+            emu.feed(format!("line{i}\r\n").as_bytes());
+        }
+        emu.feed(b"\x1b]133;A\x1b\\\r\n");
+        emu.feed(b"~/dev 10:29\r\n");
+        emu.feed(b"$ ");
+        emu.feed(b"\x1b]133;B\x1b\\");
+        emu.clear_history();
+        assert_eq!(
+            emu.terminal.scrollback_rows().unwrap(),
+            0,
+            "CSI 3 J must still empty the scrollback"
+        );
+        let text = emu.screen_text().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let decoration = lines
+            .iter()
+            .position(|l| l.contains("~/dev 10:29"))
+            .unwrap_or_else(|| panic!("decoration row must survive, got {lines:?}"));
+        assert!(
+            lines.iter().any(|l| l.starts_with('$')),
+            "input row must survive, got {lines:?}"
+        );
+        for row in lines.iter().take(decoration) {
+            assert!(
+                row.is_empty(),
+                "rows above the prompt block must be cleared, got {lines:?}"
             );
         }
     }
