@@ -1487,8 +1487,8 @@ mod tests {
         send(reader.get_mut(), &ClientMsg::ClearHistory);
         // Scrolling up now has nothing to reach: with the scrollback gone,
         // any further Top scroll lands right back on the live screen. What
-        // it shows is the active screen with everything above the cursor's
-        // row erased and the cursor's own row intact.
+        // it shows is the active screen cleared of everything but the
+        // cursor's row, which moves to the top of the screen.
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
@@ -1508,6 +1508,12 @@ mod tests {
         assert!(
             !panes[0].text.contains("59"),
             "the visible screen above the cursor is erased, got {:?}",
+            panes[0].text
+        );
+        assert_eq!(
+            panes[0].text.lines().next(),
+            Some("prompt-cmd"),
+            "the prompt row rides up to the top of the screen, got {:?}",
             panes[0].text
         );
         drop(reader);
