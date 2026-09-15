@@ -55,6 +55,22 @@ pub enum ClientMsg {
         up: bool,
         cursor_row: Option<usize>,
     },
+    /// Ask what is running here. Answers `ServerMsg::WorkspaceList`.
+    ListWorkspaces,
+}
+
+/// One attachable workspace, as the picker shows it.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct WorkspaceInfo {
+    /// Stable for the daemon's lifetime. Derived from the socket the
+    /// daemon serves, so the id the user reads back names the daemon
+    /// they connected to.
+    pub id: String,
+    pub panes: usize,
+    /// How many clients are attached right now, the asking one included
+    /// when it has attached. A connection that only reads a listing is
+    /// not one, so the attach picker never counts itself.
+    pub clients: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -95,6 +111,11 @@ pub enum ServerMsg {
     ScrollLanded {
         pane: PaneId,
         moved: isize,
+    },
+    /// Reply to `ClientMsg::ListWorkspaces`. One entry per workspace the
+    /// daemon serves, which is one today.
+    WorkspaceList {
+        workspaces: Vec<WorkspaceInfo>,
     },
 }
 
@@ -282,6 +303,38 @@ mod tests {
         let line = serde_json::to_string(&msg).unwrap();
         let back: ServerMsg = serde_json::from_str(&line).unwrap();
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn list_workspaces_round_trips_with_pane_and_client_counts() {
+        let msg = ClientMsg::ListWorkspaces;
+        let line = serde_json::to_string(&msg).unwrap();
+        let back: ClientMsg = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, msg);
+
+        let reply = ServerMsg::WorkspaceList {
+            workspaces: vec![
+                WorkspaceInfo {
+                    id: "corrald-4821".into(),
+                    panes: 3,
+                    clients: 2,
+                },
+                WorkspaceInfo {
+                    id: "corrald-4822".into(),
+                    panes: 0,
+                    clients: 0,
+                },
+            ],
+        };
+        let line = serde_json::to_string(&reply).unwrap();
+        let back: ServerMsg = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, reply);
+
+        // An empty list has to be a list, not an absent field: the picker
+        // reads it to decide whether it has anything to show.
+        let empty =
+            serde_json::to_string(&ServerMsg::WorkspaceList { workspaces: vec![] }).unwrap();
+        assert!(empty.contains("\"workspaces\":[]"), "got {empty}");
     }
 
     #[test]

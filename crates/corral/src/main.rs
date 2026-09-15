@@ -1,3 +1,4 @@
+mod attach;
 mod benchmark;
 mod clipboard;
 mod input;
@@ -5,7 +6,7 @@ mod render;
 mod selection;
 
 use corral_core::tree::{PaneId, Rect};
-use corrald::protocol::{ClientMsg, PaneState, ServerMsg};
+use corrald::protocol::{ClientMsg, PaneState, ServerMsg, WorkspaceInfo};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -107,8 +108,90 @@ fn send_msg(stream: &mut UnixStream, msg: &ClientMsg) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What the command line asked for.
+#[derive(Debug, PartialEq)]
+enum Request {
+    /// No arguments: attach to the local daemon without asking, the
+    /// behavior every earlier version had.
+    Attach,
+    /// `corral attach`: list what is running and attach to the choice.
+    Pick,
+    /// `corral attach <id>`: attach to the named workspace.
+    Workspace(String),
+}
+
+fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<Request> {
+    let args: Vec<String> = args.collect();
+    match args.as_slice() {
+        [] => Ok(Request::Attach),
+        [cmd] if cmd == "attach" => Ok(Request::Pick),
+        [cmd, id] if cmd == "attach" => Ok(Request::Workspace(id.clone())),
+        _ => anyhow::bail!("usage: corral [attach [workspace]]"),
+    }
+}
+
+/// Ask a daemon what it is serving, over a connection of its own: a
+/// listing is a query, not a session, so it is opened and dropped before
+/// the real attach.
+fn list_workspaces(path: &std::path::Path) -> anyhow::Result<Vec<WorkspaceInfo>> {
+    let stream = UnixStream::connect(path)?;
+    // Blocking, with a deadline: this is a one-shot query, and a daemon
+    // that never answers should not hang the client forever.
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut writer = stream.try_clone()?;
+    let mut reader = std::io::BufReader::new(stream);
+    send_msg(&mut writer, &ClientMsg::ListWorkspaces)?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match std::io::BufRead::read_line(&mut reader, &mut line) {
+            Ok(0) => anyhow::bail!("the daemon closed while listing workspaces"),
+            Ok(_) => {}
+            Err(e) => anyhow::bail!("no workspace list from the daemon: {e}"),
+        }
+        // A daemon sends a frame on connect, so the listing is not
+        // necessarily the first line back.
+        if let Ok(ServerMsg::WorkspaceList { workspaces }) = serde_json::from_str(line.trim()) {
+            return Ok(workspaces);
+        }
+    }
+}
+
+/// Refuse to attach to a workspace this daemon does not serve. An id the
+/// user typed can be stale, and attaching to some other workspace than the
+/// one asked for is the wrong answer to a wrong id.
+fn ensure_known(known: &[WorkspaceInfo], wanted: &str) -> anyhow::Result<()> {
+    if known.iter().any(|w| w.id == wanted) {
+        return Ok(());
+    }
+    let ids: Vec<&str> = known.iter().map(|w| w.id.as_str()).collect();
+    anyhow::bail!(
+        "no workspace {wanted:?}; this daemon serves {}",
+        ids.join(", ")
+    )
+}
+
 fn main() -> anyhow::Result<()> {
+    let request = parse_args(std::env::args().skip(1))?;
     let path = socket_path();
+
+    // The picker runs before the screen is taken over: fzf and the
+    // numbered prompt both draw on the plain terminal, and neither works
+    // inside the alternate screen.
+    match &request {
+        Request::Attach => {}
+        Request::Workspace(id) => ensure_known(&list_workspaces(&path)?, id)?,
+        Request::Pick => {
+            // The choice comes out of the listing, so it names a
+            // workspace this daemon just reported.
+            let listing = list_workspaces(&path)?;
+            if attach::choose(&listing).is_none() {
+                eprintln!("corral: no workspace chosen");
+                return Ok(());
+            }
+        }
+    }
+
     let stream = UnixStream::connect(&path)?;
     stream.set_nonblocking(true)?;
     let mut writer = stream.try_clone()?;
@@ -270,6 +353,10 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     focused = f;
                 }
                 ServerMsg::Exited { .. } => {}
+                // Only the listing connection asks for this, so the run
+                // loop cannot see one. It is here because the reply enum
+                // is shared by both connections.
+                ServerMsg::WorkspaceList { .. } => {}
                 ServerMsg::SearchResult { pane, rows, top } => {
                     // The worker already scrolled to the first match; the
                     // frame carrying the new viewport follows right
@@ -745,5 +832,56 @@ mod tests {
                 "{mode:?} must not position the native cursor"
             );
         }
+    }
+
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| (*w).to_string()).collect()
+    }
+
+    #[test]
+    fn no_arguments_attaches_without_asking() {
+        // The v0.1 behavior: bare `corral` goes straight to the daemon.
+        assert_eq!(parse_args(args(&[]).into_iter()).unwrap(), Request::Attach);
+    }
+
+    #[test]
+    fn attach_alone_is_the_picker_and_attach_with_an_id_is_direct() {
+        assert_eq!(
+            parse_args(args(&["attach"]).into_iter()).unwrap(),
+            Request::Pick
+        );
+        assert_eq!(
+            parse_args(args(&["attach", "corral-501"]).into_iter()).unwrap(),
+            Request::Workspace("corral-501".into())
+        );
+    }
+
+    #[test]
+    fn an_unsupported_command_line_is_a_usage_error() {
+        for words in [
+            vec!["detach"],
+            vec!["attach", "corral-501", "extra"],
+            vec!["", "x"],
+        ] {
+            assert!(
+                parse_args(args(&words).into_iter()).is_err(),
+                "{words:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_requested_workspace_must_be_one_the_daemon_serves() {
+        let known = vec![WorkspaceInfo {
+            id: "corral-501".into(),
+            panes: 2,
+            clients: 1,
+        }];
+        assert!(ensure_known(&known, "corral-501").is_ok());
+        // A stale id, or one from another machine's daemon, is refused
+        // rather than silently attaching to whatever is here.
+        let err = ensure_known(&known, "corral-999").unwrap_err().to_string();
+        assert!(err.contains("corral-999"), "got {err}");
+        assert!(err.contains("corral-501"), "got {err}");
     }
 }

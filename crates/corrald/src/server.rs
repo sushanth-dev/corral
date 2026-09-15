@@ -1,12 +1,12 @@
 use crate::pane::{PaneCmd, PaneOut, PaneWorker};
-use crate::protocol::{ClientMsg, PaneState, ScrollPos, ServerMsg};
+use crate::protocol::{ClientMsg, PaneState, ScrollPos, ServerMsg, WorkspaceInfo};
 use anyhow::Result;
 use corral_core::emulation::{ScrollTarget, StyledLine};
 use corral_core::tree::{Node, PaneId, Rect};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,12 @@ struct ClientSession {
     /// Latest window render per pane, from the worker, for the panes this
     /// session is showing above the live screen.
     windows: HashMap<PaneId, Window>,
+    /// Whether this session has asked to attach. A connection exists from
+    /// the accept, but it is not a client until it says so: the attach
+    /// picker opens a connection to read the listing and drops it without
+    /// ever attaching, and counting that as a client would have the picker
+    /// report itself.
+    attached: bool,
 }
 
 impl ClientSession {
@@ -69,6 +75,7 @@ impl ClientSession {
             rows,
             scroll: HashMap::new(),
             windows: HashMap::new(),
+            attached: false,
         })
     }
 
@@ -139,13 +146,21 @@ pub struct Daemon {
     /// that content to fit (S4-1).
     cols: u16,
     rows: u16,
+    /// This daemon's workspace id, named after the socket it serves so the
+    /// id a client reads back identifies the daemon it just talked to.
+    workspace: String,
+    /// Clients attached right now, which is sessions that have sent
+    /// `Attach` and not yet gone away. The session list holds the truth
+    /// and only the serve loop can see it, so the loop keeps this current
+    /// for the benefit of a listing request.
+    clients: usize,
 }
 
 // The daemon core no longer touches emulators or PTYs: every pane state
 // mutation happens on the pane's worker thread and reaches the core as
 // a PaneOut snapshot on the shared channel.
 impl Daemon {
-    pub fn new(cols: u16, rows: u16) -> Self {
+    pub fn new(cols: u16, rows: u16, workspace: impl Into<String>) -> Self {
         let (out_tx, out_rx) = channel();
         Self {
             root: Node::leaf(0),
@@ -157,7 +172,24 @@ impl Daemon {
             next_id: 1,
             cols,
             rows,
+            workspace: workspace.into(),
+            clients: 0,
         }
+    }
+
+    /// The workspace id for a daemon serving `listener`: the socket path's
+    /// file stem. Read from the bound socket rather than the environment,
+    /// because the environment is not what the daemon is actually serving,
+    /// and both ends derive the id from the same path with no extra state.
+    fn workspace_id(listener: &UnixListener) -> String {
+        listener
+            .local_addr()
+            .ok()
+            .and_then(|addr| addr.as_pathname().map(Path::to_path_buf))
+            .as_deref()
+            .and_then(Path::file_stem)
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "corral".into())
     }
 
     /// Serve clients forever. The daemon state (panes, scrollback, focus)
@@ -167,7 +199,8 @@ impl Daemon {
     /// second client's connect never waits behind the first client's read.
     /// The caller owns the listener and socket cleanup.
     pub fn serve(listener: UnixListener) -> Result<()> {
-        let mut daemon = Daemon::new(80, 24);
+        let workspace = Daemon::workspace_id(&listener);
+        let mut daemon = Daemon::new(80, 24, workspace);
         // Nonblocking accept: the loop takes whatever the kernel has queued
         // and then moves on, instead of parking on one connection.
         listener.set_nonblocking(true)?;
@@ -196,7 +229,6 @@ impl Daemon {
                     Err(e) => return Err(e.into()),
                 }
             }
-
             // One read pass over every session, then one drain of the pane
             // channel fanned out to all of them.
             let mut departed: Vec<SessionId> = Vec::new();
@@ -255,12 +287,17 @@ impl Daemon {
             if !departed.is_empty() {
                 sessions.retain(|s| !departed.contains(&s.id));
             }
+            // A listing answers with this, and only the session list knows
+            // it. Taken at the end of a pass, so a client that attached
+            // during this one shows up in the next listing: the same
+            // one-pass window a client that hangs up here falls into.
+            daemon.clients = sessions.iter().filter(|s| s.attached).count();
         }
     }
 
     fn handle(&mut self, msg: &ClientMsg, session: &mut ClientSession) -> Result<()> {
         match msg {
-            ClientMsg::Attach => {}
+            ClientMsg::Attach => session.attached = true,
             ClientMsg::CreatePane {
                 cmd,
                 args,
@@ -358,6 +395,21 @@ impl Daemon {
                         top,
                     },
                 );
+            }
+            ClientMsg::ListWorkspaces => {
+                // One workspace per daemon, and the panes are the ones the
+                // daemon is holding. The reply names this daemon, so a
+                // client can tell which one it reached.
+                write_msg(
+                    &mut session.writer,
+                    &ServerMsg::WorkspaceList {
+                        workspaces: vec![WorkspaceInfo {
+                            id: self.workspace.clone(),
+                            panes: self.panes.len(),
+                            clients: self.clients,
+                        }],
+                    },
+                )?;
             }
         }
         Ok(())
@@ -1178,7 +1230,7 @@ mod tests {
         // channel: that is the pane being gone, not a daemon failure, and
         // it must not take the whole session down with it. No drain runs
         // here, so the window is held open deliberately.
-        let mut daemon = Daemon::new(80, 24);
+        let mut daemon = Daemon::new(80, 24, "corrald-test");
         let mut client = session(1);
         for cmd in ["cat", "printf two"] {
             daemon
@@ -1790,6 +1842,89 @@ mod tests {
         };
         assert_eq!(moved, 0, "the viewport cannot move past the top");
         drop(reader);
+    }
+
+    #[test]
+    fn list_workspaces_reports_the_live_pane_and_client_counts() {
+        // `corral attach` shows what is already running: how many panes
+        // the daemon holds and how many clients are on it right now. A
+        // stale or invented count sends the user to a workspace that is
+        // not there.
+        let sock = start_daemon("workspace-list");
+        let mut a = UnixStream::connect(&sock).unwrap();
+        let mut ra = BufReader::new(a.try_clone().unwrap());
+        send(&mut a, &ClientMsg::Attach);
+        for cmd in ["sleep 30", "sleep 30"] {
+            send(
+                &mut a,
+                &ClientMsg::CreatePane {
+                    cmd: "sh".into(),
+                    args: vec!["-c".into(), cmd.into()],
+                    cwd: "/tmp".into(),
+                    dir: Dir::Horizontal,
+                },
+            );
+        }
+        wait_for_msg(&mut ra, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.len() == 2,
+            _ => false,
+        })
+        .expect("a frame with both panes within 5s");
+
+        send(&mut a, &ClientMsg::ListWorkspaces);
+        let listed = wait_for_msg(&mut ra, |m| matches!(m, ServerMsg::WorkspaceList { .. }))
+            .expect("the workspace list within 5s");
+        let ServerMsg::WorkspaceList { workspaces } = listed else {
+            unreachable!()
+        };
+        assert_eq!(workspaces.len(), 1, "one workspace per daemon");
+        assert_eq!(workspaces[0].panes, 2, "both live panes counted");
+        assert_eq!(workspaces[0].clients, 1, "only A is attached so far");
+        let id = workspaces[0].id.clone();
+        assert!(
+            !id.is_empty(),
+            "the picker shows this id and the user types it back"
+        );
+
+        // The picker reads the listing over a connection of its own and
+        // drops it without attaching, so that connection must not count
+        // itself: "1 client" is the count a user reads while deciding.
+        let mut picker = UnixStream::connect(&sock).unwrap();
+        let mut rp = BufReader::new(picker.try_clone().unwrap());
+        send(&mut picker, &ClientMsg::ListWorkspaces);
+        let listed = wait_for_msg(&mut rp, |m| matches!(m, ServerMsg::WorkspaceList { .. }))
+            .expect("the picker's listing within 5s");
+        let ServerMsg::WorkspaceList { workspaces } = listed else {
+            unreachable!()
+        };
+        assert_eq!(
+            workspaces[0].clients, 1,
+            "a connection that never attached is not a client"
+        );
+        drop(rp);
+        drop(picker);
+
+        // A second client raises the count, and the id does not move: it
+        // is what `corral attach <id>` is given, so it has to outlive any
+        // one listing.
+        let mut b = UnixStream::connect(&sock).unwrap();
+        let mut rb = BufReader::new(b.try_clone().unwrap());
+        send(&mut b, &ClientMsg::Attach);
+        wait_for_msg(&mut rb, |m| matches!(m, ServerMsg::Frame { .. }))
+            .expect("B's attach frame within 5s");
+        send(&mut a, &ClientMsg::ListWorkspaces);
+        let listed = wait_for_msg(&mut ra, |m| matches!(m, ServerMsg::WorkspaceList { .. }))
+            .expect("the second workspace list within 5s");
+        let ServerMsg::WorkspaceList { workspaces } = listed else {
+            unreachable!()
+        };
+        assert_eq!(workspaces[0].clients, 2, "B is attached too");
+        assert_eq!(
+            workspaces[0].id, id,
+            "the id is stable for the daemon's lifetime"
+        );
+        drop(ra);
+        drop(rb);
     }
 
     /// Read and discard every message already queued, so the next message
