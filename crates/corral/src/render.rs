@@ -87,7 +87,10 @@ pub fn draw(
         );
     }
     // The current match paints over the yellow with its own color so
-    // the user can tell which hit the cursor is on.
+    // the user can tell which hit the cursor is on. Black text, not
+    // white: bright magenta is a light background, so white on it is
+    // about 3:1 and the black is about 7:1. This also keeps the two
+    // styles to the same foreground.
     for (pane_id, hit_spans) in current {
         let Some(p) = panes.iter().find(|p| p.id == *pane_id) else {
             continue;
@@ -96,7 +99,7 @@ pub fn draw(
             frame,
             p,
             hit_spans,
-            Style::new().fg(Color::White).bg(CURRENT_HIT_BG),
+            Style::new().fg(Color::Black).bg(CURRENT_HIT_BG),
         );
     }
     if let Some(p) = panes.iter().find(|p| p.id == focused) {
@@ -756,5 +759,9 @@ mod tests {
             Color::Indexed(13),
             "the hit the user is on paints bright magenta over the plain search yellow"
         );
+        // Black, not white: bright magenta is a light background, so
+        // white text on it reads at about 3:1, below the 4.5:1 the
+        // general hit style clears by a wide margin (S3-5).
+        assert_eq!(term.backend().buffer()[(0, 0)].fg, Color::Black);
     }
 }
