@@ -1364,31 +1364,40 @@ mod tests {
     }
 
     #[test]
-    fn clear_history_empties_scrollback_but_leaves_the_live_screen_alone() {
+    fn clear_history_empties_scrollback_and_clears_the_screen_above_the_cursor() {
         let sock = start_daemon("clear");
         let mut client = UnixStream::connect(&sock).unwrap();
         send(
             &mut client,
             &ClientMsg::CreatePane {
                 cmd: "sh".into(),
-                args: vec!["-c".into(), "seq 1 60; sleep 30".into()],
+                // The trailing `printf` (no newline) leaves unsubmitted
+                // text on the cursor's row, so there is something above
+                // the cursor to erase and something on the cursor's row
+                // that must survive.
+                args: vec!["-c".into(), "seq 1 60; printf prompt-cmd; sleep 30".into()],
                 cwd: "/tmp".into(),
                 dir: Dir::Horizontal,
             },
         );
         let mut reader = BufReader::new(client);
         let bottom = wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("60")),
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.text.contains("60") && p.text.contains("prompt-cmd")),
             _ => false,
         })
-        .expect("bottom frame showing line 60 within 5s");
+        .expect("bottom frame showing line 60 and the prompt row within 5s");
         let ServerMsg::Frame { panes, .. } = bottom else {
             unreachable!()
         };
-        let live_text = panes[0].text.clone();
+        assert!(
+            panes[0].text.contains("59"),
+            "row above the cursor is visible pre-clear, got {:?}",
+            panes[0].text
+        );
 
-        // Scrolled up first so the viewport is not pinned to the bottom;
-        // the clear only touches scrollback, not the copy-mode position.
+        // Scrolled up first so the viewport is not pinned to the bottom.
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
@@ -1403,8 +1412,9 @@ mod tests {
 
         send(reader.get_mut(), &ClientMsg::ClearHistory);
         // Scrolling up now has nothing to reach: with the scrollback gone,
-        // any further Top scroll lands right back on the live screen.
-        // That is the proof the scrollback (not the screen) was cleared.
+        // any further Top scroll lands right back on the live screen. What
+        // it shows is the active screen with everything above the cursor's
+        // row erased and the cursor's own row intact.
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
@@ -1412,16 +1422,19 @@ mod tests {
             },
         );
         let settled = wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text == live_text),
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.text.contains("prompt-cmd") && !p.text.contains("60")),
             _ => false,
         })
-        .expect("frame back on the live screen within 5s");
+        .expect("frame showing the cleared screen within 5s");
         let ServerMsg::Frame { panes, .. } = settled else {
             unreachable!()
         };
-        assert_eq!(
-            panes[0].text, live_text,
-            "the live screen survives ClearHistory unchanged"
+        assert!(
+            !panes[0].text.contains("59"),
+            "the visible screen above the cursor is erased, got {:?}",
+            panes[0].text
         );
         drop(reader);
     }
