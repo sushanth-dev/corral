@@ -468,6 +468,25 @@ mod tests {
     }
 
     #[test]
+    fn pane_text_is_clipped_to_its_rect() {
+        // A client that is not the sizing client is handed rects narrower
+        // than the width the panes reflow at, so a pane's text can be wider
+        // than its rect. The surplus has to be cut at the rect edge rather
+        // than painted over the neighbour.
+        let panes = vec![
+            pane(1, 0, 0, 10, 3, "AAAAAAAAAAAAAAAAAAAAAAAA"),
+            pane(2, 11, 0, 9, 3, "BBBBBBBBB\nBBBBBBBBB\nBBBBBBBBB"),
+        ];
+        // Two rows taller than the panes: the status row always owns the
+        // last screen line.
+        let buf = draw_at(20, 5, &panes, 1);
+        assert_eq!(row(&buf, 0, 20), "AAAAAAAAAA│BBBBBBBBB");
+        assert_eq!(row(&buf, 1, 20), "          │BBBBBBBBB");
+        assert_eq!(row(&buf, 2, 20), "          │BBBBBBBBB");
+        assert_eq!(row(&buf, 3, 20), "                    ");
+    }
+
+    #[test]
     fn text_fills_the_rect_up_to_the_gutter_edge() {
         // No padding: a full-width line runs to the rect's last column;
         // the gutter itself (col 50 here) carries the line character.

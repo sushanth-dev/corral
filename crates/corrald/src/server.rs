@@ -12,6 +12,64 @@ use std::time::{Duration, Instant};
 
 const DRAIN_SWEEP: Duration = Duration::from_millis(16);
 
+type SessionId = u64;
+
+/// One attached client. Its read half is nonblocking so the daemon's loop
+/// can sweep every session in one pass without blocking on any of them,
+/// and it carries its own terminal size, since rects are computed per
+/// session.
+struct ClientSession {
+    id: SessionId,
+    reader: BufReader<UnixStream>,
+    /// A clone of the same socket, used for frames and replies. Nonblocking
+    /// too: `try_clone` shares the file description, and `write_msg` spins
+    /// on WouldBlock rather than failing.
+    writer: UnixStream,
+    /// Partial line left over from a nonblocking read; bytes stay here
+    /// until a newline completes them.
+    buf: String,
+    cols: u16,
+    rows: u16,
+}
+
+impl ClientSession {
+    fn new(id: SessionId, stream: UnixStream, cols: u16, rows: u16) -> Result<Self> {
+        let writer = stream.try_clone()?;
+        stream.set_nonblocking(true)?;
+        Ok(Self {
+            id,
+            reader: BufReader::new(stream),
+            writer,
+            buf: String::new(),
+            cols,
+            rows,
+        })
+    }
+
+    /// Parse everything this client has queued. `None` means the client
+    /// hung up, which is a detach, not a daemon error.
+    fn read_msgs(&mut self) -> std::io::Result<Option<Vec<ClientMsg>>> {
+        loop {
+            match self.reader.read_line(&mut self.buf) {
+                Ok(0) => return Ok(None),
+                Ok(_) => {}
+                // No more queued bytes; whatever is in `buf` is either a
+                // complete line or a partial one to resume next pass.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        let mut msgs = Vec::new();
+        while let Some(pos) = self.buf.find('\n') {
+            let line: String = self.buf.drain(..=pos).collect();
+            if let Ok(msg) = serde_json::from_str::<ClientMsg>(line.trim()) {
+                msgs.push(msg);
+            }
+        }
+        Ok(Some(msgs))
+    }
+}
+
 pub struct Daemon {
     root: Node,
     /// Command senders to the per-pane workers; each worker owns its
@@ -23,6 +81,10 @@ pub struct Daemon {
     out_rx: Receiver<PaneOut>,
     focused: PaneId,
     next_id: PaneId,
+    /// The sizing client's terminal size, that being the client which most
+    /// recently sent a message. A PTY has exactly one reflow width, so this
+    /// is the size every pane wraps at; another client's rect only clips
+    /// that content to fit (S4-1).
     cols: u16,
     rows: u16,
 }
@@ -46,69 +108,91 @@ impl Daemon {
         }
     }
 
-    /// Serve clients forever. The daemon state (panes, scrollback,
-    /// focus) lives here, not in the connection: a disconnect (Ctrl+a d)
-    /// keeps every pane running, and the next connection attaches to the
-    /// same session. One client at a time; the next connection queues
-    /// until the current one hangs up. The caller owns the listener and
-    /// socket cleanup.
+    /// Serve clients forever. The daemon state (panes, scrollback, focus)
+    /// lives here, not in any connection: a disconnect (Ctrl+a d) keeps
+    /// every pane running, and the next connection attaches to the same
+    /// session. Every attached client is served in the same pass, so a
+    /// second client's connect never waits behind the first client's read.
+    /// The caller owns the listener and socket cleanup.
     pub fn serve(listener: UnixListener) -> Result<()> {
         let mut daemon = Daemon::new(80, 24);
+        // Nonblocking accept: the loop takes whatever the kernel has queued
+        // and then moves on, instead of parking on one connection.
+        listener.set_nonblocking(true)?;
+        let mut sessions: Vec<ClientSession> = Vec::new();
+        let mut next_session: SessionId = 1;
         loop {
-            let (stream, _) = listener.accept()?;
-            daemon.run(stream)?;
-        }
-    }
+            // A re-attaching client needs the current layout immediately:
+            // without panes it creates the first shell, with panes it
+            // attaches to the existing ones. Push the frame on connect so
+            // the decision is frame-driven, not guessed.
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let mut session =
+                            ClientSession::new(next_session, stream, daemon.cols, daemon.rows)?;
+                        next_session += 1;
+                        match daemon.push_frame(&mut session) {
+                            Ok(()) => sessions.push(session),
+                            // Went away between connect and first frame;
+                            // nothing to attach to and nothing to clean up.
+                            Err(e) if is_disconnect(&e) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e.into()),
+                }
+            }
 
-    fn run(&mut self, stream: UnixStream) -> Result<()> {
-        let mut writer = stream.try_clone()?;
-        stream.set_nonblocking(true)?;
-        let mut reader = BufReader::new(stream);
-        // read_line on a nonblocking stream can return a partial JSON
-        // line; bytes stay in this buffer until a newline completes them.
-        let mut buf = String::new();
-        // A re-attaching client needs the current layout immediately:
-        // without panes it creates the first shell, with panes it
-        // attaches to the existing ones. Push the frame before the loop
-        // so the decision is frame-driven, not guessed.
-        self.push_frame(&mut writer)?;
-        loop {
-            // A frame write to a departed client reports BrokenPipe; that
-            // is a clean disconnect, not a daemon error.
-            if let Err(e) = self.drain_and_push(&mut writer) {
-                let broken = e
-                    .root_cause()
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe);
-                if broken {
-                    break;
-                }
-                return Err(e);
-            }
-            match reader.read_line(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                // WouldBlock: no client message within this pass; the
-                // drain sweep above paced the loop.
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(e) => return Err(e.into()),
-            }
-            while let Some(pos) = buf.find('\n') {
-                let line: String = buf.drain(..=pos).collect();
-                let Ok(msg) = serde_json::from_str::<ClientMsg>(line.trim()) else {
-                    continue;
+            // One read pass over every session, then one drain of the pane
+            // channel fanned out to all of them.
+            let mut departed: Vec<SessionId> = Vec::new();
+            for i in 0..sessions.len() {
+                let msgs = match sessions[i].read_msgs() {
+                    Ok(Some(msgs)) => msgs,
+                    // The client hung up; that is a detach, not an error.
+                    Ok(None) => {
+                        departed.push(sessions[i].id);
+                        continue;
+                    }
+                    // A broken socket is that one client's problem: drop it
+                    // and keep serving the rest.
+                    Err(_) => {
+                        departed.push(sessions[i].id);
+                        continue;
+                    }
                 };
-                self.handle(&msg)?;
-                // Focus, Resize, and CreatePane change layout or focus
-                // without touching pane output; the client must still see
-                // their effect. Key presses produce output that the drain
-                // sweep pushes, so they get no extra frame here.
-                if !matches!(msg, ClientMsg::Key { .. }) {
-                    self.push_frame(&mut writer)?;
+                if msgs.is_empty() {
+                    continue;
                 }
+                for msg in &msgs {
+                    if let ClientMsg::Resize { cols, rows } = msg {
+                        sessions[i].cols = *cols;
+                        sessions[i].rows = *rows;
+                    }
+                }
+                // Sending anything makes this the sizing client, so the
+                // panes reflow to its size. A no-op when it already is.
+                daemon.resize_to(sessions[i].cols, sessions[i].rows);
+                let mut relayout = false;
+                for msg in &msgs {
+                    daemon.handle(msg)?;
+                    // Focus, Resize, and CreatePane change layout or focus
+                    // without touching pane output; every attached client
+                    // must see their effect. Key presses produce output that
+                    // the drain sweep pushes, so they get no extra frame.
+                    relayout |= !matches!(msg, ClientMsg::Key { .. });
+                }
+                if relayout {
+                    push_to_all(&daemon, &mut sessions, &mut departed)?;
+                }
+            }
+            daemon.drain_and_push(&mut sessions, &mut departed)?;
+            if !departed.is_empty() {
+                sessions.retain(|s| !departed.contains(&s.id));
             }
         }
-        Ok(())
     }
 
     fn handle(&mut self, msg: &ClientMsg) -> Result<()> {
@@ -150,27 +234,17 @@ impl Daemon {
                 // output wraps at the pane width, not the old full
                 // width. Covers the first pane too, which the client
                 // resized before this CreatePane landed.
-                let rects = self.rects();
-                for (id, rect) in &rects {
-                    if let Some(pane) = self.panes.get(id) {
-                        pane.send(PaneCmd::Resize(rect.w, rect.h))?;
-                    }
-                }
+                self.reflow_panes();
             }
             ClientMsg::Key { bytes } => {
-                if let Some(pane) = self.panes.get(&self.focused) {
-                    pane.send(PaneCmd::Key(bytes.clone()))?;
-                }
+                self.send_to_pane(self.focused, PaneCmd::Key(bytes.clone()));
             }
             ClientMsg::Resize { cols, rows } => {
-                self.cols = *cols;
-                self.rows = *rows;
-                let rects = self.rects();
-                for (id, rect) in &rects {
-                    if let Some(pane) = self.panes.get(id) {
-                        pane.send(PaneCmd::Resize(rect.w, rect.h))?;
-                    }
-                }
+                // The client's own terminal size lands in its session; the
+                // size the panes wrap at follows the sizing client, which
+                // the serve loop updates for any message, this one
+                // included. Idempotent when the loop already applied it.
+                self.resize_to(*cols, *rows);
             }
             ClientMsg::Focus { dir } => {
                 if let Some(next) = self.root.focus_dir(self.focused, *dir) {
@@ -179,41 +253,39 @@ impl Daemon {
             }
             ClientMsg::FocusNext => self.focus_next(),
             ClientMsg::Scroll { target } => {
-                if let Some(pane) = self.panes.get(&self.focused) {
-                    let target = match target {
-                        crate::protocol::ScrollTarget::Delta(d) => ScrollTarget::Delta(*d),
-                        crate::protocol::ScrollTarget::Row(r) => ScrollTarget::Row(*r),
-                        crate::protocol::ScrollTarget::Top => ScrollTarget::Top,
-                        crate::protocol::ScrollTarget::Bottom => ScrollTarget::Bottom,
-                    };
-                    pane.send(PaneCmd::Scroll(target))?;
-                }
+                let target = match target {
+                    crate::protocol::ScrollTarget::Delta(d) => ScrollTarget::Delta(*d),
+                    crate::protocol::ScrollTarget::Row(r) => ScrollTarget::Row(*r),
+                    crate::protocol::ScrollTarget::Top => ScrollTarget::Top,
+                    crate::protocol::ScrollTarget::Bottom => ScrollTarget::Bottom,
+                };
+                self.send_to_pane(self.focused, PaneCmd::Scroll(target));
             }
             ClientMsg::Search {
                 needle,
                 from,
                 reverse,
             } => {
-                if let Some(pane) = self.panes.get(&self.focused) {
-                    pane.send(PaneCmd::Search {
+                self.send_to_pane(
+                    self.focused,
+                    PaneCmd::Search {
                         needle: needle.clone(),
                         from: *from,
                         reverse: *reverse,
-                    })?;
-                }
+                    },
+                );
             }
             ClientMsg::ClearHistory => {
-                if let Some(pane) = self.panes.get(&self.focused) {
-                    pane.send(PaneCmd::ClearHistory)?;
-                }
+                self.send_to_pane(self.focused, PaneCmd::ClearHistory);
             }
             ClientMsg::PromptJump { up, cursor_row } => {
-                if let Some(pane) = self.panes.get(&self.focused) {
-                    pane.send(PaneCmd::PromptJump {
+                self.send_to_pane(
+                    self.focused,
+                    PaneCmd::PromptJump {
                         up: *up,
                         cursor_row: *cursor_row,
-                    })?;
-                }
+                    },
+                );
             }
         }
         Ok(())
@@ -233,16 +305,53 @@ impl Daemon {
         self.focused = next;
     }
 
-    fn rects(&self) -> Vec<(PaneId, Rect)> {
+    /// Send one command to one pane. A closed channel means that pane's
+    /// worker has stopped, which is how every pane ends: the worker queues
+    /// its `Exited` and then drops its receiver, so the daemon either
+    /// already has that message or will get it on a later sweep. The pane
+    /// is gone, not the session, so the command is dropped. Treating it as
+    /// fatal would let one pane's exit race take down every other pane and
+    /// every attached client.
+    fn send_to_pane(&self, id: PaneId, cmd: PaneCmd) {
+        if let Some(pane) = self.panes.get(&id) {
+            let _ = pane.send(cmd);
+        }
+    }
+
+    /// Adopt a sizing client's terminal size and reflow the panes to it.
+    fn resize_to(&mut self, cols: u16, rows: u16) {
+        if self.cols == cols && self.rows == rows {
+            return;
+        }
+        self.cols = cols;
+        self.rows = rows;
+        self.reflow_panes();
+    }
+
+    /// Push the sizing client's rects to every pane's PTY and emulator, so
+    /// pane output wraps at the width it is displayed at. Called whenever
+    /// the tree changes shape or the sizing client changes size.
+    fn reflow_panes(&self) {
+        for (id, rect) in self.rects(self.cols, self.rows) {
+            self.send_to_pane(id, PaneCmd::Resize(rect.w, rect.h));
+        }
+    }
+
+    /// The layout one client sees, in that client's own terminal size.
+    fn rects(&self, cols: u16, rows: u16) -> Vec<(PaneId, Rect)> {
         self.root.rects(Rect {
             x: 0,
             y: 0,
-            w: self.cols,
-            h: self.rows,
+            w: cols,
+            h: rows,
         })
     }
 
-    fn drain_and_push(&mut self, writer: &mut UnixStream) -> Result<()> {
+    fn drain_and_push(
+        &mut self,
+        sessions: &mut [ClientSession],
+        departed: &mut Vec<SessionId>,
+    ) -> Result<()> {
         let deadline = Instant::now() + DRAIN_SWEEP;
         let mut changed = false;
         let mut exited: Vec<PaneId> = Vec::new();
@@ -254,19 +363,30 @@ impl Daemon {
                     changed = true;
                 }
                 Ok(PaneOut::SearchResult { pane, rows, top }) => {
-                    // A search reply goes straight to the client, outside
-                    // the normal frame cadence.
-                    write_msg(writer, &ServerMsg::SearchResult { pane, rows, top })?;
+                    // A search reply goes straight to the clients, outside
+                    // the normal frame cadence. It describes the one shared
+                    // viewport, so every client gets it; task 15 moves the
+                    // viewport into the session and this becomes a reply to
+                    // whichever client asked.
+                    write_to_all(
+                        sessions,
+                        &ServerMsg::SearchResult { pane, rows, top },
+                        departed,
+                    )?;
                 }
                 Ok(PaneOut::PromptLanded { pane, row, col }) => {
-                    // The client moves its copy cursor onto the command.
-                    write_msg(writer, &ServerMsg::PromptLanded { pane, row, col })?;
+                    // The clients move their copy cursor onto the command.
+                    write_to_all(
+                        sessions,
+                        &ServerMsg::PromptLanded { pane, row, col },
+                        departed,
+                    )?;
                 }
                 Ok(PaneOut::ScrollLanded { pane, moved }) => {
                     // Copy mode moves its cursor by the full requested
                     // delta; it needs the real movement to cancel out
                     // the part the viewport could not deliver (S3-3).
-                    write_msg(writer, &ServerMsg::ScrollLanded { pane, moved })?;
+                    write_to_all(sessions, &ServerMsg::ScrollLanded { pane, moved }, departed)?;
                 }
                 Ok(PaneOut::Exited { pane }) => {
                     // The worker also reports Exited when its command
@@ -284,11 +404,11 @@ impl Daemon {
                 break;
             }
         }
-        // Snapshots first, frame while the panes are still alive: the
+        // Snapshots first, frame while the panes are still alive: every
         // client must see a pane's final output before the Exited
         // message collapses the tree.
         if changed || !exited.is_empty() {
-            self.push_frame(writer)?;
+            push_to_all(self, sessions, departed)?;
         }
         for id in &exited {
             self.panes.remove(id);
@@ -297,26 +417,21 @@ impl Daemon {
             if let Some(sib) = sibling {
                 self.focused = sib;
             }
-            write_msg(writer, &ServerMsg::Exited { pane: *id })?;
+            write_to_all(sessions, &ServerMsg::Exited { pane: *id }, departed)?;
         }
         if !exited.is_empty() {
             // The tree collapsed: surviving panes' rects grew to fill
             // the closed pane's space. Reflow each PTY and emulator to
             // the new size, same as CreatePane's split does, so the
             // remaining panes unwrap back to full width.
-            let rects = self.rects();
-            for (id, rect) in &rects {
-                if let Some(pane) = self.panes.get(id) {
-                    pane.send(PaneCmd::Resize(rect.w, rect.h))?;
-                }
-            }
-            self.push_frame(writer)?;
+            self.reflow_panes();
+            push_to_all(self, sessions, departed)?;
         }
         Ok(())
     }
 
-    fn push_frame(&self, writer: &mut UnixStream) -> Result<()> {
-        let rects = self.rects();
+    fn push_frame(&self, session: &mut ClientSession) -> Result<()> {
+        let rects = self.rects(session.cols, session.rows);
         let mut panes = Vec::new();
         for (id, rect) in &rects {
             let Some(snapshot) = self.snapshots.get(id) else {
@@ -330,8 +445,55 @@ impl Daemon {
             panes,
             focused: self.focused,
         };
-        write_msg(writer, &msg)
+        write_msg(&mut session.writer, &msg)
     }
+}
+
+/// Write one frame to every session.
+fn push_to_all(
+    daemon: &Daemon,
+    sessions: &mut [ClientSession],
+    departed: &mut Vec<SessionId>,
+) -> Result<()> {
+    for_each_session(sessions, departed, |session| daemon.push_frame(session))
+}
+
+/// Write one message to every session.
+fn write_to_all(
+    sessions: &mut [ClientSession],
+    msg: &ServerMsg,
+    departed: &mut Vec<SessionId>,
+) -> Result<()> {
+    for_each_session(sessions, departed, |session| {
+        write_msg(&mut session.writer, msg)
+    })
+}
+
+/// One write attempt per session. A session that has gone away is collected
+/// for removal; any other write error is fatal.
+fn for_each_session(
+    sessions: &mut [ClientSession],
+    departed: &mut Vec<SessionId>,
+    mut write: impl FnMut(&mut ClientSession) -> Result<()>,
+) -> Result<()> {
+    for session in sessions.iter_mut() {
+        if let Err(e) = write(session) {
+            if is_disconnect(&e) {
+                departed.push(session.id);
+            } else {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A frame write to a departed client reports BrokenPipe; that is a clean
+/// disconnect, not a daemon error.
+fn is_disconnect(e: &anyhow::Error) -> bool {
+    e.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
 }
 
 fn write_msg(writer: &mut UnixStream, msg: &ServerMsg) -> Result<()> {
@@ -717,16 +879,25 @@ mod tests {
 
     #[test]
     fn second_exit_leaves_a_single_collapsed_pane() {
-        // Three short-lived panes: each exit collapses the tree until one
-        // pane fills the whole frame.
+        // Two panes exit and the third stays alive, so the tree collapses
+        // deterministically to the survivor. The survivor must be the only
+        // pane in the frame and must hold focus. (Three short-lived panes
+        // would not do: the daemon now handles a whole read batch before
+        // emitting a frame, so all three exits land in one sweep and the
+        // frame jumps straight from three panes to none.)
         let _sock = start_daemon("collapse");
         let mut client = UnixStream::connect(&_sock).unwrap();
         for out in ["one", "two", "three"] {
+            let cmd = if out == "three" {
+                format!("printf {out}; cat")
+            } else {
+                format!("printf {out}")
+            };
             send(
                 &mut client,
                 &ClientMsg::CreatePane {
                     cmd: "sh".into(),
-                    args: vec!["-c".into(), format!("printf {out}")],
+                    args: vec!["-c".into(), cmd],
                     cwd: "/tmp".into(),
                     dir: Dir::Horizontal,
                 },
@@ -744,6 +915,31 @@ mod tests {
         assert_eq!(panes.len(), 1);
         assert_eq!(focused, panes[0].id, "last live pane holds focus");
         drop(reader);
+    }
+
+    #[test]
+    fn a_command_to_a_pane_whose_worker_stopped_is_not_fatal() {
+        // A pane's worker stops the moment its command exits, taking the
+        // pane's command channel with it. The daemon only learns that from
+        // the worker's `Exited` message, which arrives on a later sweep.
+        // A command aimed at the pane inside that window lands on a closed
+        // channel: that is the pane being gone, not a daemon failure, and
+        // it must not take the whole session down with it. No drain runs
+        // here, so the window is held open deliberately.
+        let mut daemon = Daemon::new(80, 24);
+        for cmd in ["cat", "printf two"] {
+            daemon
+                .handle(&ClientMsg::CreatePane {
+                    cmd: "sh".into(),
+                    args: vec!["-c".into(), cmd.into()],
+                    cwd: "/tmp".into(),
+                    dir: Dir::Horizontal,
+                })
+                .unwrap();
+        }
+        // Long enough for `printf two` and its worker to be gone.
+        std::thread::sleep(Duration::from_millis(300));
+        daemon.resize_to(100, 30);
     }
 
     #[test]
@@ -1642,5 +1838,127 @@ mod tests {
         .expect("frame showing prompt two after down-jump within 5s");
 
         drop(reader);
+    }
+
+    /// S4-1: two clients attached at once both see a pane's later output.
+    /// The second client connects while the first is still attached and
+    /// still reading, which is what `serve`'s one-connection-at-a-time loop
+    /// cannot do: the kernel accepts the second connection into the backlog
+    /// and the daemon then starves it until the first client hangs up.
+    #[test]
+    fn both_clients_see_a_panes_output() {
+        let sock = start_daemon("multi-fanout");
+        let mut first = UnixStream::connect(&sock).unwrap();
+        send(
+            &mut first,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf one; sleep 2; printf two; sleep 20".into(),
+                ],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut first = BufReader::new(first);
+        wait_for_msg(&mut first, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("one")),
+            _ => false,
+        })
+        .expect("first client sees the pane come up within 5s");
+
+        let mut second = BufReader::new(UnixStream::connect(&sock).unwrap());
+        wait_for_msg(&mut second, |m| matches!(m, ServerMsg::Frame { .. }))
+            .expect("second client gets an attach frame within 5s");
+
+        // Output produced after both attached has to reach both. `two` is
+        // printed two seconds in, so it is only visible to whoever is
+        // attached when the worker pushes it.
+        wait_for_msg(&mut first, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("two")),
+            _ => false,
+        })
+        .expect("first client sees the pane's later output within 5s");
+        wait_for_msg(&mut second, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("two")),
+            _ => false,
+        })
+        .expect("second client sees the pane's later output within 5s");
+    }
+
+    /// S4-1: a connect is not serialized behind an attached client. Nothing
+    /// produces output here, so the only thing that can send this frame is
+    /// the accept loop running concurrently with the first client's read.
+    #[test]
+    fn a_second_client_is_served_while_the_first_is_attached() {
+        let sock = start_daemon("multi-accept");
+        let mut idle = UnixStream::connect(&sock).unwrap();
+        send(&mut idle, &ClientMsg::Attach);
+        let mut idle = BufReader::new(idle);
+        wait_for_msg(&mut idle, |m| matches!(m, ServerMsg::Frame { .. }))
+            .expect("first client attaches within 5s");
+
+        let started = Instant::now();
+        let mut second = BufReader::new(UnixStream::connect(&sock).unwrap());
+        wait_for_msg(&mut second, |m| matches!(m, ServerMsg::Frame { .. }))
+            .expect("second client gets an attach frame while the first is attached");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "second client waited {:?} for its attach frame; it queued behind the first",
+            started.elapsed()
+        );
+    }
+
+    /// S4-1: a detach is a detach, not a shutdown. The panes outlive the
+    /// client that created them: a later attach sees the same pane id and
+    /// the PTY behind it still answers.
+    #[test]
+    fn detach_keeps_the_pane_and_its_pty_alive() {
+        let sock = start_daemon("multi-detach");
+        let mut first = UnixStream::connect(&sock).unwrap();
+        send(
+            &mut first,
+            &ClientMsg::CreatePane {
+                cmd: "cat".into(),
+                args: vec![],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut first = BufReader::new(first);
+        let frame = wait_for_msg(&mut first, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.len() == 1,
+            _ => false,
+        })
+        .expect("first client sees the pane within 5s");
+        let ServerMsg::Frame { panes, .. } = frame else {
+            unreachable!()
+        };
+        let pane = panes[0].id;
+        drop(first);
+
+        // Same pane id after the detach: the session survived, rather than
+        // being torn down and rebuilt.
+        let mut second = BufReader::new(UnixStream::connect(&sock).unwrap());
+        wait_for_msg(&mut second, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.id == pane),
+            _ => false,
+        })
+        .expect("re-attach sees the same pane id within 5s");
+
+        // Alive, not just a cached snapshot: cat echoes what it reads, so
+        // output arriving now proves the process is still on its PTY.
+        send(
+            second.get_mut(),
+            &ClientMsg::Key {
+                bytes: b"still here\n".to_vec(),
+            },
+        );
+        wait_for_msg(&mut second, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("still here")),
+            _ => false,
+        })
+        .expect("the pane's PTY answers after a re-attach within 5s");
     }
 }
