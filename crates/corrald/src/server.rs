@@ -207,12 +207,6 @@ impl Daemon {
                     pane.send(PaneCmd::ClearHistory)?;
                 }
             }
-            ClientMsg::DumpScrollback { pane } => {
-                let target = pane.unwrap_or(self.focused);
-                if let Some(p) = self.panes.get(&target) {
-                    p.send(PaneCmd::DumpScrollback)?;
-                }
-            }
             ClientMsg::PromptJump { up, cursor_row } => {
                 if let Some(pane) = self.panes.get(&self.focused) {
                     pane.send(PaneCmd::PromptJump {
@@ -263,10 +257,6 @@ impl Daemon {
                     // A search reply goes straight to the client, outside
                     // the normal frame cadence.
                     write_msg(writer, &ServerMsg::SearchResult { pane, rows, top })?;
-                }
-                Ok(PaneOut::ScrollbackDump { pane, text }) => {
-                    // Same out-of-band path as the search reply (S3-7).
-                    write_msg(writer, &ServerMsg::ScrollbackDump { pane, text })?;
                 }
                 Ok(PaneOut::PromptLanded { pane, row, col }) => {
                     // The client moves its copy cursor onto the command.
@@ -1516,49 +1506,6 @@ mod tests {
             "the prompt row rides up to the top of the screen, got {:?}",
             panes[0].text
         );
-        drop(reader);
-    }
-
-    #[test]
-    fn dump_scrollback_returns_all_sixty_lines() {
-        let sock = start_daemon("dump");
-        let mut client = UnixStream::connect(&sock).unwrap();
-        send(
-            &mut client,
-            &ClientMsg::CreatePane {
-                cmd: "sh".into(),
-                args: vec!["-c".into(), "seq 1 60; sleep 30".into()],
-                cwd: "/tmp".into(),
-                dir: Dir::Horizontal,
-            },
-        );
-        let mut reader = BufReader::new(client);
-        wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("60")),
-            _ => false,
-        })
-        .expect("bottom frame showing line 60 within 5s");
-
-        send(reader.get_mut(), &ClientMsg::DumpScrollback { pane: None });
-        let reply = wait_for_msg(&mut reader, |m| {
-            matches!(m, ServerMsg::ScrollbackDump { .. })
-        })
-        .expect("ScrollbackDump within 5s");
-        let ServerMsg::ScrollbackDump { pane, text } = reply else {
-            unreachable!()
-        };
-        assert!(pane > 0, "reply names the pane it dumped");
-        // Every line here carries text, so the count is also the check
-        // that the dump holds no blank filler from the screen's tail.
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(
-            lines.len(),
-            60,
-            "all 60 lines are in the dump, got {}",
-            lines.len()
-        );
-        assert_eq!(lines.first().copied(), Some("1"), "dump starts at line 1");
-        assert_eq!(lines.last().copied(), Some("60"), "dump ends at line 60");
         drop(reader);
     }
 

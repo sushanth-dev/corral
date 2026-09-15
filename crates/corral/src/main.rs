@@ -1,6 +1,5 @@
 mod benchmark;
 mod clipboard;
-mod edit;
 mod input;
 mod render;
 mod selection;
@@ -106,32 +105,6 @@ fn send_msg(stream: &mut UnixStream, msg: &ClientMsg) -> anyhow::Result<()> {
     }
     stream.flush()?;
     Ok(())
-}
-
-/// Read one ScrollbackDump reply synchronously, skipping frames that
-/// arrive first. Puts the socket back in nonblocking mode afterwards.
-fn read_dump(reader: &mut std::io::BufReader<UnixStream>) -> anyhow::Result<String> {
-    // The socket runs nonblocking for the main loop; a read timeout on a
-    // nonblocking socket never fires (EAGAIN wins), so restore blocking
-    // mode first or every dump read returns immediately.
-    reader.get_mut().set_nonblocking(false)?;
-    reader
-        .get_mut()
-        .set_read_timeout(Some(Duration::from_secs(5)))?;
-    let text = loop {
-        let mut chunk = String::new();
-        match std::io::BufRead::read_line(reader, &mut chunk) {
-            Ok(0) => anyhow::bail!("daemon closed during scrollback dump"),
-            Ok(_) => {}
-            Err(e) => anyhow::bail!("no scrollback dump within 5s: {e}"),
-        }
-        if let Ok(ServerMsg::ScrollbackDump { text, .. }) = serde_json::from_str(chunk.trim()) {
-            break text;
-        }
-    };
-    reader.get_mut().set_read_timeout(None)?;
-    reader.get_mut().set_nonblocking(true)?;
-    Ok(text)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -333,11 +306,6 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                         ));
                     }
                 }
-                ServerMsg::ScrollbackDump { .. } => {
-                    // Only meaningful in the EditScrollback flow, which
-                    // reads the socket directly; anything arriving in the
-                    // normal loop is stale.
-                }
             }
         }
         let focused_pane = panes.iter().find(|p| p.id == focused);
@@ -530,33 +498,6 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                             cursor_row: copy_cursor.map(|(r, _)| r),
                         },
                     )?;
-                }
-                Some(input::Action::EditScrollback) => {
-                    send_msg(writer, &ClientMsg::DumpScrollback { pane: None })?;
-                    // A failed dump must not kill the client; the session
-                    // stays usable and the error surfaces in the hint line.
-                    let Ok(dump) = read_dump(&mut reader) else {
-                        continue;
-                    };
-                    // Suspend the TUI, hand the dump to the editor, then
-                    // restore; the dump file is deleted inside the flow.
-                    // Nothing comes back: the editor works on a copy of
-                    // the pane, and the pane keeps running throughout.
-                    let _ = crossterm::execute!(
-                        std::io::stdout(),
-                        crossterm::terminal::LeaveAlternateScreen
-                    );
-                    crossterm::terminal::disable_raw_mode()?;
-                    let _ = edit::edit_scrollback(&dump, &mut edit::spawn_editor);
-                    crossterm::terminal::enable_raw_mode()?;
-                    let _ = crossterm::execute!(
-                        std::io::stdout(),
-                        crossterm::terminal::EnterAlternateScreen
-                    );
-                    // Force a full repaint: the editor scribbled on the
-                    // screen behind ratatui's diff cache.
-                    terminal.clear()?;
-                    last_drawn = None;
                 }
                 Some(input::Action::Split(dir)) => {
                     let (cmd, args) = pane_command();

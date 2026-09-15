@@ -30,9 +30,6 @@ pub enum PaneCmd {
     },
     /// Erase the pane's scrollback (S3-6).
     ClearHistory,
-    /// Produce the pane's full scrollback text (S3-7); the reply rides
-    /// PaneOut as a ScrollbackDump the daemon core forwards to the client.
-    DumpScrollback,
     /// Jump the viewport to the previous (up) or next (down) OSC133
     /// prompt row (S3-8). `cursor_row` anchors the walk at the copy
     /// cursor inside the viewport; `None` anchors at the viewport
@@ -54,11 +51,6 @@ pub enum PaneOut {
         pane: PaneId,
         rows: Vec<usize>,
         top: usize,
-    },
-    /// Reply to PaneCmd::DumpScrollback (S3-7).
-    ScrollbackDump {
-        pane: PaneId,
-        text: String,
     },
     /// Reply to PaneCmd::PromptJump: the prompt's command text landed
     /// at this row and column inside the viewport.
@@ -184,10 +176,6 @@ fn run_worker(
                     // exactly as they are.
                     emu.clear_history();
                     push_snapshot(id, &mut emu, cols, rows, &out);
-                }
-                PaneCmd::DumpScrollback => {
-                    let text = emu.dump_scrollback().unwrap_or_default();
-                    let _ = out.send(PaneOut::ScrollbackDump { pane: id, text });
                 }
                 PaneCmd::PromptJump { up, cursor_row } => {
                     // Command input positions, not raw OSC 133;A marker
@@ -339,7 +327,6 @@ mod tests {
             match out_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(PaneOut::SearchResult { .. }) => {}
                 Ok(PaneOut::PromptLanded { .. }) => {}
-                Ok(PaneOut::ScrollbackDump { .. }) => {}
                 Ok(PaneOut::ScrollLanded { .. }) => {}
                 Ok(PaneOut::Snapshot { pane, state }) => {
                     assert!(pane == 7 || pane == 9, "unknown pane id {pane}");

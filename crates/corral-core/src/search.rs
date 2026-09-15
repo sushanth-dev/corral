@@ -50,33 +50,6 @@ impl Emulator {
         Ok(hits)
     }
 
-    /// The full scrollback plus active screen as plain text, one
-    /// screen-space row per line (S3-7). This is what the client writes
-    /// to the temp file for $EDITOR.
-    ///
-    /// The blank tail is dropped. A pane's screen is mostly empty below
-    /// the shell's prompt - the rows under the cursor are filler the
-    /// terminal would have scrolled away - so dumping the whole screen
-    /// opened the editor on thirty empty lines with the pane's content
-    /// stranded at the top, reading as "nothing to edit". Blank rows
-    /// between content stay: those are real spacing the user put there.
-    pub fn dump_scrollback(&mut self) -> Result<String> {
-        let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
-        let mut lines = Vec::with_capacity(total);
-        for row in 0..total {
-            lines.push(self.row_text(row)?);
-        }
-        while lines.last().is_some_and(|line| line.is_empty()) {
-            lines.pop();
-        }
-        let mut out = String::new();
-        for line in lines {
-            out.push_str(&line);
-            out.push('\n');
-        }
-        Ok(out)
-    }
-
     /// Screen-space rows whose semantic prompt state is `Prompt` (S3-8).
     /// Shell-integrated shells emit OSC 133 A at each prompt; rows
     /// without markers report `None` and yield no prompt rows.
@@ -340,51 +313,6 @@ mod tests {
         emu.scroll(ScrollTarget::Top);
         let hits = emu.search("NEEDLEMARK", None, false).unwrap();
         assert_eq!(hits.first().copied(), Some(0));
-    }
-
-    #[test]
-    fn dump_scrollback_returns_the_whole_history_and_no_blank_tail() {
-        // 50 lines into an 80x24 emulator: history plus active screen,
-        // all in order. The screen's blank rows under the cursor are
-        // not content, so the dump ends on the last fed line.
-        let mut emu = marker_emulator();
-        let dump = emu.dump_scrollback().unwrap();
-        let lines: Vec<&str> = dump.lines().collect();
-        assert_eq!(lines.len(), 50, "every fed line, and only those");
-        assert!(
-            lines.first().unwrap().contains("NEEDLEMARK line 0"),
-            "top of scrollback first, got {:?}",
-            lines.first().unwrap()
-        );
-        assert!(
-            lines.last().unwrap().contains("plain line 49"),
-            "active screen last, got {:?}",
-            lines.last().unwrap()
-        );
-    }
-
-    #[test]
-    fn dump_scrollback_keeps_blank_rows_between_content() {
-        // A gap the user's own output left behind is content: only the
-        // tail below it goes. Trimming every blank line would close the
-        // gap and misreport where things were on screen.
-        let mut emu = Emulator::new(80, 6).unwrap();
-        emu.feed(b"first\r\n\r\n\r\nlast\r\n");
-        let dump = emu.dump_scrollback().unwrap();
-        assert_eq!(
-            dump, "first\n\n\nlast\n",
-            "inner blank rows survive, the tail does not"
-        );
-    }
-
-    #[test]
-    fn dump_scrollback_of_a_fresh_screen_has_no_content() {
-        let mut emu = Emulator::new(80, 24).unwrap();
-        assert_eq!(
-            emu.dump_scrollback().unwrap(),
-            "",
-            "a pane that has printed nothing dumps nothing"
-        );
     }
 
     #[test]

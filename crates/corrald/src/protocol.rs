@@ -46,11 +46,6 @@ pub enum ClientMsg {
     },
     /// Erase the focused pane's scrollback (CSI 3 J).
     ClearHistory,
-    /// Dump a pane's full scrollback (S3-7). `None` means the focused
-    /// pane; the reply rides ServerMsg::ScrollbackDump.
-    DumpScrollback {
-        pane: Option<PaneId>,
-    },
     /// Scroll the focused pane's viewport to the previous (up) or next
     /// (down) OSC133 prompt row (S3-8). `cursor_row` is the copy-mode
     /// cursor's row inside the viewport; the anchor is that row, not
@@ -78,12 +73,6 @@ pub enum ServerMsg {
         pane: PaneId,
         rows: Vec<usize>,
         top: usize,
-    },
-    /// The named pane's full scrollback as plain text (S3-7), one
-    /// screen-space row per line.
-    ScrollbackDump {
-        pane: PaneId,
-        text: String,
     },
     /// Reply to a prompt jump: the prompt's command text now sits at
     /// this row and column inside the viewport (not the shell theme's
@@ -183,8 +172,6 @@ mod tests {
                 reverse: true,
             },
             ClientMsg::ClearHistory,
-            ClientMsg::DumpScrollback { pane: None },
-            ClientMsg::DumpScrollback { pane: Some(3) },
             ClientMsg::PromptJump {
                 up: true,
                 cursor_row: None,
@@ -261,16 +248,6 @@ mod tests {
         })
         .unwrap();
         assert!(empty.contains("\"rows\":[]"), "got {empty}");
-    }
-
-    #[test]
-    fn scrollback_dump_round_trips() {
-        let msg = ServerMsg::ScrollbackDump {
-            pane: 5,
-            text: "line one\nline two\n".into(),
-        };
-        let back: ServerMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
-        assert_eq!(back, msg);
     }
 
     #[test]

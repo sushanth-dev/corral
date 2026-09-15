@@ -63,8 +63,6 @@ pub enum Action {
     SearchPrev,
     /// Leader `c`: erase the focused pane's scrollback.
     ClearHistory,
-    /// Leader `e`: open the focused pane's scrollback in an editor.
-    EditScrollback,
     /// `{` in copy mode: jump to the previous prompt row.
     PromptPrev,
     /// `}` in copy mode: jump to the next prompt row.
@@ -74,8 +72,8 @@ pub enum Action {
 }
 
 // The Ctrl+a leader is the only key corral consumes in input mode. In
-// copy mode the leader still arms (tmux-style) so Ctrl+a c and Ctrl+a e
-// reach their actions from scrollback; every other copy key is
+// copy mode the leader still arms (tmux-style) so Ctrl+a c reaches its
+// action from scrollback; every other copy key is
 // consumed: vi keys move the cursor, everything else does nothing, and
 // no byte ever reaches the pane. `half_page` is the pane height for
 // Ctrl+d/Ctrl+u; it only matters in copy mode.
@@ -100,7 +98,6 @@ fn leader_action(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
         (KeyCode::Down, _) => Some(Action::Focus(Dir::Vertical)),
         (KeyCode::Char('['), _) => Some(Action::EnterCopy),
         (KeyCode::Char('c'), _) => Some(Action::ClearHistory),
-        (KeyCode::Char('e'), _) => Some(Action::EditScrollback),
         (KeyCode::Char('d'), _) => Some(Action::Quit),
         _ => None,
     }
@@ -125,7 +122,7 @@ pub fn handle(
     if *mode == Mode::Copy {
         // The leader works in copy mode (tmux-style): Ctrl+a arms, the
         // next key goes through the shared leader table (Ctrl+a c clear
-        // history and Ctrl+a e edit scrollback both land from here).
+        // history lands from here).
         if matches!(
             (ev.code, ev.modifiers),
             (KeyCode::Char('a'), KeyModifiers::CONTROL)
@@ -753,9 +750,6 @@ mod tests {
             (KeyCode::Char('c'), |a: &Action| {
                 matches!(a, Action::ClearHistory)
             }),
-            (KeyCode::Char('e'), |a: &Action| {
-                matches!(a, Action::EditScrollback)
-            }),
             (KeyCode::Char('d'), |a: &Action| matches!(a, Action::Quit)),
         ];
         for (code, check) in cases {
@@ -866,9 +860,9 @@ mod tests {
     }
 
     #[test]
-    fn leader_arms_in_copy_mode_and_clear_history_and_edit_work() {
+    fn leader_arms_in_copy_mode_and_clear_history_works() {
         // tmux allows the prefix inside copy mode; Ctrl+a c (clear
-        // history) and Ctrl+a e (edit scrollback) must land from here.
+        // history) must land from here.
         let mut armed = false;
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
@@ -889,23 +883,6 @@ mod tests {
             Some(Action::ClearHistory)
         ));
         assert!(!armed);
-        handle(
-            key(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            &mut armed,
-            &Mode::Copy,
-            false,
-            0,
-        );
-        assert!(matches!(
-            handle(
-                key(KeyCode::Char('e'), KeyModifiers::NONE),
-                &mut armed,
-                &Mode::Copy,
-                false,
-                0
-            ),
-            Some(Action::EditScrollback)
-        ));
         // An unknown leader key disarms and swallows.
         handle(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
