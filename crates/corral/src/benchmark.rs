@@ -17,6 +17,7 @@ mod bench {
     use ratatui::backend::TestBackend;
 
     use crate::render;
+    use crate::theme::Theme;
 
     const PANES: usize = 30;
     const LINES_PER_PANE: usize = 500;
@@ -83,6 +84,7 @@ mod bench {
         let backend = TestBackend::new(WIDTH, HEIGHT);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let focused = 0;
+        let theme = Theme::bundled();
 
         let mut times: Vec<u128> = Vec::with_capacity(DRAWS);
         for _ in 0..DRAWS {
@@ -104,6 +106,7 @@ mod bench {
                         &[],
                         &[],
                         None,
+                        &theme,
                     )
                 })
                 .expect("draw");

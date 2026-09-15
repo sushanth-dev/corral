@@ -1,0 +1,15 @@
+{
+  "name": "Catppuccin Mocha",
+  "palette": {
+    "gutter": "#45475a",
+    "focused_gutter": "#89b4fa",
+    "cursor_bg": "#7f849c",
+    "cursor_fg": "#11111b",
+    "search_bg": "#f9e2af",
+    "search_fg": "#11111b",
+    "current_hit_bg": "#cba6f7",
+    "current_hit_fg": "#11111b",
+    "hint_bg": "#585b70",
+    "hint_fg": "#cdd6f4"
+  }
+}

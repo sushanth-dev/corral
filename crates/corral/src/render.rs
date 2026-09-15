@@ -1,3 +1,4 @@
+use crate::theme::Theme;
 use corral_core::emulation::CellColor;
 use corral_core::tree::PaneId;
 use corrald::protocol::PaneState;
@@ -6,23 +7,6 @@ use ratatui::layout::Rect as RRect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-
-// Gutters between panes render as thin line characters. Adjacent to the
-// focused pane they light up so focus is visible.
-const GUTTER: Color = Color::Indexed(238);
-const FOCUSED_GUTTER: Color = Color::Indexed(245);
-// The copy-mode cursor: a light block over the cell, visible on both
-// dark and light text.
-const CURSOR_BG: Color = Color::Indexed(245);
-// Search matches: yellow on black, distinct from the reversed
-// selection highlight. Indexed 11 (bright) rather than 3: dark
-// 256-color themes like Catppuccin render the base 8 as muted tones,
-// so the highlight sank into the surrounding text.
-const SEARCH_BG: Color = Color::Indexed(11);
-// The current search match: magenta on white, visibly distinct from
-// the yellow so the n/N walk is readable. Indexed 13 (bright) for the
-// same reason as SEARCH_BG.
-const CURRENT_HIT_BG: Color = Color::Indexed(13);
 
 /// Selection highlight spans for one pane: (row, first col, last col
 /// inclusive) in text-grid coordinates.
@@ -50,6 +34,7 @@ pub fn draw(
     search: &[(PaneId, SpanList)],
     current: &[(PaneId, SpanList)],
     cursor: Option<(usize, usize)>,
+    theme: &Theme,
 ) {
     for pane in panes {
         let rr = RRect {
@@ -83,14 +68,13 @@ pub fn draw(
             frame,
             p,
             hit_spans,
-            Style::new().fg(Color::Black).bg(SEARCH_BG),
+            Style::new()
+                .fg(theme.palette.search_fg)
+                .bg(theme.palette.search_bg),
         );
     }
-    // The current match paints over the yellow with its own color so
-    // the user can tell which hit the cursor is on. Black text, not
-    // white: bright magenta is a light background, so white on it is
-    // about 3:1 and the black is about 7:1. This also keeps the two
-    // styles to the same foreground.
+    // The current match paints over the search style with its own color
+    // so the user can tell which hit the cursor is on.
     for (pane_id, hit_spans) in current {
         let Some(p) = panes.iter().find(|p| p.id == *pane_id) else {
             continue;
@@ -99,14 +83,16 @@ pub fn draw(
             frame,
             p,
             hit_spans,
-            Style::new().fg(Color::Black).bg(CURRENT_HIT_BG),
+            Style::new()
+                .fg(theme.palette.current_hit_fg)
+                .bg(theme.palette.current_hit_bg),
         );
     }
     if let Some(p) = panes.iter().find(|p| p.id == focused) {
-        paint_cursor(frame, p, cursor);
+        paint_cursor(frame, p, cursor, theme);
     }
-    paint_gutters(frame, panes, focused);
-    draw_hint(frame, hint);
+    paint_gutters(frame, panes, focused, theme);
+    draw_hint(frame, hint, theme);
 }
 
 /// The pane's visible rows as styled ratatui lines. Falls back to plain
@@ -166,7 +152,12 @@ fn run_style(run: &corral_core::emulation::StyledRun) -> Style {
 
 // The copy-mode cursor paints one viewport cell. The pane rect maps
 // the viewport coordinates to screen cells.
-fn paint_cursor(frame: &mut Frame, pane: &PaneState, cursor: Option<(usize, usize)>) {
+fn paint_cursor(
+    frame: &mut Frame,
+    pane: &PaneState,
+    cursor: Option<(usize, usize)>,
+    theme: &Theme,
+) {
     let Some((row, col)) = cursor else {
         return;
     };
@@ -176,8 +167,8 @@ fn paint_cursor(frame: &mut Frame, pane: &PaneState, cursor: Option<(usize, usiz
         return;
     }
     let cell = &mut frame.buffer_mut()[(x, y)];
-    cell.set_bg(CURSOR_BG);
-    cell.set_fg(Color::Black);
+    cell.set_bg(theme.palette.cursor_bg);
+    cell.set_fg(theme.palette.cursor_fg);
 }
 
 /// Every occurrence of `needle` in `text` as highlight spans: one
@@ -259,7 +250,7 @@ const COPY_KEYS: &str = "hjkl move | { } prompt | ctrl+o yank cmd | v select | q
 // on, with the active mode leftmost so it is never the part that gets
 // cut off; in copy mode it also carries the scroll position and the
 // key hints above (including ctrl+o, which has no other affordance).
-fn draw_hint(frame: &mut Frame, hint: Hint) {
+fn draw_hint(frame: &mut Frame, hint: Hint, theme: &Theme) {
     let area = frame.area();
     let row = area.height.saturating_sub(1);
     let text = match hint {
@@ -271,7 +262,9 @@ fn draw_hint(frame: &mut Frame, hint: Hint) {
         Hint::Select => " copy mode select  y yank | esc cancel ".to_string(),
         Hint::Search(needle) => format!(" search: {needle} "),
     };
-    let style = Style::new().fg(Color::Black).bg(Color::Indexed(245));
+    let style = Style::new()
+        .fg(theme.palette.hint_fg)
+        .bg(theme.palette.hint_bg);
     let line = Line::from(vec![Span::styled(text, style)]);
     let para = Paragraph::new(line).style(style);
     frame.render_widget(
@@ -289,7 +282,7 @@ fn draw_hint(frame: &mut Frame, hint: Hint) {
 // covers. Paint it as a vertical or horizontal line character spanning
 // the overlap of the two adjacent panes; it lights when either side is
 // focused. Overlap, not exact alignment, so nested layouts work.
-fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
+fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId, theme: &Theme) {
     for (i, a) in panes.iter().enumerate() {
         for b in &panes[i + 1..] {
             let (ra, rb) = (a.rect, b.rect);
@@ -307,7 +300,11 @@ fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
                 let y1 = (l.y + l.h).min(r.y + r.h);
                 if y1 > y0 && r.x - (l.x + l.w) == 1 {
                     let hot = left.id == focused || right.id == focused;
-                    let style = Style::new().fg(if hot { FOCUSED_GUTTER } else { GUTTER });
+                    let style = Style::new().fg(if hot {
+                        theme.palette.focused_gutter
+                    } else {
+                        theme.palette.gutter
+                    });
                     for y in y0..y1 {
                         frame.buffer_mut()[(gx, y)].set_symbol("│").set_style(style);
                     }
@@ -328,7 +325,11 @@ fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
                 let x1 = (t.x + t.w).min(bo.x + bo.w);
                 if x1 > x0 && bo.y - (t.y + t.h) == 1 {
                     let hot = top.id == focused || bottom.id == focused;
-                    let style = Style::new().fg(if hot { FOCUSED_GUTTER } else { GUTTER });
+                    let style = Style::new().fg(if hot {
+                        theme.palette.focused_gutter
+                    } else {
+                        theme.palette.gutter
+                    });
                     for x in x0..x1 {
                         frame.buffer_mut()[(x, gy)].set_symbol("─").set_style(style);
                     }
@@ -341,6 +342,7 @@ fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Palette;
     use corral_core::tree;
     use ratatui::{Terminal as TuiTerminal, backend::TestBackend};
 
@@ -362,6 +364,28 @@ mod tests {
             pane(1, 0, 0, 50, 10, "pane-one\nsecond line"),
             pane(2, 51, 0, 50, 10, "pane-two"),
         ]
+    }
+
+    // A sentinel per surface, distinct from the bundled theme's real
+    // colors: render tests assert against these fields, not the palette a
+    // theme file happens to carry, so a Catppuccin tweak cannot silently
+    // break a rendering test.
+    fn test_theme() -> Theme {
+        Theme {
+            name: "test".into(),
+            palette: Palette {
+                gutter: Color::Rgb(1, 1, 1),
+                focused_gutter: Color::Rgb(2, 2, 2),
+                cursor_bg: Color::Rgb(3, 3, 3),
+                cursor_fg: Color::Rgb(4, 4, 4),
+                search_bg: Color::Rgb(5, 5, 5),
+                search_fg: Color::Rgb(6, 6, 6),
+                current_hit_bg: Color::Rgb(7, 7, 7),
+                current_hit_fg: Color::Rgb(8, 8, 8),
+                hint_bg: Color::Rgb(9, 9, 9),
+                hint_fg: Color::Rgb(10, 10, 10),
+            },
+        }
     }
 
     fn draw_at(
@@ -397,7 +421,8 @@ mod tests {
     ) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, panes, focused, hint, spans, search, &[], cursor))
+        let theme = test_theme();
+        term.draw(|f| draw(f, panes, focused, hint, spans, search, &[], cursor, &theme))
             .unwrap();
         term.backend().buffer().clone()
     }
@@ -423,7 +448,7 @@ mod tests {
         let panes = panes();
         for focused in [1, 2] {
             let buf = draw_at(101, 10, &panes, focused);
-            assert_eq!(buf[(50, 0)].fg, ratatui::style::Color::Indexed(245));
+            assert_eq!(buf[(50, 0)].fg, test_theme().palette.focused_gutter);
         }
     }
 
@@ -438,8 +463,8 @@ mod tests {
             pane(3, 51, 5, 50, 5, "three"),
         ];
         let buf = draw_at(101, 10, &panes, 3);
-        assert_eq!(buf[(50, 0)].fg, ratatui::style::Color::Indexed(238));
-        assert_eq!(buf[(60, 4)].fg, ratatui::style::Color::Indexed(245));
+        assert_eq!(buf[(50, 0)].fg, test_theme().palette.gutter);
+        assert_eq!(buf[(60, 4)].fg, test_theme().palette.focused_gutter);
         assert_eq!(buf[(60, 4)].symbol(), "─");
     }
 
@@ -454,7 +479,7 @@ mod tests {
             let got = buf[(x, 5)].fg;
             assert_ne!(
                 got,
-                ratatui::style::Color::Indexed(245),
+                test_theme().palette.focused_gutter,
                 "cell ({x},5) fg {got:?}"
             );
         }
@@ -525,7 +550,7 @@ mod tests {
         // pane or gutter is ever expected to draw there.
         for y in 0..9u16 {
             assert_eq!(buf[(50, y)].symbol(), "│");
-            assert_eq!(buf[(50, y)].fg, ratatui::style::Color::Indexed(245));
+            assert_eq!(buf[(50, y)].fg, test_theme().palette.focused_gutter);
         }
     }
 
@@ -534,6 +559,7 @@ mod tests {
         let panes = panes();
         let backend = TestBackend::new(101, 10);
         let mut term = TuiTerminal::new(backend).unwrap();
+        let theme = test_theme();
         term.draw(|f| {
             draw(
                 f,
@@ -544,6 +570,7 @@ mod tests {
                 &[],
                 &[],
                 None,
+                &theme,
             )
         })
         .unwrap();
@@ -559,7 +586,8 @@ mod tests {
         let panes = panes();
         let backend = TestBackend::new(101, 10);
         let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, &panes, 1, Hint::Copy(None), &[], &[], &[], None))
+        let theme = test_theme();
+        term.draw(|f| draw(f, &panes, 1, Hint::Copy(None), &[], &[], &[], None, &theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
         assert!(row(&buf, 9, 101).contains("copy mode"));
@@ -667,7 +695,11 @@ mod tests {
     fn copy_mode_cursor_paints_one_cell() {
         let panes = panes();
         let buf = draw_full(101, 10, &panes, 1, Hint::Copy(None), &[], &[], Some((2, 4)));
-        assert_eq!(buf[(4, 2)].bg, CURSOR_BG, "cursor cell carries its bg");
+        assert_eq!(
+            buf[(4, 2)].bg,
+            test_theme().palette.cursor_bg,
+            "cursor cell carries its bg"
+        );
         assert_eq!(buf[(5, 2)].bg, Color::Reset, "neighbor cells untouched");
     }
 
@@ -736,14 +768,17 @@ mod tests {
     }
 
     #[test]
-    fn search_spans_paint_yellow_in_the_client_style() {
-        // The dedicated search style: bright yellow bg, not reversed.
-        // Pin the index literally: the point of the constant is that
-        // themes remap the base 8, so a symbolic assertion here would
-        // pass whatever value the constant held (S3-5).
-        let style = Style::new().fg(Color::Black).bg(SEARCH_BG);
-        assert_eq!(style.bg, Some(Color::Indexed(11)));
-        assert!(!style.add_modifier.contains(Modifier::REVERSED));
+    fn search_hits_render_in_the_theme_search_color() {
+        // The dedicated search style paints the theme's colors, not
+        // reversed: distinct from a selection span (S3-5, now theme-driven
+        // per S4-5).
+        let panes = panes();
+        let hit_spans = search_spans(&panes[0].text, "pane");
+        let buf = draw_full(101, 10, &panes, 1, Hint::None, &[], &[(1, hit_spans)], None);
+        let theme = test_theme();
+        assert_eq!(buf[(0, 0)].bg, theme.palette.search_bg);
+        assert_eq!(buf[(0, 0)].fg, theme.palette.search_fg);
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -755,12 +790,13 @@ mod tests {
     }
 
     #[test]
-    fn current_hit_paints_magenta_over_the_search_yellow() {
+    fn current_hit_paints_the_theme_color_over_the_search_color() {
         let panes = panes();
         let hit_spans = search_spans(&panes[0].text, "pane");
         let current = current_hit_spans(&panes[0].text, "pane", 0);
         let backend = TestBackend::new(101, 10);
         let mut term = TuiTerminal::new(backend).unwrap();
+        let theme = test_theme();
         term.draw(|f| {
             draw(
                 f,
@@ -771,17 +807,18 @@ mod tests {
                 &[(1, hit_spans)],
                 &[(1, current)],
                 None,
+                &theme,
             )
         })
         .unwrap();
         assert_eq!(
             term.backend().buffer()[(0, 0)].bg,
-            Color::Indexed(13),
-            "the hit the user is on paints bright magenta over the plain search yellow"
+            theme.palette.current_hit_bg,
+            "the hit the user is on paints over the plain search color"
         );
-        // Black, not white: bright magenta is a light background, so
-        // white text on it reads at about 3:1, below the 4.5:1 the
-        // general hit style clears by a wide margin (S3-5).
-        assert_eq!(term.backend().buffer()[(0, 0)].fg, Color::Black);
+        assert_eq!(
+            term.backend().buffer()[(0, 0)].fg,
+            theme.palette.current_hit_fg
+        );
     }
 }

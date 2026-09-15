@@ -4,6 +4,7 @@ mod clipboard;
 mod input;
 mod render;
 mod selection;
+mod theme;
 
 use corral_core::tree::{PaneId, Rect};
 use corrald::protocol::{ClientMsg, PaneState, ServerMsg, WorkspaceInfo};
@@ -192,6 +193,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Resolved before the screen is taken over: a load failure warns on the
+    // plain terminal rather than scrolling under the alternate screen.
+    let theme = theme::Theme::resolve();
+
     let stream = UnixStream::connect(&path)?;
     stream.set_nonblocking(true)?;
     let mut writer = stream.try_clone()?;
@@ -199,7 +204,7 @@ fn main() -> anyhow::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     let _ = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen);
-    let result = run(stream, &mut writer);
+    let result = run(stream, &mut writer, &theme);
     let _ = crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen);
     crossterm::terminal::disable_raw_mode()?;
     result
@@ -214,7 +219,7 @@ fn pane_command() -> (String, Vec<String>) {
     (shell, vec!["-l".into()])
 }
 
-fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
+fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> anyhow::Result<()> {
     send_msg(writer, &ClientMsg::Attach)?;
     // Size the daemon to the real terminal. The daemon answers Attach
     // with the current layout immediately, so this first read tells us
@@ -696,6 +701,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     &search,
                     &current,
                     visible_cursor,
+                    theme,
                 );
                 // Position the real cursor inside the frame. Full-screen
                 // programs manage their own cursor; copy and select mode
