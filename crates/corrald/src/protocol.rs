@@ -100,6 +100,19 @@ pub enum ServerMsg {
         row: usize,
         col: usize,
     },
+    /// Reply to a viewport scroll: how far the pane's viewport actually
+    /// moved, in the same sign convention as `ScrollTarget::Delta`
+    /// (negative is toward history, positive toward the live screen).
+    /// A scroll clamps at either end of the scrollback, so this can be
+    /// smaller than the requested delta, and the frame's `scroll` field
+    /// cannot stand in for it: it collapses the pinned end to `None`.
+    /// Copy mode moves its cursor by the full request, so it needs the
+    /// difference to keep the cursor off the edge the viewport pinned
+    /// against (S3-3).
+    ScrollLanded {
+        pane: PaneId,
+        moved: isize,
+    },
 }
 
 /// One pane's render state. The cursor is None while a full-screen
@@ -276,6 +289,16 @@ mod tests {
             row: 41,
             col: 6,
         };
+        let line = serde_json::to_string(&msg).unwrap();
+        let back: ServerMsg = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn scroll_landed_round_trips_its_signed_move() {
+        // A clamped scroll toward history: the client must be able to
+        // tell this from a full one.
+        let msg = ServerMsg::ScrollLanded { pane: 7, moved: -5 };
         let line = serde_json::to_string(&msg).unwrap();
         let back: ServerMsg = serde_json::from_str(&line).unwrap();
         assert_eq!(back, msg);

@@ -71,6 +71,12 @@ pub enum PaneOut {
         row: usize,
         col: usize,
     },
+    /// Reply to PaneCmd::Scroll: how far the viewport actually moved,
+    /// signed like ScrollTarget::Delta. A clamped scroll moves less.
+    ScrollLanded {
+        pane: PaneId,
+        moved: isize,
+    },
     Exited {
         pane: PaneId,
     },
@@ -138,7 +144,18 @@ fn run_worker(
                     }
                 }
                 PaneCmd::Scroll(target) => {
+                    // Measure the shift with viewport_offset(), which
+                    // reports the real top even when the viewport is
+                    // pinned to the bottom; scroll_position() collapses
+                    // that case to None, so the client cannot recover
+                    // the movement from the frame alone (S3-3).
+                    let before = emu.viewport_offset().unwrap_or(0) as isize;
                     emu.scroll(target);
+                    let after = emu.viewport_offset().unwrap_or(0) as isize;
+                    let _ = out.send(PaneOut::ScrollLanded {
+                        pane: id,
+                        moved: after - before,
+                    });
                     push_snapshot(id, &mut emu, cols, rows, &out);
                 }
                 PaneCmd::Search {
@@ -345,6 +362,7 @@ mod tests {
                 Ok(PaneOut::SearchResult { .. }) => {}
                 Ok(PaneOut::PromptLanded { .. }) => {}
                 Ok(PaneOut::ScrollbackDump { .. }) => {}
+                Ok(PaneOut::ScrollLanded { .. }) => {}
                 Ok(PaneOut::Snapshot { pane, state }) => {
                     assert!(pane == 7 || pane == 9, "unknown pane id {pane}");
                     if state.text.contains("hello") {

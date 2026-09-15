@@ -277,6 +277,12 @@ impl Daemon {
                     // The client moves its copy cursor onto the command.
                     write_msg(writer, &ServerMsg::PromptLanded { pane, row, col })?;
                 }
+                Ok(PaneOut::ScrollLanded { pane, moved }) => {
+                    // Copy mode moves its cursor by the full requested
+                    // delta; it needs the real movement to cancel out
+                    // the part the viewport could not deliver (S3-3).
+                    write_msg(writer, &ServerMsg::ScrollLanded { pane, moved })?;
+                }
                 Ok(PaneOut::Exited { pane }) => {
                     // The worker also reports Exited when its command
                     // channel drops at daemon shutdown; only a live pane
@@ -1273,6 +1279,79 @@ mod tests {
             "bottom shows the latest line again, got {:?}",
             panes[0].text
         );
+        drop(reader);
+    }
+
+    #[test]
+    fn scroll_landed_reports_the_clamped_move_at_the_scrollback_boundary() {
+        let sock = start_daemon("scroll-landed");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        // Short scrollback: 30 lines in a 24-row screen leaves well under
+        // the half-page (12) the client asks for, so a Ctrl+u clamps.
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "seq 1 30; sleep 30".into()],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut reader = BufReader::new(client);
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.text.contains("30") && p.scroll.is_none()),
+            _ => false,
+        })
+        .expect("bottom frame with line 30 and scroll None within 5s");
+
+        // Pinned to the bottom, so the viewport top sits `total` rows up;
+        // a half-page scroll runs out of history before it gets there.
+        send(
+            reader.get_mut(),
+            &ClientMsg::Scroll {
+                target: crate::protocol::ScrollTarget::Delta(-12),
+            },
+        );
+        let landed = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::ScrollLanded { .. }))
+            .expect("ScrollLanded reply within 5s");
+        let ServerMsg::ScrollLanded { moved, .. } = landed else {
+            unreachable!()
+        };
+        let scrolled = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.scroll.is_some()),
+            _ => false,
+        })
+        .expect("scrolled frame with a scroll position within 5s");
+        let ServerMsg::Frame { panes, .. } = scrolled else {
+            unreachable!()
+        };
+        let total = panes[0].scroll.expect("scroll populated").total;
+        assert!(
+            total > 0 && total < 12,
+            "pane needs a scrollback shorter than the half page, got {total}"
+        );
+        assert_eq!(
+            moved,
+            -(total as isize),
+            "a clamped half-page scroll must report the rows it actually moved"
+        );
+
+        // Already at the top: the next half-page scroll moves nothing at
+        // all, and the client learns that rather than assuming a full 12.
+        send(
+            reader.get_mut(),
+            &ClientMsg::Scroll {
+                target: crate::protocol::ScrollTarget::Delta(-12),
+            },
+        );
+        let landed = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::ScrollLanded { .. }))
+            .expect("second ScrollLanded reply within 5s");
+        let ServerMsg::ScrollLanded { moved, .. } = landed else {
+            unreachable!()
+        };
+        assert_eq!(moved, 0, "the viewport cannot move past the top");
         drop(reader);
     }
 
