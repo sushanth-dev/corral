@@ -110,22 +110,33 @@ pub struct PaneState {
     /// The pane requested application cursor keys (DECCKM); the client
     /// then sends arrows as ESC O A..D instead of ESC [ A..D.
     pub app_cursor: bool,
-    /// The viewport's position inside scrollback, `None` when pinned to
-    /// the bottom (live follow). The client shows a position indicator
-    /// from this and stops forwarding arrow keys to the PTY while set.
+    /// This session's viewport position inside scrollback, `None` when
+    /// pinned to the bottom (live follow). The viewport belongs to the
+    /// client, not the daemon: one client scrolling into history leaves
+    /// every other client following the live screen. The client shows a
+    /// position indicator from this and stops forwarding arrow keys to
+    /// the PTY while set.
     pub scroll: Option<ScrollPos>,
+    /// Total scrollback rows in the pane. The daemon clamps a session's
+    /// scroll against this without a round trip to the pane worker, and
+    /// it is also the screen-space row the live screen starts at. Present
+    /// even while live, where `scroll` is `None` and the client still
+    /// needs the range.
+    pub total_scrollback: usize,
     /// The visible screen as styled runs (colors, attributes). Same row
     /// count as `text`; empty means "fall back to plain `text`".
     pub lines: Vec<StyledLine>,
 }
 
-/// Scroll position of one pane's viewport, mirrored from
+/// Scroll position of one session's viewport in one pane, mirrored from
 /// `corral_core::emulation::ScrollPos`.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
 pub struct ScrollPos {
-    /// Rows the viewport top is above the bottom of the active screen.
+    /// The viewport's top row in screen space, `0..=total`. `total` is
+    /// the first row of the live screen.
     pub offset: usize,
-    /// Total scrollback rows.
+    /// Total scrollback rows; the same value as
+    /// `PaneState::total_scrollback`.
     pub total: usize,
 }
 
@@ -206,6 +217,7 @@ mod tests {
                     offset: 12,
                     total: 96,
                 }),
+                total_scrollback: 96,
                 lines: vec![],
             }],
             focused: 1,
@@ -288,6 +300,7 @@ mod tests {
                 cursor: None,
                 app_cursor: false,
                 scroll: None,
+                total_scrollback: 0,
                 lines: vec![StyledLine {
                     runs: vec![
                         StyledRun {
@@ -389,6 +402,7 @@ mod tests {
                 cursor: None,
                 app_cursor: true,
                 scroll: None,
+                total_scrollback: 3,
                 lines: vec![],
             }],
             focused: 1,

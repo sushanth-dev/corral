@@ -352,6 +352,7 @@ mod tests {
             cursor: None,
             app_cursor: false,
             scroll: None,
+            total_scrollback: 0,
             lines: vec![],
         }
     }
