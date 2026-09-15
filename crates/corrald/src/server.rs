@@ -1562,6 +1562,32 @@ mod tests {
             .unwrap_or_else(|| panic!("frame showing {needle} after {label} within 5s"));
         }
 
+        // Jumping up past the first command stays on it rather than
+        // overshooting into the blank space above its marker.
+        send(
+            reader.get_mut(),
+            &ClientMsg::PromptJump {
+                up: true,
+                cursor_row: Some(cursor_row),
+            },
+        );
+        let landed = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::PromptLanded { .. }))
+            .expect("PromptLanded reply within 5s");
+        let ServerMsg::PromptLanded { row: r, .. } = landed else {
+            unreachable!()
+        };
+        assert_eq!(
+            r, cursor_row,
+            "up-jump past the first command must stay put"
+        );
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.scroll.is_some() && p.text.contains("prompt one")),
+            _ => false,
+        })
+        .expect("frame still showing prompt one after the boundary up-jump within 5s");
+
         // Down returns to the next prompt.
         send(
             reader.get_mut(),

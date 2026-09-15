@@ -161,13 +161,18 @@ impl Emulator {
     /// The text of the command whose prompt is the last one at or above
     /// `anchor`: prompt row through the row before the next prompt
     /// (S3-8). `anchor` is a screen-space row; `None` means the bottom
-    /// of scrollback. Prompt rows resolve through `prompt_text_rows`
-    /// so the block starts at the visible prompt, not the blank
-    /// marker row above it.
+    /// of scrollback. Prompt rows resolve through
+    /// `prompt_input_positions` so the block starts at the command's
+    /// real input row, not a decorative wrapper row a themed prompt
+    /// (Tide) draws above it.
     pub fn command_text(&mut self, anchor: Option<usize>) -> Result<String> {
         let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
         let anchor = anchor.unwrap_or(total.saturating_sub(1));
-        let prompts = self.prompt_text_rows()?;
+        let prompts: Vec<usize> = self
+            .prompt_input_positions()?
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect();
         let start = prompts.iter().rev().find(|&&r| r <= anchor).copied();
         let Some(start) = start else {
             return Ok(String::new());
@@ -416,6 +421,34 @@ mod tests {
         assert!(first.contains("cmd 0"), "got {first:?}");
         assert!(first.contains("out 0-4"), "got {first:?}");
         assert!(!first.contains("cmd 1"), "got {first:?}");
+    }
+
+    #[test]
+    fn command_text_excludes_the_wrapper_row_on_themed_prompts() {
+        // Same Tide-style layout as
+        // prompt_input_positions_lands_on_the_command_not_the_wrapper:
+        // command_text must start at the resolved input row, not the
+        // decorative wrapper line under the marker.
+        let mut emu = Emulator::new(80, 24).unwrap();
+        for i in 0..2 {
+            emu.feed(b"\x1b]133;A\x1b\\\r\n");
+            emu.feed(b"almost-a-prompt-wrapper\r\n");
+            emu.feed(b"$ ");
+            emu.feed(b"\x1b]133;B\x1b\\");
+            emu.feed(format!("cmd {i}\r\n").as_bytes());
+            for j in 0..5 {
+                emu.feed(format!("out {i}.{j}\r\n").as_bytes());
+            }
+        }
+        // Anchor at the bottom: the last command's block, so there is
+        // no next prompt to muddy the end boundary.
+        let text = emu.command_text(None).unwrap();
+        assert!(text.contains("cmd 1"), "got {text:?}");
+        assert!(text.contains("out 1.4"), "got {text:?}");
+        assert!(
+            !text.contains("almost-a-prompt-wrapper"),
+            "block must start at the command, not the wrapper row, got {text:?}"
+        );
     }
 
     #[test]

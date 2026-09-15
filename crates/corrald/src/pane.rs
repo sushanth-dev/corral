@@ -203,21 +203,25 @@ fn run_worker(
                         .viewport_offset()
                         .unwrap_or(total.saturating_sub(rows as usize));
                     let anchor = top + cursor_row.unwrap_or(rows as usize - 1);
-                    let target = if up {
-                        prompts.iter().rev().find(|&&(r, _)| r < anchor)
-                    } else {
-                        prompts.iter().find(|&&(r, _)| r > anchor)
-                    };
+                    let target = resolve_prompt_jump(&prompts, anchor, up);
                     let landed = match target {
-                        Some(&(row, col)) => {
+                        Some((row, col)) => {
                             emu.scroll(ScrollTarget::Row(row));
                             Some((row, col))
                         }
-                        None if up => {
-                            // No prompt above: pin to the top like tmux.
-                            emu.scroll(ScrollTarget::Top);
-                            None
-                        }
+                        None if up => match prompts.first() {
+                            // Already on the first command: stay put
+                            // rather than overshooting into blank space
+                            // above it.
+                            Some(&(row, col)) => {
+                                emu.scroll(ScrollTarget::Row(row));
+                                Some((row, col))
+                            }
+                            None => {
+                                emu.scroll(ScrollTarget::Top);
+                                None
+                            }
+                        },
                         None => {
                             // No prompt below: back to the bottom (live).
                             emu.scroll(ScrollTarget::Bottom);
@@ -291,6 +295,16 @@ fn run_worker(
     let _ = out.send(PaneOut::Exited { pane: id });
 }
 
+/// Picks the prompt to jump to from `anchor` (screen-space row) among
+/// `prompts` (resolved command input positions, in row order).
+fn resolve_prompt_jump(prompts: &[(usize, u16)], anchor: usize, up: bool) -> Option<(usize, u16)> {
+    if up {
+        prompts.iter().rev().find(|&&(r, _)| r < anchor).copied()
+    } else {
+        prompts.iter().find(|&&(r, _)| r > anchor).copied()
+    }
+}
+
 fn push_snapshot(id: PaneId, emu: &mut Emulator, cols: u16, rows: u16, out: &Sender<PaneOut>) {
     let scroll = emu
         .scroll_position()
@@ -356,5 +370,26 @@ mod tests {
         assert!(got_hello && got_world, "both snapshots must arrive");
         drop(ca);
         drop(cb);
+    }
+
+    // Tide fixture shape: 3 prompts at rows 2, 10, 18 in a 24-row screen.
+    const TIDE_PROMPTS: [(usize, u16); 3] = [(2, 2), (10, 2), (18, 2)];
+
+    #[test]
+    fn prompt_jump_up_finds_the_nearest_prompt_above_the_anchor() {
+        assert_eq!(resolve_prompt_jump(&TIDE_PROMPTS, 19, true), Some((18, 2)));
+    }
+
+    #[test]
+    fn prompt_jump_up_returns_none_at_the_first_command() {
+        // Anchored on the first command itself: there is no prompt
+        // above it, so the caller must fall back to it (not scroll to
+        // the absolute top, which can overshoot into blank space).
+        assert_eq!(resolve_prompt_jump(&TIDE_PROMPTS, 2, true), None);
+    }
+
+    #[test]
+    fn prompt_jump_down_finds_the_nearest_prompt_below_the_anchor() {
+        assert_eq!(resolve_prompt_jump(&TIDE_PROMPTS, 10, false), Some((18, 2)));
     }
 }
