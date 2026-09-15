@@ -15,11 +15,14 @@ const FOCUSED_GUTTER: Color = Color::Indexed(245);
 // dark and light text.
 const CURSOR_BG: Color = Color::Indexed(245);
 // Search matches: yellow on black, distinct from the reversed
-// selection highlight.
-const SEARCH_BG: Color = Color::Indexed(3);
+// selection highlight. Indexed 11 (bright) rather than 3: dark
+// 256-color themes like Catppuccin render the base 8 as muted tones,
+// so the highlight sank into the surrounding text.
+const SEARCH_BG: Color = Color::Indexed(11);
 // The current search match: magenta on white, visibly distinct from
-// the yellow so the n/N walk is readable.
-const CURRENT_HIT_BG: Color = Color::Indexed(5);
+// the yellow so the n/N walk is readable. Indexed 13 (bright) for the
+// same reason as SEARCH_BG.
+const CURRENT_HIT_BG: Color = Color::Indexed(13);
 
 /// Selection highlight spans for one pane: (row, first col, last col
 /// inclusive) in text-grid coordinates.
@@ -84,7 +87,10 @@ pub fn draw(
         );
     }
     // The current match paints over the yellow with its own color so
-    // the user can tell which hit the cursor is on.
+    // the user can tell which hit the cursor is on. Black text, not
+    // white: bright magenta is a light background, so white on it is
+    // about 3:1 and the black is about 7:1. This also keeps the two
+    // styles to the same foreground.
     for (pane_id, hit_spans) in current {
         let Some(p) = panes.iter().find(|p| p.id == *pane_id) else {
             continue;
@@ -93,7 +99,7 @@ pub fn draw(
             frame,
             p,
             hit_spans,
-            Style::new().fg(Color::White).bg(CURRENT_HIT_BG),
+            Style::new().fg(Color::Black).bg(CURRENT_HIT_BG),
         );
     }
     if let Some(p) = panes.iter().find(|p| p.id == focused) {
@@ -711,9 +717,12 @@ mod tests {
 
     #[test]
     fn search_spans_paint_yellow_in_the_client_style() {
-        // The dedicated search style: yellow bg, not reversed.
+        // The dedicated search style: bright yellow bg, not reversed.
+        // Pin the index literally: the point of the constant is that
+        // themes remap the base 8, so a symbolic assertion here would
+        // pass whatever value the constant held (S3-5).
         let style = Style::new().fg(Color::Black).bg(SEARCH_BG);
-        assert_eq!(style.bg, Some(SEARCH_BG));
+        assert_eq!(style.bg, Some(Color::Indexed(11)));
         assert!(!style.add_modifier.contains(Modifier::REVERSED));
     }
 
@@ -747,8 +756,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             term.backend().buffer()[(0, 0)].bg,
-            CURRENT_HIT_BG,
-            "the hit the user is on paints the active color, not the plain search color"
+            Color::Indexed(13),
+            "the hit the user is on paints bright magenta over the plain search yellow"
         );
+        // Black, not white: bright magenta is a light background, so
+        // white text on it reads at about 3:1, below the 4.5:1 the
+        // general hit style clears by a wide margin (S3-5).
+        assert_eq!(term.backend().buffer()[(0, 0)].fg, Color::Black);
     }
 }

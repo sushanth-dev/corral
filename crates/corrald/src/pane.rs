@@ -30,18 +30,11 @@ pub enum PaneCmd {
     },
     /// Erase the pane's scrollback (S3-6).
     ClearHistory,
-    /// Produce the pane's full scrollback text (S3-7); the reply rides
-    /// PaneOut as a ScrollbackDump the daemon core forwards to the client.
-    DumpScrollback,
     /// Jump the viewport to the previous (up) or next (down) OSC133
     /// prompt row (S3-8). `cursor_row` anchors the walk at the copy
     /// cursor inside the viewport; `None` anchors at the viewport
     /// bottom.
     PromptJump { up: bool, cursor_row: Option<usize> },
-    /// Erase the pane's scrollback and feed `text` back through the
-    /// emulator (S3-7 write-back): the terminal view shows the editor's
-    /// result.
-    LoadScrollback { text: String },
     /// Rebuild and resend the snapshot even if nothing changed.
     #[allow(dead_code)]
     Render,
@@ -59,17 +52,18 @@ pub enum PaneOut {
         rows: Vec<usize>,
         top: usize,
     },
-    /// Reply to PaneCmd::DumpScrollback (S3-7).
-    ScrollbackDump {
-        pane: PaneId,
-        text: String,
-    },
     /// Reply to PaneCmd::PromptJump: the prompt's command text landed
     /// at this row and column inside the viewport.
     PromptLanded {
         pane: PaneId,
         row: usize,
         col: usize,
+    },
+    /// Reply to PaneCmd::Scroll: how far the viewport actually moved,
+    /// signed like ScrollTarget::Delta. A clamped scroll moves less.
+    ScrollLanded {
+        pane: PaneId,
+        moved: isize,
     },
     Exited {
         pane: PaneId,
@@ -138,7 +132,18 @@ fn run_worker(
                     }
                 }
                 PaneCmd::Scroll(target) => {
+                    // Measure the shift with viewport_offset(), which
+                    // reports the real top even when the viewport is
+                    // pinned to the bottom; scroll_position() collapses
+                    // that case to None, so the client cannot recover
+                    // the movement from the frame alone (S3-3).
+                    let before = emu.viewport_offset().unwrap_or(0) as isize;
                     emu.scroll(target);
+                    let after = emu.viewport_offset().unwrap_or(0) as isize;
+                    let _ = out.send(PaneOut::ScrollLanded {
+                        pane: id,
+                        moved: after - before,
+                    });
                     push_snapshot(id, &mut emu, cols, rows, &out);
                 }
                 PaneCmd::Search {
@@ -171,10 +176,6 @@ fn run_worker(
                     // exactly as they are.
                     emu.clear_history();
                     push_snapshot(id, &mut emu, cols, rows, &out);
-                }
-                PaneCmd::DumpScrollback => {
-                    let text = emu.dump_scrollback().unwrap_or_default();
-                    let _ = out.send(PaneOut::ScrollbackDump { pane: id, text });
                 }
                 PaneCmd::PromptJump { up, cursor_row } => {
                     // Command input positions, not raw OSC 133;A marker
@@ -239,24 +240,6 @@ fn run_worker(
                         None => (cursor_row.unwrap_or(rows as usize - 1), 0),
                     };
                     let _ = out.send(PaneOut::PromptLanded { pane: id, row, col });
-                }
-                PaneCmd::LoadScrollback { text } => {
-                    // The editor's result replaces the pane's history:
-                    // erase scrollback, pin to the bottom, and feed the
-                    // text through the emulator so styling and prompt
-                    // markers rebuild from the new content. The rebuilt
-                    // view ends where the dump ended, so nudge the
-                    // shell with a bare Enter: it draws a fresh prompt
-                    // and the user lands back at a usable command line
-                    // without pressing anything.
-                    emu.clear_history();
-                    emu.scroll(ScrollTarget::Bottom);
-                    emu.feed(text.as_bytes());
-                    for reply in emu.take_pty_writes() {
-                        let _ = pty.write_all(&reply);
-                    }
-                    let _ = pty.write_all(b"\r");
-                    push_snapshot(id, &mut emu, cols, rows, &out);
                 }
                 PaneCmd::Render => {
                     push_snapshot(id, &mut emu, cols, rows, &out);
@@ -344,7 +327,7 @@ mod tests {
             match out_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(PaneOut::SearchResult { .. }) => {}
                 Ok(PaneOut::PromptLanded { .. }) => {}
-                Ok(PaneOut::ScrollbackDump { .. }) => {}
+                Ok(PaneOut::ScrollLanded { .. }) => {}
                 Ok(PaneOut::Snapshot { pane, state }) => {
                     assert!(pane == 7 || pane == 9, "unknown pane id {pane}");
                     if state.text.contains("hello") {

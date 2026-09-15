@@ -46,11 +46,6 @@ pub enum ClientMsg {
     },
     /// Erase the focused pane's scrollback (CSI 3 J).
     ClearHistory,
-    /// Dump a pane's full scrollback (S3-7). `None` means the focused
-    /// pane; the reply rides ServerMsg::ScrollbackDump.
-    DumpScrollback {
-        pane: Option<PaneId>,
-    },
     /// Scroll the focused pane's viewport to the previous (up) or next
     /// (down) OSC133 prompt row (S3-8). `cursor_row` is the copy-mode
     /// cursor's row inside the viewport; the anchor is that row, not
@@ -59,12 +54,6 @@ pub enum ClientMsg {
     PromptJump {
         up: bool,
         cursor_row: Option<usize>,
-    },
-    /// Replace a pane's scrollback with edited text (S3-7 write-back):
-    /// the daemon erases the pane's history and feeds `text` through the
-    /// emulator, so the terminal view reflects the editor's changes.
-    LoadScrollback {
-        text: String,
     },
 }
 
@@ -85,12 +74,6 @@ pub enum ServerMsg {
         rows: Vec<usize>,
         top: usize,
     },
-    /// The named pane's full scrollback as plain text (S3-7), one
-    /// screen-space row per line.
-    ScrollbackDump {
-        pane: PaneId,
-        text: String,
-    },
     /// Reply to a prompt jump: the prompt's command text now sits at
     /// this row and column inside the viewport (not the shell theme's
     /// decorative prompt wrapper). The client moves its copy cursor
@@ -99,6 +82,19 @@ pub enum ServerMsg {
         pane: PaneId,
         row: usize,
         col: usize,
+    },
+    /// Reply to a viewport scroll: how far the pane's viewport actually
+    /// moved, in the same sign convention as `ScrollTarget::Delta`
+    /// (negative is toward history, positive toward the live screen).
+    /// A scroll clamps at either end of the scrollback, so this can be
+    /// smaller than the requested delta, and the frame's `scroll` field
+    /// cannot stand in for it: it collapses the pinned end to `None`.
+    /// Copy mode moves its cursor by the full request, so it needs the
+    /// difference to keep the cursor off the edge the viewport pinned
+    /// against (S3-3).
+    ScrollLanded {
+        pane: PaneId,
+        moved: isize,
     },
 }
 
@@ -176,8 +172,6 @@ mod tests {
                 reverse: true,
             },
             ClientMsg::ClearHistory,
-            ClientMsg::DumpScrollback { pane: None },
-            ClientMsg::DumpScrollback { pane: Some(3) },
             ClientMsg::PromptJump {
                 up: true,
                 cursor_row: None,
@@ -185,9 +179,6 @@ mod tests {
             ClientMsg::PromptJump {
                 up: false,
                 cursor_row: Some(11),
-            },
-            ClientMsg::LoadScrollback {
-                text: "edited\nlines".into(),
             },
         ];
         for msg in msgs {
@@ -260,22 +251,22 @@ mod tests {
     }
 
     #[test]
-    fn scrollback_dump_round_trips() {
-        let msg = ServerMsg::ScrollbackDump {
-            pane: 5,
-            text: "line one\nline two\n".into(),
-        };
-        let back: ServerMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
-        assert_eq!(back, msg);
-    }
-
-    #[test]
     fn prompt_landed_round_trips() {
         let msg = ServerMsg::PromptLanded {
             pane: 3,
             row: 41,
             col: 6,
         };
+        let line = serde_json::to_string(&msg).unwrap();
+        let back: ServerMsg = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn scroll_landed_round_trips_its_signed_move() {
+        // A clamped scroll toward history: the client must be able to
+        // tell this from a full one.
+        let msg = ServerMsg::ScrollLanded { pane: 7, moved: -5 };
         let line = serde_json::to_string(&msg).unwrap();
         let back: ServerMsg = serde_json::from_str(&line).unwrap();
         assert_eq!(back, msg);

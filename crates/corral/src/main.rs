@@ -1,11 +1,10 @@
 mod benchmark;
 mod clipboard;
-mod edit;
 mod input;
 mod render;
 mod selection;
 
-use corral_core::tree::PaneId;
+use corral_core::tree::{PaneId, Rect};
 use corrald::protocol::{ClientMsg, PaneState, ServerMsg};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -48,6 +47,41 @@ fn initial_copy_cursor(pane_cursor: Option<(u16, u16)>, height: usize) -> (usize
     }
 }
 
+/// Where to put the terminal's native cursor this frame, or `None` to
+/// leave it hidden. Only input mode positions it: copy and select mode
+/// paint their own cursor cell (`render::paint_cursor` via
+/// `visible_cursor`), so positioning the native cursor as well puts a
+/// second one on screen at the live shell cursor's unrelated spot. The
+/// client-drawn search prompt is the same case.
+fn native_cursor_position(
+    mode: &input::Mode,
+    rect: Rect,
+    pane_cursor: Option<(u16, u16)>,
+) -> Option<(u16, u16)> {
+    if !matches!(mode, input::Mode::Input) {
+        return None;
+    }
+    let (cx, cy) = pane_cursor?;
+    let (x, y) = (rect.x + cx, rect.y + cy);
+    (x < rect.x + rect.w && y < rect.y + rect.h).then_some((x, y))
+}
+
+/// The copy cursor's row after a Ctrl+u/Ctrl+d half-page scroll.
+///
+/// The scroll lands the cursor on the pane's middle row, not where it
+/// started: copy mode's cursor is a reading position on the pane, and
+/// half-page scrolling is only useful if the content just scrolled to
+/// has room above and below it. With scrollback left to travel the
+/// viewport delivers the full request and the cursor sits on that
+/// middle row while the content slides under it. At either end the
+/// viewport clamps, so the cursor takes up the rows it could not
+/// deliver; holding it still there would stick it to the edge the
+/// viewport pinned against (S3-3).
+fn copy_cursor_row_after_half_page_scroll(requested: isize, moved: isize, height: usize) -> usize {
+    let row = (height / 2) as isize + requested - moved;
+    row.clamp(0, height as isize - 1).max(0) as usize
+}
+
 fn send_msg(stream: &mut UnixStream, msg: &ClientMsg) -> anyhow::Result<()> {
     let mut line = serde_json::to_string(msg)?;
     line.push('\n');
@@ -71,32 +105,6 @@ fn send_msg(stream: &mut UnixStream, msg: &ClientMsg) -> anyhow::Result<()> {
     }
     stream.flush()?;
     Ok(())
-}
-
-/// Read one ScrollbackDump reply synchronously, skipping frames that
-/// arrive first. Puts the socket back in nonblocking mode afterwards.
-fn read_dump(reader: &mut std::io::BufReader<UnixStream>) -> anyhow::Result<String> {
-    // The socket runs nonblocking for the main loop; a read timeout on a
-    // nonblocking socket never fires (EAGAIN wins), so restore blocking
-    // mode first or every dump read returns immediately.
-    reader.get_mut().set_nonblocking(false)?;
-    reader
-        .get_mut()
-        .set_read_timeout(Some(Duration::from_secs(5)))?;
-    let text = loop {
-        let mut chunk = String::new();
-        match std::io::BufRead::read_line(reader, &mut chunk) {
-            Ok(0) => anyhow::bail!("daemon closed during scrollback dump"),
-            Ok(_) => {}
-            Err(e) => anyhow::bail!("no scrollback dump within 5s: {e}"),
-        }
-        if let Ok(ServerMsg::ScrollbackDump { text, .. }) = serde_json::from_str(chunk.trim()) {
-            break text;
-        }
-    };
-    reader.get_mut().set_read_timeout(None)?;
-    reader.get_mut().set_nonblocking(true)?;
-    Ok(text)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -187,6 +195,10 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
     // Copy-mode cursor: viewport-relative (row, col). Set on entering
     // copy mode, moved by hjkl, and placed on prompts by PromptLanded.
     let mut copy_cursor: Option<(usize, usize)> = None;
+    // The delta of the half-page scroll awaiting its ScrollLanded reply.
+    // The client applies the reply before reading the next key, so one
+    // slot is enough: nothing can move the cursor in between.
+    let mut copy_scroll_pending: Option<isize> = None;
     // Search prompt state: the needle being typed, and the last submitted
     // needle that n/N repeat.
     let mut search_needle = String::new();
@@ -273,10 +285,26 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                         copy_cursor = Some((row, col));
                     }
                 }
-                ServerMsg::ScrollbackDump { .. } => {
-                    // Only meaningful in the EditScrollback flow, which
-                    // reads the socket directly; anything arriving in the
-                    // normal loop is stale.
+                ServerMsg::ScrollLanded { pane, moved } => {
+                    // Half-page scroll: put the cursor on the pane's
+                    // middle row, less the rows the viewport could not
+                    // follow. The reply always arrives before the next
+                    // key, so the cursor is still where the scroll left
+                    // it.
+                    if pane == focused
+                        && let (Some(requested), Some(cur)) =
+                            (copy_scroll_pending.take(), copy_cursor)
+                    {
+                        let height = panes
+                            .iter()
+                            .find(|p| p.id == pane)
+                            .map(|p| p.rect.h as usize)
+                            .unwrap_or(1);
+                        copy_cursor = Some((
+                            copy_cursor_row_after_half_page_scroll(requested, moved, height),
+                            cur.1,
+                        ));
+                    }
                 }
             }
         }
@@ -301,6 +329,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     mode = input::Mode::Input;
                     selection = None;
                     copy_cursor = None;
+                    copy_scroll_pending = None;
                     search_hits = None;
                     // Leaving copy mode restores live follow at the bottom.
                     send_msg(
@@ -341,20 +370,28 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     send_msg(writer, &ClientMsg::Scroll { target })?;
                     // g/G pin the copy cursor to the new viewport edge.
                     // Ctrl+u/Ctrl+d (Delta) scroll the content under a
-                    // stationary cursor instead, like vim/tmux: the
-                    // cursor's row inside the viewport does not change,
-                    // so it stays centered rather than snapping to an
-                    // edge.
+                    // cursor that lands on the pane's middle row instead:
+                    // with scrollback left to travel the viewport keeps up
+                    // and the cursor holds that row, but at either end the
+                    // viewport clamps and the cursor must take up the
+                    // slack, or it sticks to the pinned edge (S3-3). The
+                    // reply says how far the viewport really moved.
                     let height = focused_pane.map(|p| p.rect.h as usize).unwrap_or(1);
                     match target {
                         corrald::protocol::ScrollTarget::Top => {
+                            copy_scroll_pending = None;
                             copy_cursor = Some((0, copy_cursor.map_or(0, |c| c.1)));
                         }
                         corrald::protocol::ScrollTarget::Bottom => {
+                            copy_scroll_pending = None;
                             copy_cursor = Some((height - 1, copy_cursor.map_or(0, |c| c.1)));
                         }
-                        corrald::protocol::ScrollTarget::Delta(_) => {}
-                        corrald::protocol::ScrollTarget::Row(_) => {}
+                        corrald::protocol::ScrollTarget::Delta(d) => {
+                            copy_scroll_pending = Some(d);
+                        }
+                        corrald::protocol::ScrollTarget::Row(_) => {
+                            copy_scroll_pending = None;
+                        }
                     }
                 }
                 Some(input::Action::BeginSelect(kind)) => {
@@ -461,34 +498,6 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                             cursor_row: copy_cursor.map(|(r, _)| r),
                         },
                     )?;
-                }
-                Some(input::Action::EditScrollback) => {
-                    send_msg(writer, &ClientMsg::DumpScrollback { pane: None })?;
-                    // A failed dump must not kill the client; the session
-                    // stays usable and the error surfaces in the hint line.
-                    let Ok(dump) = read_dump(&mut reader) else {
-                        continue;
-                    };
-                    // Suspend the TUI, hand the dump to the editor, then
-                    // restore; the dump file is deleted inside the flow.
-                    let _ = crossterm::execute!(
-                        std::io::stdout(),
-                        crossterm::terminal::LeaveAlternateScreen
-                    );
-                    crossterm::terminal::disable_raw_mode()?;
-                    let edit_result = edit::edit_scrollback(&dump, &mut edit::spawn_editor);
-                    crossterm::terminal::enable_raw_mode()?;
-                    let _ = crossterm::execute!(
-                        std::io::stdout(),
-                        crossterm::terminal::EnterAlternateScreen
-                    );
-                    // Force a full repaint: the editor scribbled on the
-                    // screen behind ratatui's diff cache.
-                    terminal.clear()?;
-                    last_drawn = None;
-                    if let Ok(edited) = edit_result {
-                        send_msg(writer, &ClientMsg::LoadScrollback { text: edited })?;
-                    }
                 }
                 Some(input::Action::Split(dir)) => {
                     let (cmd, args) = pane_command();
@@ -602,14 +611,12 @@ fn run(stream: UnixStream, writer: &mut UnixStream) -> anyhow::Result<()> {
                     visible_cursor,
                 );
                 // Position the real cursor inside the frame. Full-screen
-                // programs manage their own cursor.
+                // programs manage their own cursor; copy and select mode
+                // paint their own.
                 if let Some(p) = panes.iter().find(|p| p.id == focused)
-                    && let Some((cx, cy)) = p.cursor
+                    && let Some((x, y)) = native_cursor_position(&mode, p.rect, p.cursor)
                 {
-                    let (x, y) = (p.rect.x + cx, p.rect.y + cy);
-                    if x < p.rect.x + p.rect.w && y < p.rect.y + p.rect.h {
-                        f.set_cursor_position(ratatui::layout::Position::new(x, y));
-                    }
+                    f.set_cursor_position(ratatui::layout::Position::new(x, y));
                 }
             })?;
         }
@@ -683,5 +690,60 @@ mod tests {
     #[test]
     fn initial_copy_cursor_falls_back_to_the_viewport_bottom_when_hidden() {
         assert_eq!(initial_copy_cursor(None, 24), (23, 0));
+    }
+
+    #[test]
+    fn half_page_scroll_centers_the_cursor_when_the_viewport_keeps_up() {
+        // 20-row pane, half page 10, plenty of scrollback: the viewport
+        // moves the full 10 and the cursor lands on the middle row,
+        // wherever it was before the scroll.
+        assert_eq!(copy_cursor_row_after_half_page_scroll(-10, -10, 20), 10);
+        assert_eq!(copy_cursor_row_after_half_page_scroll(10, 10, 20), 10);
+    }
+
+    #[test]
+    fn half_page_scroll_moves_the_cursor_by_the_rows_the_viewport_could_not() {
+        // Scrollback shorter than a half page (5 rows against a 10-row
+        // request): the viewport clamps after 5, so the cursor takes the
+        // remaining 5 rather than staying on the middle row.
+        assert_eq!(copy_cursor_row_after_half_page_scroll(-10, -5, 20), 5);
+    }
+
+    #[test]
+    fn half_page_scroll_clamps_the_cursor_inside_the_viewport() {
+        // Ctrl+d at the live prompt: the viewport cannot move at all, so
+        // all 10 rows land on the cursor, which stops at the last row.
+        assert_eq!(copy_cursor_row_after_half_page_scroll(10, 0, 20), 19);
+        // Same at the top edge, going the other way.
+        assert_eq!(copy_cursor_row_after_half_page_scroll(-10, 0, 20), 0);
+    }
+
+    #[test]
+    fn native_cursor_is_positioned_only_in_input_mode() {
+        let rect = Rect {
+            x: 2,
+            y: 3,
+            w: 80,
+            h: 24,
+        };
+        // Input mode: the pane's live shell cursor, offset into the pane's
+        // rect.
+        assert_eq!(
+            native_cursor_position(&input::Mode::Input, rect, Some((4, 5))),
+            Some((6, 8))
+        );
+        // Copy and select mode paint their own cursor cell, so the native
+        // one would show up twice; the search prompt draws its own line.
+        for mode in [
+            input::Mode::Copy,
+            input::Mode::Select(selection::SelectMode::Span),
+            input::Mode::Search,
+        ] {
+            assert_eq!(
+                native_cursor_position(&mode, rect, Some((4, 5))),
+                None,
+                "{mode:?} must not position the native cursor"
+            );
+        }
     }
 }

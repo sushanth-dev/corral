@@ -50,19 +50,6 @@ impl Emulator {
         Ok(hits)
     }
 
-    /// The full scrollback plus active screen as plain text, one
-    /// screen-space row per line (S3-7). This is what the client writes
-    /// to the temp file for $EDITOR.
-    pub fn dump_scrollback(&mut self) -> Result<String> {
-        let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
-        let mut out = String::new();
-        for row in 0..total {
-            out.push_str(&self.row_text(row)?);
-            out.push('\n');
-        }
-        Ok(out)
-    }
-
     /// Screen-space rows whose semantic prompt state is `Prompt` (S3-8).
     /// Shell-integrated shells emit OSC 133 A at each prompt; rows
     /// without markers report `None` and yield no prompt rows.
@@ -145,6 +132,45 @@ impl Emulator {
             out.push(pos);
         }
         Ok(out)
+    }
+
+    /// How many rows above the live cursor belong to the prompt block
+    /// the cursor is inside, and so must survive a history clear.
+    ///
+    /// A themed prompt (Tide) is several rows tall: OSC 133 A marks a
+    /// blank row, then the shell draws its decoration row (directory
+    /// and time) and the input row, all tagged `Prompt` or
+    /// `Continuation` by the VT layer until the next marker. The erase
+    /// stops at the top of that block, so the visible prompt keeps the
+    /// line the user reads it on.
+    ///
+    /// Zero when the cursor's own row is not part of a prompt: a
+    /// running command's output, or a shell that emits no markers. A
+    /// submitted prompt block further up is tagged output by then, so
+    /// neither case preserves anything above the cursor's row.
+    pub(crate) fn prompt_rows_above_live_cursor(&mut self) -> Result<u16> {
+        if !self.terminal.is_cursor_visible()? {
+            return Ok(0);
+        }
+        let cursor_row = self.terminal.scrollback_rows()? + self.terminal.cursor_y()? as usize;
+        let mut block = 0usize;
+        for row in (0..=cursor_row).rev() {
+            let grid = self.terminal.grid_ref(Point::Screen(PointCoordinate {
+                x: 0,
+                y: row as u32,
+            }))?;
+            let prompt = grid.row()?.semantic_prompt()?;
+            if matches!(
+                prompt,
+                libghostty_vt::screen::RowSemanticPrompt::Prompt
+                    | libghostty_vt::screen::RowSemanticPrompt::Continuation
+            ) {
+                block += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(block.saturating_sub(1) as u16)
     }
 
     /// The real PTY cursor's screen-space position, or `None` when it
@@ -287,39 +313,6 @@ mod tests {
         emu.scroll(ScrollTarget::Top);
         let hits = emu.search("NEEDLEMARK", None, false).unwrap();
         assert_eq!(hits.first().copied(), Some(0));
-    }
-
-    #[test]
-    fn dump_scrollback_returns_every_screen_space_row() {
-        // 50 lines into an 80x24 emulator: history plus active screen,
-        // all in order. The grid also carries blank rows (the cursor
-        // line below the last feed), so compare the non-empty lines.
-        let mut emu = marker_emulator();
-        let dump = emu.dump_scrollback().unwrap();
-        let lines: Vec<&str> = dump.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(lines.len(), 50, "every fed line is in the dump");
-        assert!(
-            lines.first().unwrap().contains("NEEDLEMARK line 0"),
-            "top of scrollback first, got {:?}",
-            lines.first().unwrap()
-        );
-        assert!(
-            lines.last().unwrap().contains("plain line 49"),
-            "active screen last, got {:?}",
-            lines.last().unwrap()
-        );
-    }
-
-    #[test]
-    fn dump_scrollback_of_a_fresh_screen_has_no_content() {
-        let mut emu = Emulator::new(80, 24).unwrap();
-        assert!(
-            emu.dump_scrollback()
-                .unwrap()
-                .lines()
-                .all(|l| l.trim().is_empty()),
-            "fresh screen dumps blank rows only"
-        );
     }
 
     #[test]

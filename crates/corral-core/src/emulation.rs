@@ -179,11 +179,50 @@ impl Emulator {
         Ok(self.terminal.mode(libghostty_vt::terminal::Mode::DECCKM)?)
     }
 
-    /// Erase every scrollback line, leaving the active screen untouched
-    /// (CSI 3 J). libghostty has no dedicated call; the VT sequence is
-    /// the documented mechanism (plan Task S3-6 Step 2).
+    /// Erase every scrollback line (CSI 3 J) and, since real terminal
+    /// semantics never touch the visible grid, also clear the visible
+    /// screen of content that scrolled onto it just before the clear
+    /// (plan Task 10). The prompt block - the shell's prompt and any
+    /// in-progress typed command - survives and is left at the top of
+    /// the screen, the position `clear` leaves a shell in.
+    ///
+    /// The block boundary is the top of the prompt block, not the
+    /// cursor's row: a themed prompt (Tide) draws a decoration row above
+    /// the input row the cursor sits on, and erasing up to the cursor
+    /// took that decoration with it. The block height is measured before
+    /// CSI 3 J runs, since the prompt rows are addressed in screen space
+    /// (scrollback plus cursor row) and the clear rebases the screen
+    /// onto an empty scrollback.
+    ///
+    /// The cursor's row comes from `cursor_x`/`cursor_y`, which are
+    /// active-screen relative - the same frame CSI H addresses - so this
+    /// is independent of where the viewport happens to be scrolled.
     pub fn clear_history(&mut self) {
+        let keep_above = self.prompt_rows_above_live_cursor().unwrap_or(0);
         self.terminal.vt_write(b"\x1b[3J");
+        if !self.terminal.is_cursor_visible().unwrap_or(false) {
+            return;
+        }
+        let (Ok(col), Ok(row)) = (self.terminal.cursor_x(), self.terminal.cursor_y()) else {
+            return;
+        };
+        // DELETE LINE from the top of the screen, not a row-by-row
+        // erase: it takes the blank rows above the prompt block away
+        // *and* scrolls the block up to row 1, which is where `clear`
+        // leaves a shell - prompt at the top, clear space under it.
+        // Every row shifts by the same amount, so the shell's model of
+        // where its prompt is (an offset from the cursor) still holds
+        // and its next repaint lands on the block instead of smearing
+        // it. DELETE LINE leaves scrollback alone and resets the cursor
+        // column, so the cursor is placed back on the block's last row
+        // afterwards.
+        let above = row.saturating_sub(keep_above);
+        if above > 0 {
+            self.terminal
+                .vt_write(format!("\x1b[1;1H\x1b[{above}M").as_bytes());
+        }
+        self.terminal
+            .vt_write(format!("\x1b[{};{}H", keep_above + 1, col + 1).as_bytes());
     }
 
     /// Cursor cell position within the viewport, when visible.
@@ -491,7 +530,97 @@ mod tests {
     }
 
     #[test]
-    fn clear_history_empties_scrollback_and_keeps_the_screen() {
+    fn clear_history_moves_the_typed_command_to_the_top_row() {
+        let mut emu = Emulator::new(80, 5).unwrap();
+        for i in 1..=100 {
+            emu.feed(format!("line{i}\r\n").as_bytes());
+        }
+        // A command typed but not yet submitted: the cursor sits on the
+        // visible screen's last row, and that row must survive the clear,
+        // at the top of the screen where `clear` leaves a shell.
+        emu.feed(b"prompt$ cmd");
+        emu.clear_history();
+        assert_eq!(
+            emu.terminal.scrollback_rows().unwrap(),
+            0,
+            "CSI 3 J must still empty the scrollback"
+        );
+        let (cursor_col, cursor_row) = emu.cursor().unwrap().expect("cursor visible");
+        let text = emu.screen_text().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0], "prompt$ cmd",
+            "the typed command must land on the top row, got {lines:?}"
+        );
+        assert_eq!(cursor_row, 0, "the cursor rides up with its row");
+        assert_eq!(cursor_col, 11, "cursor stays where typing left it");
+        for row in lines.iter().skip(1) {
+            assert!(
+                row.is_empty(),
+                "nothing else must survive the clear, got {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_history_keeps_the_themed_prompt_block_and_moves_it_to_the_top() {
+        // Tide draws a two-row prompt: OSC 133 A marks a blank row, the
+        // shell draws a decoration row (directory and time), and the
+        // input row follows with OSC 133 B. Erasing every row above the
+        // cursor's row took the decoration with it, so the visible
+        // prompt lost the line the user reads it on.
+        let mut emu = Emulator::new(80, 5).unwrap();
+        for i in 1..=40 {
+            emu.feed(format!("line{i}\r\n").as_bytes());
+        }
+        emu.feed(b"\x1b]133;A\x1b\\\r\n");
+        emu.feed(b"~/dev 10:29\r\n");
+        emu.feed(b"$ ");
+        emu.feed(b"\x1b]133;B\x1b\\");
+        emu.clear_history();
+        assert_eq!(
+            emu.terminal.scrollback_rows().unwrap(),
+            0,
+            "CSI 3 J must still empty the scrollback"
+        );
+        let text = emu.screen_text().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        // The block keeps its internal shape and sits at the top: the
+        // marker's blank row first, then the decoration, then the input
+        // row with the cursor on it.
+        assert_eq!(
+            lines[0], "",
+            "the marker row leads the block, got {lines:?}"
+        );
+        assert_eq!(
+            lines[1], "~/dev 10:29",
+            "decoration row must survive under the marker, got {lines:?}"
+        );
+        assert!(
+            lines[2].starts_with('$'),
+            "input row must survive, got {lines:?}"
+        );
+        let (cursor_col, cursor_row) = emu.cursor().unwrap().expect("cursor visible");
+        assert_eq!(
+            cursor_row, 2,
+            "the cursor moves with the block onto the input row"
+        );
+        assert_eq!(cursor_col, 2, "cursor stays where typing left it");
+        for row in lines.iter().skip(3) {
+            assert!(
+                row.is_empty(),
+                "nothing but the block must survive, got {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_history_empties_scrollback_and_the_screen_above_the_cursor() {
+        // Contract narrowed by Task 10: the S3-6 acceptance criterion
+        // ("active text is intact") only holds for the cursor's row and
+        // below. Every line fed here ends in `\r\n`, so the cursor sits
+        // on a blank row below "line100" - that row, and everything
+        // above it, is now gone along with the scrollback.
         let mut emu = Emulator::new(80, 5).unwrap();
         for i in 1..=100 {
             emu.feed(format!("line{i}\r\n").as_bytes());
@@ -508,12 +637,11 @@ mod tests {
             0,
             "CSI 3 J must empty the scrollback"
         );
-        // The active screen keeps its last rows; nothing was wiped from it.
         emu.scroll(ScrollTarget::Bottom);
         let text = emu.screen_text().unwrap();
         assert!(
-            text.lines().any(|l| l.contains("line100")),
-            "active screen intact after clear, got {text:?}"
+            !text.contains("line100"),
+            "screen above the (blank) cursor row is erased too, got {text:?}"
         );
     }
 

@@ -207,23 +207,12 @@ impl Daemon {
                     pane.send(PaneCmd::ClearHistory)?;
                 }
             }
-            ClientMsg::DumpScrollback { pane } => {
-                let target = pane.unwrap_or(self.focused);
-                if let Some(p) = self.panes.get(&target) {
-                    p.send(PaneCmd::DumpScrollback)?;
-                }
-            }
             ClientMsg::PromptJump { up, cursor_row } => {
                 if let Some(pane) = self.panes.get(&self.focused) {
                     pane.send(PaneCmd::PromptJump {
                         up: *up,
                         cursor_row: *cursor_row,
                     })?;
-                }
-            }
-            ClientMsg::LoadScrollback { text } => {
-                if let Some(pane) = self.panes.get(&self.focused) {
-                    pane.send(PaneCmd::LoadScrollback { text: text.clone() })?;
                 }
             }
         }
@@ -269,13 +258,15 @@ impl Daemon {
                     // the normal frame cadence.
                     write_msg(writer, &ServerMsg::SearchResult { pane, rows, top })?;
                 }
-                Ok(PaneOut::ScrollbackDump { pane, text }) => {
-                    // Same out-of-band path as the search reply (S3-7).
-                    write_msg(writer, &ServerMsg::ScrollbackDump { pane, text })?;
-                }
                 Ok(PaneOut::PromptLanded { pane, row, col }) => {
                     // The client moves its copy cursor onto the command.
                     write_msg(writer, &ServerMsg::PromptLanded { pane, row, col })?;
+                }
+                Ok(PaneOut::ScrollLanded { pane, moved }) => {
+                    // Copy mode moves its cursor by the full requested
+                    // delta; it needs the real movement to cancel out
+                    // the part the viewport could not deliver (S3-3).
+                    write_msg(writer, &ServerMsg::ScrollLanded { pane, moved })?;
                 }
                 Ok(PaneOut::Exited { pane }) => {
                     // The worker also reports Exited when its command
@@ -1277,6 +1268,79 @@ mod tests {
     }
 
     #[test]
+    fn scroll_landed_reports_the_clamped_move_at_the_scrollback_boundary() {
+        let sock = start_daemon("scroll-landed");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        // Short scrollback: 30 lines in a 24-row screen leaves well under
+        // the half-page (12) the client asks for, so a Ctrl+u clamps.
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), "seq 1 30; sleep 30".into()],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut reader = BufReader::new(client);
+        wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.text.contains("30") && p.scroll.is_none()),
+            _ => false,
+        })
+        .expect("bottom frame with line 30 and scroll None within 5s");
+
+        // Pinned to the bottom, so the viewport top sits `total` rows up;
+        // a half-page scroll runs out of history before it gets there.
+        send(
+            reader.get_mut(),
+            &ClientMsg::Scroll {
+                target: crate::protocol::ScrollTarget::Delta(-12),
+            },
+        );
+        let landed = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::ScrollLanded { .. }))
+            .expect("ScrollLanded reply within 5s");
+        let ServerMsg::ScrollLanded { moved, .. } = landed else {
+            unreachable!()
+        };
+        let scrolled = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.scroll.is_some()),
+            _ => false,
+        })
+        .expect("scrolled frame with a scroll position within 5s");
+        let ServerMsg::Frame { panes, .. } = scrolled else {
+            unreachable!()
+        };
+        let total = panes[0].scroll.expect("scroll populated").total;
+        assert!(
+            total > 0 && total < 12,
+            "pane needs a scrollback shorter than the half page, got {total}"
+        );
+        assert_eq!(
+            moved,
+            -(total as isize),
+            "a clamped half-page scroll must report the rows it actually moved"
+        );
+
+        // Already at the top: the next half-page scroll moves nothing at
+        // all, and the client learns that rather than assuming a full 12.
+        send(
+            reader.get_mut(),
+            &ClientMsg::Scroll {
+                target: crate::protocol::ScrollTarget::Delta(-12),
+            },
+        );
+        let landed = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::ScrollLanded { .. }))
+            .expect("second ScrollLanded reply within 5s");
+        let ServerMsg::ScrollLanded { moved, .. } = landed else {
+            unreachable!()
+        };
+        assert_eq!(moved, 0, "the viewport cannot move past the top");
+        drop(reader);
+    }
+
+    #[test]
     fn search_finds_rows_and_the_viewport_jumps_to_the_first_hit() {
         let sock = start_daemon("search");
         let mut client = UnixStream::connect(&sock).unwrap();
@@ -1364,31 +1428,40 @@ mod tests {
     }
 
     #[test]
-    fn clear_history_empties_scrollback_but_leaves_the_live_screen_alone() {
+    fn clear_history_empties_scrollback_and_clears_the_screen_above_the_cursor() {
         let sock = start_daemon("clear");
         let mut client = UnixStream::connect(&sock).unwrap();
         send(
             &mut client,
             &ClientMsg::CreatePane {
                 cmd: "sh".into(),
-                args: vec!["-c".into(), "seq 1 60; sleep 30".into()],
+                // The trailing `printf` (no newline) leaves unsubmitted
+                // text on the cursor's row, so there is something above
+                // the cursor to erase and something on the cursor's row
+                // that must survive.
+                args: vec!["-c".into(), "seq 1 60; printf prompt-cmd; sleep 30".into()],
                 cwd: "/tmp".into(),
                 dir: Dir::Horizontal,
             },
         );
         let mut reader = BufReader::new(client);
         let bottom = wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("60")),
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.text.contains("60") && p.text.contains("prompt-cmd")),
             _ => false,
         })
-        .expect("bottom frame showing line 60 within 5s");
+        .expect("bottom frame showing line 60 and the prompt row within 5s");
         let ServerMsg::Frame { panes, .. } = bottom else {
             unreachable!()
         };
-        let live_text = panes[0].text.clone();
+        assert!(
+            panes[0].text.contains("59"),
+            "row above the cursor is visible pre-clear, got {:?}",
+            panes[0].text
+        );
 
-        // Scrolled up first so the viewport is not pinned to the bottom;
-        // the clear only touches scrollback, not the copy-mode position.
+        // Scrolled up first so the viewport is not pinned to the bottom.
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
@@ -1403,8 +1476,9 @@ mod tests {
 
         send(reader.get_mut(), &ClientMsg::ClearHistory);
         // Scrolling up now has nothing to reach: with the scrollback gone,
-        // any further Top scroll lands right back on the live screen.
-        // That is the proof the scrollback (not the screen) was cleared.
+        // any further Top scroll lands right back on the live screen. What
+        // it shows is the active screen cleared of everything but the
+        // cursor's row, which moves to the top of the screen.
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
@@ -1412,58 +1486,26 @@ mod tests {
             },
         );
         let settled = wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text == live_text),
+            ServerMsg::Frame { panes, .. } => panes
+                .iter()
+                .any(|p| p.text.contains("prompt-cmd") && !p.text.contains("60")),
             _ => false,
         })
-        .expect("frame back on the live screen within 5s");
+        .expect("frame showing the cleared screen within 5s");
         let ServerMsg::Frame { panes, .. } = settled else {
             unreachable!()
         };
+        assert!(
+            !panes[0].text.contains("59"),
+            "the visible screen above the cursor is erased, got {:?}",
+            panes[0].text
+        );
         assert_eq!(
-            panes[0].text, live_text,
-            "the live screen survives ClearHistory unchanged"
+            panes[0].text.lines().next(),
+            Some("prompt-cmd"),
+            "the prompt row rides up to the top of the screen, got {:?}",
+            panes[0].text
         );
-        drop(reader);
-    }
-
-    #[test]
-    fn dump_scrollback_returns_all_sixty_lines() {
-        let sock = start_daemon("dump");
-        let mut client = UnixStream::connect(&sock).unwrap();
-        send(
-            &mut client,
-            &ClientMsg::CreatePane {
-                cmd: "sh".into(),
-                args: vec!["-c".into(), "seq 1 60; sleep 30".into()],
-                cwd: "/tmp".into(),
-                dir: Dir::Horizontal,
-            },
-        );
-        let mut reader = BufReader::new(client);
-        wait_for_msg(&mut reader, |m| match m {
-            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.text.contains("60")),
-            _ => false,
-        })
-        .expect("bottom frame showing line 60 within 5s");
-
-        send(reader.get_mut(), &ClientMsg::DumpScrollback { pane: None });
-        let reply = wait_for_msg(&mut reader, |m| {
-            matches!(m, ServerMsg::ScrollbackDump { .. })
-        })
-        .expect("ScrollbackDump within 5s");
-        let ServerMsg::ScrollbackDump { pane, text } = reply else {
-            unreachable!()
-        };
-        assert!(pane > 0, "reply names the pane it dumped");
-        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(
-            lines.len(),
-            60,
-            "all 60 lines are in the dump, got {}",
-            lines.len()
-        );
-        assert_eq!(lines.first().copied(), Some("1"), "dump starts at line 1");
-        assert_eq!(lines.last().copied(), Some("60"), "dump ends at line 60");
         drop(reader);
     }
 
