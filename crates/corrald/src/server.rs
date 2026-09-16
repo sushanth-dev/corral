@@ -396,6 +396,22 @@ impl Daemon {
                     },
                 );
             }
+            ClientMsg::FocusPane { pane } => {
+                if self.panes.contains_key(pane) {
+                    self.focused = *pane;
+                }
+            }
+            ClientMsg::SetSplitRatio { at, ratio } => {
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    w: self.cols,
+                    h: self.rows,
+                };
+                if self.root.set_ratio_near(area, *at, *ratio) {
+                    self.reflow_panes();
+                }
+            }
             ClientMsg::ListWorkspaces => {
                 // One workspace per daemon, and the panes are the ones the
                 // daemon is holding. The reply names this daemon, so a
@@ -1017,6 +1033,116 @@ mod tests {
         assert!(
             panes.iter().any(|p| p.id == focused),
             "focused {focused} is not a live pane"
+        );
+        drop(reader);
+        let _ = std::fs::remove_file(dir.join("s.sock"));
+    }
+
+    #[test]
+    fn focus_pane_message_focuses_the_named_pane_directly() {
+        let dir =
+            std::env::temp_dir().join(format!("corral-test-focuspane-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || Daemon::serve(listener).unwrap());
+
+        let mut client = UnixStream::connect(&sock).unwrap();
+        for out in ["one", "two"] {
+            send(
+                &mut client,
+                &ClientMsg::CreatePane {
+                    cmd: "sh".into(),
+                    args: vec!["-c".into(), format!("printf {out}; sleep 2")],
+                    cwd: "/tmp".into(),
+                    dir: Dir::Horizontal,
+                },
+            );
+        }
+        let mut reader = BufReader::new(client);
+        let frame = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.len() == 2,
+            _ => false,
+        })
+        .unwrap();
+        let ServerMsg::Frame { panes, focused } = frame else {
+            unreachable!()
+        };
+        let other = panes
+            .iter()
+            .map(|p| p.id)
+            .find(|&id| id != focused)
+            .unwrap();
+        send(reader.get_mut(), &ClientMsg::FocusPane { pane: other });
+        let frame = wait_for_msg(&mut reader, |m| matches!(m, ServerMsg::Frame { .. }))
+            .expect("frame after focus pane");
+        let ServerMsg::Frame { focused, .. } = frame else {
+            unreachable!()
+        };
+        assert_eq!(focused, other, "click focused the clicked pane directly");
+        drop(reader);
+        let _ = std::fs::remove_file(dir.join("s.sock"));
+    }
+
+    #[test]
+    fn set_split_ratio_message_reflows_the_panes_to_the_new_ratio() {
+        let dir = std::env::temp_dir().join(format!("corral-test-setratio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || Daemon::serve(listener).unwrap());
+
+        let mut client = UnixStream::connect(&sock).unwrap();
+        send(
+            &mut client,
+            &ClientMsg::Resize {
+                cols: 100,
+                rows: 40,
+            },
+        );
+        for out in ["one", "two"] {
+            send(
+                &mut client,
+                &ClientMsg::CreatePane {
+                    cmd: "sh".into(),
+                    args: vec!["-c".into(), format!("printf {out}; sleep 2")],
+                    cwd: "/tmp".into(),
+                    dir: Dir::Horizontal,
+                },
+            );
+        }
+        let mut reader = BufReader::new(client);
+        let frame = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.len() == 2,
+            _ => false,
+        })
+        .unwrap();
+        let ServerMsg::Frame { panes, .. } = frame else {
+            unreachable!()
+        };
+        let left = panes.iter().min_by_key(|p| p.rect.x).unwrap().id;
+
+        send(
+            reader.get_mut(),
+            &ClientMsg::SetSplitRatio {
+                at: left,
+                ratio: 0.75,
+            },
+        );
+        let frame = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.id == left && p.rect.w > 60),
+            _ => false,
+        })
+        .expect("frame with the widened left pane");
+        let ServerMsg::Frame { panes, .. } = frame else {
+            unreachable!()
+        };
+        let left_rect = panes.iter().find(|p| p.id == left).unwrap().rect;
+        assert!(
+            left_rect.w > 60,
+            "left pane should have grown toward 75% of 100 columns, got {left_rect:?}"
         );
         drop(reader);
         let _ = std::fs::remove_file(dir.join("s.sock"));

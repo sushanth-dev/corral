@@ -204,7 +204,9 @@ fn main() -> anyhow::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     let _ = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen);
+    let _ = crossterm::execute!(stdout, crossterm::event::EnableMouseCapture);
     let result = run(stream, &mut writer, &theme);
+    let _ = crossterm::execute!(stdout, crossterm::event::DisableMouseCapture);
     let _ = crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen);
     crossterm::terminal::disable_raw_mode()?;
     result
@@ -304,6 +306,9 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
     // pieces with MemoryClipboard directly.
     let mut clipboard: Box<dyn clipboard::Clipboard> = Box::new(clipboard::SystemClipboard::new());
     let mut leader_armed = false;
+    // The gutter a mouse-down started tracking, if any; carried across
+    // the drag events that follow it.
+    let mut drag: Option<(PaneId, corral_core::tree::Dir, Rect)> = None;
     let mut buf = String::new();
     let mut panes: Vec<PaneState> = Vec::new();
     let mut focused: PaneId = 0;
@@ -407,214 +412,256 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
         let focused_pane = panes.iter().find(|p| p.id == focused);
         let app_cursor = focused_pane.map(|p| p.app_cursor).unwrap_or(false);
         let half_page = focused_pane.map(|p| p.rect.h / 2).unwrap_or(0);
-        if crossterm::event::poll(POLL)?
-            && let crossterm::event::Event::Key(ev) = crossterm::event::read()?
-        {
-            let action = input::handle(ev, &mut leader_armed, &mode, app_cursor, half_page);
-            match action {
-                Some(input::Action::Quit) => break,
-                Some(input::Action::EnterCopy) => {
-                    mode = input::Mode::Copy;
-                    let bottom = focused_pane.map(|p| p.rect.h as usize).unwrap_or(1);
-                    copy_cursor = Some(initial_copy_cursor(
-                        focused_pane.and_then(|p| p.cursor),
-                        bottom,
-                    ));
-                }
-                Some(input::Action::ExitCopy) => {
-                    mode = input::Mode::Input;
-                    selection = None;
-                    copy_cursor = None;
-                    copy_scroll_pending = None;
-                    search_hits = None;
-                    // Leaving copy mode restores live follow at the bottom.
-                    send_msg(
-                        writer,
-                        &ClientMsg::Scroll {
-                            target: corrald::protocol::ScrollTarget::Bottom,
-                        },
-                    )?;
-                }
-                Some(input::Action::CopyCursorMove { drow, dcol }) => {
-                    // Move the viewport cursor; when it pushes past the
-                    // top or bottom edge, drag the viewport with it.
-                    if let (Some(cur), Some(p)) = (copy_cursor.as_mut(), focused_pane) {
-                        let height = p.rect.h as isize;
-                        let width = p.rect.w as isize;
-                        let (r, c) = (cur.0 as isize, cur.1 as isize);
-                        let new_r = (r + drow).clamp(0, height - 1).max(0);
-                        let new_c = (c + dcol).clamp(0, width - 1).max(0);
-                        *cur = (new_r as usize, new_c as usize);
-                        if new_r == 0 && drow < 0 {
+        if crossterm::event::poll(POLL)? {
+            match crossterm::event::read()? {
+                crossterm::event::Event::Mouse(ev) => {
+                    match input::handle_mouse(ev, &panes, &mode, &mut drag) {
+                        Some(input::MouseAction::FocusPane(pane)) => {
+                            send_msg(writer, &ClientMsg::FocusPane { pane })?;
+                        }
+                        Some(input::MouseAction::SetSplitRatio { at, ratio }) => {
+                            send_msg(writer, &ClientMsg::SetSplitRatio { at, ratio })?;
+                        }
+                        Some(input::MouseAction::Scroll(delta)) => {
+                            copy_scroll_pending = Some(delta);
                             send_msg(
                                 writer,
                                 &ClientMsg::Scroll {
-                                    target: corrald::protocol::ScrollTarget::Delta(-1),
+                                    target: corrald::protocol::ScrollTarget::Delta(delta),
                                 },
                             )?;
-                        } else if new_r == height - 1 && drow > 0 {
+                        }
+                        Some(input::MouseAction::EnterCopyThenScroll(delta)) => {
+                            mode = input::Mode::Copy;
+                            let bottom = focused_pane.map(|p| p.rect.h as usize).unwrap_or(1);
+                            copy_cursor = Some(initial_copy_cursor(
+                                focused_pane.and_then(|p| p.cursor),
+                                bottom,
+                            ));
+                            copy_scroll_pending = Some(delta);
                             send_msg(
                                 writer,
                                 &ClientMsg::Scroll {
-                                    target: corrald::protocol::ScrollTarget::Delta(1),
+                                    target: corrald::protocol::ScrollTarget::Delta(delta),
                                 },
                             )?;
                         }
+                        None => {}
                     }
+                    continue;
                 }
-                Some(input::Action::CopyScroll(target)) => {
-                    send_msg(writer, &ClientMsg::Scroll { target })?;
-                    // g/G pin the copy cursor to the new viewport edge.
-                    // Ctrl+u/Ctrl+d (Delta) scroll the content under a
-                    // cursor that lands on the pane's middle row instead:
-                    // with scrollback left to travel the viewport keeps up
-                    // and the cursor holds that row, but at either end the
-                    // viewport clamps and the cursor must take up the
-                    // slack, or it sticks to the pinned edge (S3-3). The
-                    // reply says how far the viewport really moved.
-                    let height = focused_pane.map(|p| p.rect.h as usize).unwrap_or(1);
-                    match target {
-                        corrald::protocol::ScrollTarget::Top => {
+                crossterm::event::Event::Key(ev) => {
+                    let action = input::handle(ev, &mut leader_armed, &mode, app_cursor, half_page);
+                    match action {
+                        Some(input::Action::Quit) => break,
+                        Some(input::Action::EnterCopy) => {
+                            mode = input::Mode::Copy;
+                            let bottom = focused_pane.map(|p| p.rect.h as usize).unwrap_or(1);
+                            copy_cursor = Some(initial_copy_cursor(
+                                focused_pane.and_then(|p| p.cursor),
+                                bottom,
+                            ));
+                        }
+                        Some(input::Action::ExitCopy) => {
+                            mode = input::Mode::Input;
+                            selection = None;
+                            copy_cursor = None;
                             copy_scroll_pending = None;
-                            copy_cursor = Some((0, copy_cursor.map_or(0, |c| c.1)));
+                            search_hits = None;
+                            // Leaving copy mode restores live follow at the bottom.
+                            send_msg(
+                                writer,
+                                &ClientMsg::Scroll {
+                                    target: corrald::protocol::ScrollTarget::Bottom,
+                                },
+                            )?;
                         }
-                        corrald::protocol::ScrollTarget::Bottom => {
-                            copy_scroll_pending = None;
-                            copy_cursor = Some((height - 1, copy_cursor.map_or(0, |c| c.1)));
+                        Some(input::Action::CopyCursorMove { drow, dcol }) => {
+                            // Move the viewport cursor; when it pushes past the
+                            // top or bottom edge, drag the viewport with it.
+                            if let (Some(cur), Some(p)) = (copy_cursor.as_mut(), focused_pane) {
+                                let height = p.rect.h as isize;
+                                let width = p.rect.w as isize;
+                                let (r, c) = (cur.0 as isize, cur.1 as isize);
+                                let new_r = (r + drow).clamp(0, height - 1).max(0);
+                                let new_c = (c + dcol).clamp(0, width - 1).max(0);
+                                *cur = (new_r as usize, new_c as usize);
+                                if new_r == 0 && drow < 0 {
+                                    send_msg(
+                                        writer,
+                                        &ClientMsg::Scroll {
+                                            target: corrald::protocol::ScrollTarget::Delta(-1),
+                                        },
+                                    )?;
+                                } else if new_r == height - 1 && drow > 0 {
+                                    send_msg(
+                                        writer,
+                                        &ClientMsg::Scroll {
+                                            target: corrald::protocol::ScrollTarget::Delta(1),
+                                        },
+                                    )?;
+                                }
+                            }
                         }
-                        corrald::protocol::ScrollTarget::Delta(d) => {
-                            copy_scroll_pending = Some(d);
+                        Some(input::Action::CopyScroll(target)) => {
+                            send_msg(writer, &ClientMsg::Scroll { target })?;
+                            // g/G pin the copy cursor to the new viewport edge.
+                            // Ctrl+u/Ctrl+d (Delta) scroll the content under a
+                            // cursor that lands on the pane's middle row instead:
+                            // with scrollback left to travel the viewport keeps up
+                            // and the cursor holds that row, but at either end the
+                            // viewport clamps and the cursor must take up the
+                            // slack, or it sticks to the pinned edge (S3-3). The
+                            // reply says how far the viewport really moved.
+                            let height = focused_pane.map(|p| p.rect.h as usize).unwrap_or(1);
+                            match target {
+                                corrald::protocol::ScrollTarget::Top => {
+                                    copy_scroll_pending = None;
+                                    copy_cursor = Some((0, copy_cursor.map_or(0, |c| c.1)));
+                                }
+                                corrald::protocol::ScrollTarget::Bottom => {
+                                    copy_scroll_pending = None;
+                                    copy_cursor =
+                                        Some((height - 1, copy_cursor.map_or(0, |c| c.1)));
+                                }
+                                corrald::protocol::ScrollTarget::Delta(d) => {
+                                    copy_scroll_pending = Some(d);
+                                }
+                                corrald::protocol::ScrollTarget::Row(_) => {
+                                    copy_scroll_pending = None;
+                                }
+                            }
                         }
-                        corrald::protocol::ScrollTarget::Row(_) => {
-                            copy_scroll_pending = None;
+                        Some(input::Action::BeginSelect(kind)) => {
+                            // The anchor is the copy cursor: selection starts
+                            // where the user is looking, not the viewport
+                            // top-left. Copy mode always sets a cursor first.
+                            let anchor = copy_cursor.unwrap_or((0, 0));
+                            selection = Some(selection::Selection::start(kind, anchor));
+                            mode = input::Mode::Select(kind);
                         }
+                        Some(input::Action::SelectMove { drow, dcol }) => {
+                            if let (Some(sel), Some(p)) = (selection.as_mut(), focused_pane) {
+                                let grid = selection::Grid::from_text(&p.text);
+                                sel.extend(&grid, drow, dcol);
+                            }
+                        }
+                        Some(input::Action::Yank) => {
+                            if let (Some(sel), Some(p)) = (selection.as_ref(), focused_pane) {
+                                clipboard.set_text(&sel.text(&p.text))?;
+                                selection = None;
+                                mode = input::Mode::Copy;
+                            }
+                        }
+                        Some(input::Action::CancelSelect) => {
+                            selection = None;
+                            mode = input::Mode::Copy;
+                        }
+                        Some(input::Action::BeginSearch)
+                        | Some(input::Action::BeginSearchReverse) => {
+                            search_needle.clear();
+                            // Remember the direction so Enter searches the way
+                            // the prompt was opened; n/N keep repeating it.
+                            search_reverse =
+                                matches!(action, Some(input::Action::BeginSearchReverse));
+                            mode = input::Mode::Search;
+                        }
+                        Some(input::Action::SearchChar(c)) => search_needle.push(c),
+                        Some(input::Action::SearchBackspace) => {
+                            search_needle.pop();
+                        }
+                        Some(input::Action::SearchSubmit) => {
+                            if search_needle.is_empty() {
+                                mode = input::Mode::Copy;
+                            } else {
+                                last_search = Some(search_needle.clone());
+                                last_search_reverse = search_reverse;
+                                // Forward search starts at the top of scrollback
+                                // (first match after /); reverse starts from the
+                                // bottom and walks up (first match above ?).
+                                send_msg(
+                                    writer,
+                                    &ClientMsg::Search {
+                                        needle: search_needle.clone(),
+                                        from: None,
+                                        reverse: search_reverse,
+                                    },
+                                )?;
+                                mode = input::Mode::Copy;
+                            }
+                        }
+                        Some(input::Action::SearchCancel) => mode = input::Mode::Copy,
+                        Some(input::Action::SearchNext) | Some(input::Action::SearchPrev) => {
+                            if let Some(needle) = last_search.as_ref() {
+                                // Resume from the viewport top: the daemon scrolls
+                                // to the next hit at or after that row. n repeats
+                                // in the direction the search was submitted with.
+                                let from = focused_pane.and_then(|p| p.scroll).map(|s| s.offset);
+                                let reverse = if matches!(action, Some(input::Action::SearchNext)) {
+                                    last_search_reverse
+                                } else {
+                                    !last_search_reverse
+                                };
+                                send_msg(
+                                    writer,
+                                    &ClientMsg::Search {
+                                        needle: needle.clone(),
+                                        from,
+                                        reverse,
+                                    },
+                                )?;
+                            }
+                        }
+                        Some(input::Action::Focus(dir)) => {
+                            send_msg(writer, &ClientMsg::Focus { dir })?;
+                        }
+                        Some(input::Action::FocusNext) => {
+                            send_msg(writer, &ClientMsg::FocusNext)?;
+                        }
+                        Some(input::Action::ClearHistory) => {
+                            send_msg(writer, &ClientMsg::ClearHistory)?;
+                        }
+                        Some(input::Action::PromptPrev) => {
+                            send_msg(
+                                writer,
+                                &ClientMsg::PromptJump {
+                                    up: true,
+                                    cursor_row: copy_cursor.map(|(r, _)| r),
+                                },
+                            )?;
+                        }
+                        Some(input::Action::PromptNext) => {
+                            send_msg(
+                                writer,
+                                &ClientMsg::PromptJump {
+                                    up: false,
+                                    cursor_row: copy_cursor.map(|(r, _)| r),
+                                },
+                            )?;
+                        }
+                        Some(input::Action::Split(dir)) => {
+                            let (cmd, args) = pane_command();
+                            let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+                            send_msg(
+                                writer,
+                                &ClientMsg::CreatePane {
+                                    cmd,
+                                    args,
+                                    cwd,
+                                    dir,
+                                },
+                            )?;
+                        }
+                        Some(input::Action::Send(bytes)) => {
+                            send_msg(writer, &ClientMsg::Key { bytes })?;
+                        }
+                        Some(input::Action::ToggleHint) => {
+                            hint_on = !hint_on;
+                        }
+                        None => {}
                     }
                 }
-                Some(input::Action::BeginSelect(kind)) => {
-                    // The anchor is the copy cursor: selection starts
-                    // where the user is looking, not the viewport
-                    // top-left. Copy mode always sets a cursor first.
-                    let anchor = copy_cursor.unwrap_or((0, 0));
-                    selection = Some(selection::Selection::start(kind, anchor));
-                    mode = input::Mode::Select(kind);
-                }
-                Some(input::Action::SelectMove { drow, dcol }) => {
-                    if let (Some(sel), Some(p)) = (selection.as_mut(), focused_pane) {
-                        let grid = selection::Grid::from_text(&p.text);
-                        sel.extend(&grid, drow, dcol);
-                    }
-                }
-                Some(input::Action::Yank) => {
-                    if let (Some(sel), Some(p)) = (selection.as_ref(), focused_pane) {
-                        clipboard.set_text(&sel.text(&p.text))?;
-                        selection = None;
-                        mode = input::Mode::Copy;
-                    }
-                }
-                Some(input::Action::CancelSelect) => {
-                    selection = None;
-                    mode = input::Mode::Copy;
-                }
-                Some(input::Action::BeginSearch) | Some(input::Action::BeginSearchReverse) => {
-                    search_needle.clear();
-                    // Remember the direction so Enter searches the way
-                    // the prompt was opened; n/N keep repeating it.
-                    search_reverse = matches!(action, Some(input::Action::BeginSearchReverse));
-                    mode = input::Mode::Search;
-                }
-                Some(input::Action::SearchChar(c)) => search_needle.push(c),
-                Some(input::Action::SearchBackspace) => {
-                    search_needle.pop();
-                }
-                Some(input::Action::SearchSubmit) => {
-                    if search_needle.is_empty() {
-                        mode = input::Mode::Copy;
-                    } else {
-                        last_search = Some(search_needle.clone());
-                        last_search_reverse = search_reverse;
-                        // Forward search starts at the top of scrollback
-                        // (first match after /); reverse starts from the
-                        // bottom and walks up (first match above ?).
-                        send_msg(
-                            writer,
-                            &ClientMsg::Search {
-                                needle: search_needle.clone(),
-                                from: None,
-                                reverse: search_reverse,
-                            },
-                        )?;
-                        mode = input::Mode::Copy;
-                    }
-                }
-                Some(input::Action::SearchCancel) => mode = input::Mode::Copy,
-                Some(input::Action::SearchNext) | Some(input::Action::SearchPrev) => {
-                    if let Some(needle) = last_search.as_ref() {
-                        // Resume from the viewport top: the daemon scrolls
-                        // to the next hit at or after that row. n repeats
-                        // in the direction the search was submitted with.
-                        let from = focused_pane.and_then(|p| p.scroll).map(|s| s.offset);
-                        let reverse = if matches!(action, Some(input::Action::SearchNext)) {
-                            last_search_reverse
-                        } else {
-                            !last_search_reverse
-                        };
-                        send_msg(
-                            writer,
-                            &ClientMsg::Search {
-                                needle: needle.clone(),
-                                from,
-                                reverse,
-                            },
-                        )?;
-                    }
-                }
-                Some(input::Action::Focus(dir)) => {
-                    send_msg(writer, &ClientMsg::Focus { dir })?;
-                }
-                Some(input::Action::FocusNext) => {
-                    send_msg(writer, &ClientMsg::FocusNext)?;
-                }
-                Some(input::Action::ClearHistory) => {
-                    send_msg(writer, &ClientMsg::ClearHistory)?;
-                }
-                Some(input::Action::PromptPrev) => {
-                    send_msg(
-                        writer,
-                        &ClientMsg::PromptJump {
-                            up: true,
-                            cursor_row: copy_cursor.map(|(r, _)| r),
-                        },
-                    )?;
-                }
-                Some(input::Action::PromptNext) => {
-                    send_msg(
-                        writer,
-                        &ClientMsg::PromptJump {
-                            up: false,
-                            cursor_row: copy_cursor.map(|(r, _)| r),
-                        },
-                    )?;
-                }
-                Some(input::Action::Split(dir)) => {
-                    let (cmd, args) = pane_command();
-                    let cwd = std::env::current_dir()?.to_string_lossy().to_string();
-                    send_msg(
-                        writer,
-                        &ClientMsg::CreatePane {
-                            cmd,
-                            args,
-                            cwd,
-                            dir,
-                        },
-                    )?;
-                }
-                Some(input::Action::Send(bytes)) => {
-                    send_msg(writer, &ClientMsg::Key { bytes })?;
-                }
-                Some(input::Action::ToggleHint) => {
-                    hint_on = !hint_on;
-                }
-                None => {}
+                _ => {}
             }
         }
         let hint = match mode {

@@ -348,6 +348,176 @@ pub fn handle(
     }
 }
 
+/// One thing a mouse event asks for. Distinct from `Action` because a
+/// wheel tick in input mode does two things at once (enter copy mode,
+/// then scroll it), which a single `Action` cannot carry.
+#[derive(Debug, PartialEq)]
+pub enum MouseAction {
+    FocusPane(corral_core::tree::PaneId),
+    SetSplitRatio {
+        at: corral_core::tree::PaneId,
+        ratio: f32,
+    },
+    Scroll(isize),
+    EnterCopyThenScroll(isize),
+}
+
+const WHEEL_DELTA: isize = 3;
+
+/// The pane whose rect contains (col, row), if any.
+fn pane_at(
+    panes: &[corrald::protocol::PaneState],
+    col: u16,
+    row: u16,
+) -> Option<corral_core::tree::PaneId> {
+    panes
+        .iter()
+        .find(|p| {
+            col >= p.rect.x
+                && col < p.rect.x + p.rect.w
+                && row >= p.rect.y
+                && row < p.rect.y + p.rect.h
+        })
+        .map(|p| p.id)
+}
+
+/// Hit-tests a gutter cell: not inside any pane, but bordered by panes on
+/// both sides along one axis. Returns the bordering pane nearest the
+/// origin (the "at" pane the daemon resizes relative to, via
+/// `Node::set_ratio_near`), the split's axis, and the combined rect the
+/// two sides span (used to turn a later drag position into a ratio).
+fn gutter_at(
+    panes: &[corrald::protocol::PaneState],
+    col: u16,
+    row: u16,
+) -> Option<(corral_core::tree::PaneId, Dir, corral_core::tree::Rect)> {
+    let shares_row =
+        |p: &&corrald::protocol::PaneState| row >= p.rect.y && row < p.rect.y + p.rect.h;
+    let left = panes
+        .iter()
+        .filter(shares_row)
+        .find(|p| p.rect.x + p.rect.w == col);
+    let right = panes
+        .iter()
+        .filter(shares_row)
+        .find(|p| p.rect.x == col + 1);
+    if let (Some(l), Some(r)) = (left, right) {
+        let x0 = panes
+            .iter()
+            .filter(|p| p.rect.x + p.rect.w == col)
+            .map(|p| p.rect.x)
+            .min()
+            .unwrap_or(l.rect.x);
+        let x1 = panes
+            .iter()
+            .filter(|p| p.rect.x == col + 1)
+            .map(|p| p.rect.x + p.rect.w)
+            .max()
+            .unwrap_or(r.rect.x + r.rect.w);
+        let y0 = l.rect.y.min(r.rect.y);
+        let y1 = (l.rect.y + l.rect.h).max(r.rect.y + r.rect.h);
+        return Some((
+            l.id,
+            Dir::Horizontal,
+            corral_core::tree::Rect {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            },
+        ));
+    }
+    let shares_col =
+        |p: &&corrald::protocol::PaneState| col >= p.rect.x && col < p.rect.x + p.rect.w;
+    let top = panes
+        .iter()
+        .filter(shares_col)
+        .find(|p| p.rect.y + p.rect.h == row);
+    let bottom = panes
+        .iter()
+        .filter(shares_col)
+        .find(|p| p.rect.y == row + 1);
+    if let (Some(t), Some(b)) = (top, bottom) {
+        let y0 = panes
+            .iter()
+            .filter(|p| p.rect.y + p.rect.h == row)
+            .map(|p| p.rect.y)
+            .min()
+            .unwrap_or(t.rect.y);
+        let y1 = panes
+            .iter()
+            .filter(|p| p.rect.y == row + 1)
+            .map(|p| p.rect.y + p.rect.h)
+            .max()
+            .unwrap_or(b.rect.y + b.rect.h);
+        let x0 = t.rect.x.min(b.rect.x);
+        let x1 = (t.rect.x + t.rect.w).max(b.rect.x + b.rect.w);
+        return Some((
+            t.id,
+            Dir::Vertical,
+            corral_core::tree::Rect {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            },
+        ));
+    }
+    None
+}
+
+/// Dispatches a mouse event: a click focuses the pane under it or starts
+/// tracking a gutter drag, a drag on a tracked gutter yields a ratio
+/// change, and wheel ticks scroll (entering copy mode first if the
+/// client is not there yet, per the plan). `drag` persists the gutter a
+/// button-down started tracking across the following drag events.
+pub fn handle_mouse(
+    ev: crossterm::event::MouseEvent,
+    panes: &[corrald::protocol::PaneState],
+    mode: &Mode,
+    drag: &mut Option<(corral_core::tree::PaneId, Dir, corral_core::tree::Rect)>,
+) -> Option<MouseAction> {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    match ev.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(id) = pane_at(panes, ev.column, ev.row) {
+                *drag = None;
+                return Some(MouseAction::FocusPane(id));
+            }
+            *drag = gutter_at(panes, ev.column, ev.row);
+            None
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let (at, dir, group) = (*drag)?;
+            let ratio = match dir {
+                Dir::Horizontal => {
+                    (ev.column.saturating_sub(group.x)) as f32 / group.w.max(1) as f32
+                }
+                Dir::Vertical => (ev.row.saturating_sub(group.y)) as f32 / group.h.max(1) as f32,
+            };
+            Some(MouseAction::SetSplitRatio {
+                at,
+                ratio: ratio.clamp(0.0, 1.0),
+            })
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            *drag = None;
+            None
+        }
+        MouseEventKind::ScrollUp => Some(scroll_action(mode, -WHEEL_DELTA)),
+        MouseEventKind::ScrollDown => Some(scroll_action(mode, WHEEL_DELTA)),
+        _ => None,
+    }
+}
+
+fn scroll_action(mode: &Mode, delta: isize) -> MouseAction {
+    if *mode == Mode::Input {
+        MouseAction::EnterCopyThenScroll(delta)
+    } else {
+        MouseAction::Scroll(delta)
+    }
+}
+
 // xterm modifier parameter: shift adds 1, alt 2, ctrl 4 (1 = none).
 fn mod_code(m: KeyModifiers) -> u8 {
     1 + u8::from(m.contains(KeyModifiers::SHIFT))
@@ -407,7 +577,7 @@ fn fkey(n: u8, m: KeyModifiers) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEventState};
+    use crossterm::event::{KeyCode, KeyEventState, MouseButton, MouseEventKind};
 
     fn key(code: KeyCode, mods: KeyModifiers) -> crossterm::event::KeyEvent {
         crossterm::event::KeyEvent {
@@ -1288,5 +1458,146 @@ mod tests {
             );
         }
         assert!(!armed, "search mode armed the leader");
+    }
+
+    fn pane_state(
+        id: corral_core::tree::PaneId,
+        rect: corral_core::tree::Rect,
+    ) -> corrald::protocol::PaneState {
+        corrald::protocol::PaneState {
+            id,
+            rect,
+            text: String::new(),
+            cursor: None,
+            app_cursor: false,
+            scroll: None,
+            total_scrollback: 0,
+            lines: vec![],
+            title: String::new(),
+        }
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Two panes side by side, split at column 50 (gutter at 50).
+    fn two_panes() -> Vec<corrald::protocol::PaneState> {
+        vec![
+            pane_state(
+                1,
+                corral_core::tree::Rect {
+                    x: 0,
+                    y: 0,
+                    w: 50,
+                    h: 20,
+                },
+            ),
+            pane_state(
+                2,
+                corral_core::tree::Rect {
+                    x: 51,
+                    y: 0,
+                    w: 49,
+                    h: 20,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn left_click_inside_a_pane_focuses_that_pane() {
+        let panes = two_panes();
+        let mut drag = None;
+        let action = handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, 5),
+            &panes,
+            &Mode::Input,
+            &mut drag,
+        );
+        assert_eq!(action, Some(MouseAction::FocusPane(1)));
+
+        let action = handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 60, 5),
+            &panes,
+            &Mode::Input,
+            &mut drag,
+        );
+        assert_eq!(action, Some(MouseAction::FocusPane(2)));
+    }
+
+    #[test]
+    fn wheel_up_yields_a_scroll_delta() {
+        let panes = two_panes();
+        let mut drag = None;
+        // From input mode, the wheel enters copy mode on its way in.
+        let action = handle_mouse(
+            mouse(MouseEventKind::ScrollUp, 10, 5),
+            &panes,
+            &Mode::Input,
+            &mut drag,
+        );
+        assert_eq!(action, Some(MouseAction::EnterCopyThenScroll(-WHEEL_DELTA)));
+
+        // Already in copy mode, it just scrolls.
+        let action = handle_mouse(
+            mouse(MouseEventKind::ScrollDown, 10, 5),
+            &panes,
+            &Mode::Copy,
+            &mut drag,
+        );
+        assert_eq!(action, Some(MouseAction::Scroll(WHEEL_DELTA)));
+    }
+
+    #[test]
+    fn drag_on_a_gutter_between_two_panes_yields_a_ratio_change() {
+        let panes = two_panes();
+        let mut drag = None;
+        // Mouse-down on the gutter column (50) starts tracking it.
+        let down = handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 50, 5),
+            &panes,
+            &Mode::Input,
+            &mut drag,
+        );
+        assert_eq!(down, None, "a gutter press only arms the drag");
+        assert!(drag.is_some());
+
+        let action = handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 25, 5),
+            &panes,
+            &Mode::Input,
+            &mut drag,
+        );
+        match action {
+            Some(MouseAction::SetSplitRatio { at, ratio }) => {
+                assert_eq!(at, 1, "the ratio setter targets the left pane");
+                assert!(ratio < 0.5, "dragging left of center shrinks the ratio");
+            }
+            other => panic!("expected a SetSplitRatio action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_events_map_the_same_with_mouse_capture_on() {
+        // Mouse support only widens the event match in main.rs's poll
+        // loop; `handle` itself takes no mouse state, so a key event
+        // maps exactly as it did before this task.
+        let mut armed = false;
+        assert_eq!(
+            handle(
+                key(KeyCode::Char('x'), KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Input,
+                false,
+                0
+            ),
+            Some(Action::Send(b"x".to_vec()))
+        );
     }
 }

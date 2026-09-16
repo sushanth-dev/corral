@@ -57,6 +57,17 @@ pub enum ClientMsg {
     },
     /// Ask what is running here. Answers `ServerMsg::WorkspaceList`.
     ListWorkspaces,
+    /// A mouse click landed on this pane; focus it directly, rather than
+    /// stepping there through `Focus`'s direction search.
+    FocusPane {
+        pane: PaneId,
+    },
+    /// A gutter drag moved to this position; set the ratio of the split
+    /// whose immediate child is `at` (see `Node::set_ratio_near`).
+    SetSplitRatio {
+        at: PaneId,
+        ratio: f32,
+    },
 }
 
 /// One attachable workspace, as the picker shows it.
@@ -216,6 +227,8 @@ mod tests {
                 up: false,
                 cursor_row: Some(11),
             },
+            ClientMsg::FocusPane { pane: 3 },
+            ClientMsg::SetSplitRatio { at: 2, ratio: 0.3 },
         ];
         for msg in msgs {
             let line = serde_json::to_string(&msg).unwrap();

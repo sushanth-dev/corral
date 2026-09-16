@@ -37,34 +37,44 @@ impl Node {
     pub fn rects(&self, area: Rect) -> Vec<(PaneId, Rect)> {
         match self {
             Node::Leaf(id) => vec![(*id, area)],
-            Node::Split { dir, ratio, a, b } => match dir {
-                Dir::Horizontal => {
-                    let cut = ((area.w as f32) * ratio).round() as u16;
-                    let lw = cut.saturating_sub(1).max(1);
-                    let rx = area.x + cut;
-                    let rw = area.w.saturating_sub(cut).max(1);
-                    let mut out = a.rects(Rect { w: lw, ..area });
-                    out.extend(b.rects(Rect {
-                        x: rx,
-                        w: rw,
-                        ..area
-                    }));
-                    out
+            Node::Split { dir, ratio, a, b } => {
+                let (area_a, area_b) = split_areas(*dir, *ratio, area);
+                let mut out = a.rects(area_a);
+                out.extend(b.rects(area_b));
+                out
+            }
+        }
+    }
+
+    /// Sets the ratio of the split whose immediate child is the leaf `at`,
+    /// clamped so neither side collapses below one cell in `area` (the
+    /// area this node itself covers). Returns whether such a split was
+    /// found. A leaf touches exactly one immediate parent split, so this
+    /// is the gutter a drag starting on that leaf's border would move; a
+    /// leaf nested deeper on the same side has its own, closer parent
+    /// split, found first since we check direct children before recursing.
+    pub fn set_ratio_near(&mut self, area: Rect, at: PaneId, ratio: f32) -> bool {
+        match self {
+            Node::Leaf(_) => false,
+            Node::Split {
+                dir,
+                ratio: r,
+                a,
+                b,
+            } => {
+                let a_is_at = matches!(**a, Node::Leaf(x) if x == at);
+                let b_is_at = matches!(**b, Node::Leaf(x) if x == at);
+                if a_is_at || b_is_at {
+                    let dim = match dir {
+                        Dir::Horizontal => area.w,
+                        Dir::Vertical => area.h,
+                    };
+                    *r = clamp_ratio(ratio, dim);
+                    return true;
                 }
-                Dir::Vertical => {
-                    let cut = ((area.h as f32) * ratio).round() as u16;
-                    let th = cut.saturating_sub(1).max(1);
-                    let by = area.y + cut;
-                    let bh = area.h.saturating_sub(cut).max(1);
-                    let mut out = a.rects(Rect { h: th, ..area });
-                    out.extend(b.rects(Rect {
-                        y: by,
-                        h: bh,
-                        ..area
-                    }));
-                    out
-                }
-            },
+                let (area_a, area_b) = split_areas(*dir, *r, area);
+                a.set_ratio_near(area_a, at, ratio) || b.set_ratio_near(area_b, at, ratio)
+            }
         }
     }
 
@@ -167,6 +177,50 @@ fn sibling_id(node: &Node) -> Option<PaneId> {
         Node::Leaf(id) => Some(*id),
         _ => None,
     }
+}
+
+/// Cuts `area` into the two sides of a split at `ratio`, leaving a
+/// one-cell gutter between them. Shared by `rects` (tiling for render)
+/// and `set_ratio_near` (finding a nested split's own area to clamp
+/// against), so the two never disagree on where the cut falls.
+fn split_areas(dir: Dir, ratio: f32, area: Rect) -> (Rect, Rect) {
+    match dir {
+        Dir::Horizontal => {
+            let cut = ((area.w as f32) * ratio).round() as u16;
+            let lw = cut.saturating_sub(1).max(1);
+            let rx = area.x + cut;
+            let rw = area.w.saturating_sub(cut).max(1);
+            (
+                Rect { w: lw, ..area },
+                Rect {
+                    x: rx,
+                    w: rw,
+                    ..area
+                },
+            )
+        }
+        Dir::Vertical => {
+            let cut = ((area.h as f32) * ratio).round() as u16;
+            let th = cut.saturating_sub(1).max(1);
+            let by = area.y + cut;
+            let bh = area.h.saturating_sub(cut).max(1);
+            (
+                Rect { h: th, ..area },
+                Rect {
+                    y: by,
+                    h: bh,
+                    ..area
+                },
+            )
+        }
+    }
+}
+
+/// Keeps a ratio from putting either side of a `dim`-cell split below one
+/// cell.
+fn clamp_ratio(ratio: f32, dim: u16) -> f32 {
+    let dim = (dim.max(2)) as f32;
+    ratio.clamp(1.0 / dim, 1.0 - 1.0 / dim)
 }
 
 #[cfg(test)]
@@ -315,6 +369,87 @@ mod tests {
             ]
         );
         assert!(!node.replace(42, Node::leaf(7)));
+    }
+
+    #[test]
+    fn set_ratio_near_updates_the_matching_split() {
+        let mut node = Node::split(
+            Dir::Horizontal,
+            0.5,
+            Box::new(Node::leaf(1)),
+            Box::new(Node::leaf(2)),
+        );
+        assert!(node.set_ratio_near(AREA, 1, 0.25));
+        let rects = node.rects(AREA);
+        assert_eq!(
+            rects[0].1.w, 24,
+            "left pane now gets a quarter, minus the gutter"
+        );
+        // Either leaf on the split identifies the same split.
+        assert!(node.set_ratio_near(AREA, 2, 0.75));
+        let rects = node.rects(AREA);
+        assert_eq!(
+            rects[1].1.w, 25,
+            "right pane now gets a quarter of the area"
+        );
+    }
+
+    #[test]
+    fn set_ratio_near_finds_the_leafs_own_immediate_parent_in_a_nested_tree() {
+        let mut node = Node::split(
+            Dir::Horizontal,
+            0.5,
+            Box::new(Node::leaf(1)),
+            Box::new(Node::split(
+                Dir::Vertical,
+                0.5,
+                Box::new(Node::leaf(2)),
+                Box::new(Node::leaf(3)),
+            )),
+        );
+        // 2's own parent is the inner vertical split, not the outer one.
+        assert!(node.set_ratio_near(AREA, 2, 0.75));
+        let rects = node.rects(AREA);
+        let (_, r1) = rects.iter().find(|(id, _)| *id == 1).unwrap();
+        assert_eq!(r1.w, 50, "the outer split is untouched");
+        let (_, r2) = rects.iter().find(|(id, _)| *id == 2).unwrap();
+        assert!(r2.h > 20, "the inner split moved toward pane 2's ratio");
+    }
+
+    #[test]
+    fn set_ratio_near_returns_false_when_the_pane_is_not_in_the_tree() {
+        let mut node = Node::split(
+            Dir::Horizontal,
+            0.5,
+            Box::new(Node::leaf(1)),
+            Box::new(Node::leaf(2)),
+        );
+        assert!(!node.set_ratio_near(AREA, 42, 0.5));
+    }
+
+    #[test]
+    fn set_ratio_near_clamps_so_neither_side_collapses_below_one_cell() {
+        let mut node = Node::split(
+            Dir::Horizontal,
+            0.5,
+            Box::new(Node::leaf(1)),
+            Box::new(Node::leaf(2)),
+        );
+        let small = Rect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+        };
+        assert!(node.set_ratio_near(small, 1, 0.0));
+        let rects = node.rects(small);
+        assert!(rects[0].1.w >= 1, "left side kept at least one cell");
+        assert!(rects[1].1.w >= 1, "right side kept at least one cell");
+
+        assert!(node.set_ratio_near(small, 1, 1.0));
+        let rects = node.rects(small);
+        assert!(rects[0].1.w >= 1, "left side kept at least one cell");
+        assert!(rects[1].1.w >= 1, "right side kept at least one cell");
     }
 
     #[test]
