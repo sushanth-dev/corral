@@ -1506,7 +1506,6 @@ mod tests {
             scroll: None,
             total_scrollback: 0,
             lines: vec![],
-            title: String::new(),
             pwd: String::new(),
         }
     }

@@ -107,9 +107,7 @@ pub fn draw(
 }
 
 /// The directory the status bar shows: the focused pane's OSC 7 working
-/// directory, empty when the pane has not reported one. A pane's title is
-/// deliberately not a fallback, since nothing keeps it in step with the
-/// cwd and it can be any string the program inside sent.
+/// directory, empty when the pane has not reported one.
 fn pane_dir(pane: Option<&PaneState>) -> &str {
     pane.map(|p| p.pwd.as_str()).unwrap_or("")
 }
@@ -626,7 +624,6 @@ mod tests {
             scroll: None,
             total_scrollback: 0,
             lines: vec![],
-            title: String::new(),
             pwd: String::new(),
         }
     }
@@ -817,19 +814,6 @@ mod tests {
         let bar = row(&buf, 9, 101);
         assert!(bar.starts_with("corral-test | "), "got {bar:?}");
         assert!(bar.contains("~/D/app"), "got {bar:?}");
-        assert!(bar.ends_with(" | 14:23 16-Sep-26"), "got {bar:?}");
-    }
-
-    #[test]
-    fn the_bar_shows_no_pane_title_even_with_no_directory_to_show() {
-        let mut panes = panes();
-        panes[0].title = "demo-title".into();
-        let buf = draw_at(101, 10, &panes, 1);
-        let bar = row(&buf, 9, 101);
-        assert!(!bar.contains("demo-title"), "got {bar:?}");
-        // A pane reports a title far more often than a directory, so the
-        // zones either side of it have to stand without one.
-        assert!(bar.starts_with("corral-test | "), "got {bar:?}");
         assert!(bar.ends_with(" | 14:23 16-Sep-26"), "got {bar:?}");
     }
 
