@@ -30,6 +30,7 @@ pub fn draw(
     panes: &[PaneState],
     focused: PaneId,
     hint: Hint,
+    hint_on: bool,
     spans: &[(PaneId, SpanList)],
     search: &[(PaneId, SpanList)],
     current: &[(PaneId, SpanList)],
@@ -93,7 +94,7 @@ pub fn draw(
     }
     paint_gutters(frame, panes, focused, theme);
     paint_title(frame, panes, focused, theme);
-    draw_hint(frame, hint, theme);
+    draw_hint(frame, hint, hint_on, theme);
 }
 
 /// The focused pane's title (S4-3, OSC 0/2), overlaid on its own top-left
@@ -265,24 +266,31 @@ fn paint_spans(frame: &mut Frame, pane: &PaneState, spans: &SpanList, style: Sty
 // Key hints shown alongside "copy mode": the client reserves the last
 // terminal row for this bar (see the client's initial Resize), so it
 // always has somewhere to draw and never gets overwritten by pane
-// content.
+// content. This is the copy map the copy-mode hint lists.
 const COPY_KEYS: &str = "hjkl move | { } prompt | ctrl+o yank cmd | v select | q exit";
 
 // One status row on the last screen line, over everything else. Always
 // on, with the active mode leftmost so it is never the part that gets
 // cut off; in copy mode it also carries the scroll position and the
 // key hints above (including ctrl+o, which has no other affordance).
-fn draw_hint(frame: &mut Frame, hint: Hint, theme: &Theme) {
+// `hint_on` is the leader's `t` toggle: the row stays reserved either
+// way (reclaiming it would resize every pane and reflow their PTYs on
+// each toggle), it just renders empty when off.
+fn draw_hint(frame: &mut Frame, hint: Hint, hint_on: bool, theme: &Theme) {
     let area = frame.area();
     let row = area.height.saturating_sub(1);
-    let text = match hint {
-        Hint::None => " input mode  ctrl+a leader ".to_string(),
-        Hint::Copy(None) => format!(" copy mode  {COPY_KEYS} "),
-        Hint::Copy(Some((offset, total))) => {
-            format!(" copy mode {offset}/{total}  {COPY_KEYS} ")
+    let text = if !hint_on {
+        String::new()
+    } else {
+        match hint {
+            Hint::None => format!(" input mode  ctrl+a: {} ", crate::input::leader_hint()),
+            Hint::Copy(None) => format!(" copy mode  {COPY_KEYS} "),
+            Hint::Copy(Some((offset, total))) => {
+                format!(" copy mode {offset}/{total}  {COPY_KEYS} ")
+            }
+            Hint::Select => " copy mode select  y yank | esc cancel ".to_string(),
+            Hint::Search(needle) => format!(" search: {needle} "),
         }
-        Hint::Select => " copy mode select  y yank | esc cancel ".to_string(),
-        Hint::Search(needle) => format!(" search: {needle} "),
     };
     let style = Style::new()
         .fg(theme.palette.hint_fg)
@@ -445,8 +453,21 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut term = TuiTerminal::new(backend).unwrap();
         let theme = test_theme();
-        term.draw(|f| draw(f, panes, focused, hint, spans, search, &[], cursor, &theme))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                panes,
+                focused,
+                hint,
+                true,
+                spans,
+                search,
+                &[],
+                cursor,
+                &theme,
+            )
+        })
+        .unwrap();
         term.backend().buffer().clone()
     }
 
@@ -627,6 +648,7 @@ mod tests {
                 &panes,
                 1,
                 Hint::Copy(Some((12, 96))),
+                true,
                 &[],
                 &[],
                 &[],
@@ -648,11 +670,57 @@ mod tests {
         let backend = TestBackend::new(101, 10);
         let mut term = TuiTerminal::new(backend).unwrap();
         let theme = test_theme();
-        term.draw(|f| draw(f, &panes, 1, Hint::Copy(None), &[], &[], &[], None, &theme))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &panes,
+                1,
+                Hint::Copy(None),
+                true,
+                &[],
+                &[],
+                &[],
+                None,
+                &theme,
+            )
+        })
+        .unwrap();
         let buf = term.backend().buffer().clone();
         assert!(row(&buf, 9, 101).contains("copy mode"));
         assert!(!row(&buf, 9, 101).contains("/"));
+    }
+
+    #[test]
+    fn input_mode_hint_lists_every_leader_binding_from_the_table() {
+        let panes = panes();
+        let buf = draw_full(200, 10, &panes, 1, Hint::None, &[], &[], None);
+        let bottom = row(&buf, 9, 200);
+        assert!(bottom.contains("input mode"));
+        assert!(bottom.contains(&crate::input::leader_hint()));
+    }
+
+    #[test]
+    fn toggling_the_hint_off_hides_the_text_but_keeps_the_row_reserved() {
+        let panes = panes();
+        let backend = TestBackend::new(101, 10);
+        let mut term = TuiTerminal::new(backend).unwrap();
+        let theme = test_theme();
+        term.draw(|f| draw(f, &panes, 1, Hint::None, false, &[], &[], &[], None, &theme))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(
+            !row(&buf, 9, 101).contains("input mode"),
+            "hint text must not render when off"
+        );
+        assert_eq!(
+            buf.area.height, 10,
+            "the last row stays reserved, not reclaimed"
+        );
+        // Toggled back on, the same draw call fills it in again.
+        term.draw(|f| draw(f, &panes, 1, Hint::None, true, &[], &[], &[], None, &theme))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(row(&buf, 9, 101).contains("input mode"));
     }
 
     #[test]
@@ -864,6 +932,7 @@ mod tests {
                 &panes,
                 1,
                 Hint::None,
+                true,
                 &[],
                 &[(1, hit_spans)],
                 &[(1, current)],

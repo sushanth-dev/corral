@@ -69,6 +69,111 @@ pub enum Action {
     PromptNext,
     /// Leader `o`: move focus to the next pane, wrapping.
     FocusNext,
+    /// Leader `t`: show or hide the hint bar.
+    ToggleHint,
+}
+
+/// One entry in the leader table: the key after Ctrl+a, its description
+/// for the hint bar, and the action it dispatches. A single table backs
+/// both, so the hint can never list a binding `leader_action` does not
+/// also produce.
+struct LeaderEntry {
+    code: KeyCode,
+    description: &'static str,
+    action: fn() -> Action,
+}
+
+const LEADER_TABLE: &[LeaderEntry] = &[
+    LeaderEntry {
+        code: KeyCode::Char('h'),
+        description: "h/l focus",
+        action: || Action::Focus(Dir::Horizontal),
+    },
+    LeaderEntry {
+        code: KeyCode::Char('l'),
+        description: "h/l focus",
+        action: || Action::Focus(Dir::Horizontal),
+    },
+    LeaderEntry {
+        code: KeyCode::Char('j'),
+        description: "j/k focus",
+        action: || Action::Focus(Dir::Vertical),
+    },
+    LeaderEntry {
+        code: KeyCode::Char('k'),
+        description: "j/k focus",
+        action: || Action::Focus(Dir::Vertical),
+    },
+    // tmux geometry: % splits right (side by side, cut in width =
+    // Dir::Horizontal here), " splits below (stacked = Dir::Vertical).
+    LeaderEntry {
+        code: KeyCode::Char('%'),
+        description: "% split right",
+        action: || Action::Split(Dir::Horizontal),
+    },
+    LeaderEntry {
+        code: KeyCode::Char('"'),
+        description: "\" split down",
+        action: || Action::Split(Dir::Vertical),
+    },
+    LeaderEntry {
+        code: KeyCode::Char('o'),
+        description: "o next pane",
+        action: || Action::FocusNext,
+    },
+    LeaderEntry {
+        code: KeyCode::Left,
+        description: "h/l focus",
+        action: || Action::Focus(Dir::Horizontal),
+    },
+    LeaderEntry {
+        code: KeyCode::Right,
+        description: "h/l focus",
+        action: || Action::Focus(Dir::Horizontal),
+    },
+    LeaderEntry {
+        code: KeyCode::Up,
+        description: "j/k focus",
+        action: || Action::Focus(Dir::Vertical),
+    },
+    LeaderEntry {
+        code: KeyCode::Down,
+        description: "j/k focus",
+        action: || Action::Focus(Dir::Vertical),
+    },
+    LeaderEntry {
+        code: KeyCode::Char('['),
+        description: "[ copy mode",
+        action: || Action::EnterCopy,
+    },
+    LeaderEntry {
+        code: KeyCode::Char('c'),
+        description: "c clear history",
+        action: || Action::ClearHistory,
+    },
+    LeaderEntry {
+        code: KeyCode::Char('d'),
+        description: "d quit",
+        action: || Action::Quit,
+    },
+    LeaderEntry {
+        code: KeyCode::Char('t'),
+        description: "t toggle hint",
+        action: || Action::ToggleHint,
+    },
+];
+
+/// The input-mode hint text: every leader binding's description, in
+/// table order, with duplicates (h/l and the arrows both focus) folded
+/// into one entry.
+pub fn leader_hint() -> String {
+    let mut descriptions: Vec<&'static str> = Vec::new();
+    for entry in LEADER_TABLE {
+        if !descriptions.contains(&entry.description) {
+            descriptions.push(entry.description);
+        }
+    }
+    descriptions.join(" | ")
 }
 
 // The Ctrl+a leader is the only key corral consumes in input mode. In
@@ -80,27 +185,11 @@ pub enum Action {
 
 /// The shared leader table: the key after Ctrl+a. Used by input mode
 /// and, since the leader arms there too, by copy mode.
-fn leader_action(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
-    match (code, mods) {
-        (KeyCode::Char('h'), _) => Some(Action::Focus(Dir::Horizontal)),
-        (KeyCode::Char('l'), _) => Some(Action::Focus(Dir::Horizontal)),
-        (KeyCode::Char('j'), _) => Some(Action::Focus(Dir::Vertical)),
-        (KeyCode::Char('k'), _) => Some(Action::Focus(Dir::Vertical)),
-        // tmux geometry: % splits right (side by side, cut in width =
-        // Dir::Horizontal here), " splits below (stacked =
-        // Dir::Vertical).
-        (KeyCode::Char('%'), _) => Some(Action::Split(Dir::Horizontal)),
-        (KeyCode::Char('"'), _) => Some(Action::Split(Dir::Vertical)),
-        (KeyCode::Char('o'), _) => Some(Action::FocusNext),
-        (KeyCode::Left, _) => Some(Action::Focus(Dir::Horizontal)),
-        (KeyCode::Right, _) => Some(Action::Focus(Dir::Horizontal)),
-        (KeyCode::Up, _) => Some(Action::Focus(Dir::Vertical)),
-        (KeyCode::Down, _) => Some(Action::Focus(Dir::Vertical)),
-        (KeyCode::Char('['), _) => Some(Action::EnterCopy),
-        (KeyCode::Char('c'), _) => Some(Action::ClearHistory),
-        (KeyCode::Char('d'), _) => Some(Action::Quit),
-        _ => None,
-    }
+fn leader_action(code: KeyCode, _mods: KeyModifiers) -> Option<Action> {
+    LEADER_TABLE
+        .iter()
+        .find(|entry| entry.code == code)
+        .map(|entry| (entry.action)())
 }
 
 pub fn handle(
@@ -751,6 +840,9 @@ mod tests {
                 matches!(a, Action::ClearHistory)
             }),
             (KeyCode::Char('d'), |a: &Action| matches!(a, Action::Quit)),
+            (KeyCode::Char('t'), |a: &Action| {
+                matches!(a, Action::ToggleHint)
+            }),
         ];
         for (code, check) in cases {
             let mut armed = false;
@@ -772,6 +864,41 @@ mod tests {
             assert!(check(&action), "{code:?} produced {action:?}");
             assert!(!armed, "{code:?} left the leader armed");
         }
+    }
+
+    #[test]
+    fn leader_hint_lists_every_binding_from_the_table_once() {
+        let hint = leader_hint();
+        for description in [
+            "h/l focus",
+            "j/k focus",
+            "% split right",
+            "\" split down",
+            "o next pane",
+            "[ copy mode",
+            "c clear history",
+            "d quit",
+            "t toggle hint",
+        ] {
+            assert!(
+                hint.contains(description),
+                "hint {hint:?} is missing {description:?}"
+            );
+        }
+        // h/l and the arrows share one description; it must not repeat.
+        assert_eq!(
+            hint.matches("h/l focus").count(),
+            1,
+            "hint {hint:?} must fold h/l and the arrows into one entry"
+        );
+    }
+
+    #[test]
+    fn leader_then_t_toggles_the_hint() {
+        assert!(matches!(
+            leader_then(KeyCode::Char('t'), KeyModifiers::NONE),
+            Some(Action::ToggleHint)
+        ));
     }
 
     #[test]

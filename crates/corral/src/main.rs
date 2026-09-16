@@ -279,6 +279,9 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut mode = input::Mode::Input;
+    // Toggled by the leader's `t`; the hint's reserved row stays on
+    // screen either way (see render::draw_hint).
+    let mut hint_on = true;
     let mut selection: Option<selection::Selection> = None;
     // Copy-mode cursor: viewport-relative (row, col). Set on entering
     // copy mode, moved by hjkl, and placed on prompts by PromptLanded.
@@ -313,6 +316,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
         Vec<PaneState>,
         PaneId,
         render::Hint,
+        bool,
         Option<(usize, usize)>,
         Option<(usize, usize)>,
         Option<(PaneId, Vec<usize>, usize)>,
@@ -607,6 +611,9 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
                 Some(input::Action::Send(bytes)) => {
                     send_msg(writer, &ClientMsg::Key { bytes })?;
                 }
+                Some(input::Action::ToggleHint) => {
+                    hint_on = !hint_on;
+                }
                 None => {}
             }
         }
@@ -661,6 +668,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
                 panes.clone(),
                 focused,
                 hint.clone(),
+                hint_on,
                 sel_cursor,
                 visible_cursor,
                 search_hits.clone(),
@@ -670,6 +678,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
                 panes.clone(),
                 focused,
                 hint.clone(),
+                hint_on,
                 sel_cursor,
                 visible_cursor,
                 search_hits.clone(),
@@ -697,6 +706,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
                     &panes,
                     focused,
                     hint,
+                    hint_on,
                     &spans,
                     &search,
                     &current,
