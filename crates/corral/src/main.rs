@@ -484,8 +484,11 @@ fn run(
                             // that follows says whether it got there. The
                             // cursor is left where the wheel found it: the
                             // mid-row repositioning belongs to the half-page
-                            // keys, not to every tick.
-                            exit_copy_when_live = delta > 0;
+                            // keys, not to every tick. Scoped to the pane the
+                            // wheel actually hit, so a tick over an
+                            // unfocused pane cannot exit copy mode on the
+                            // focused one.
+                            exit_copy_when_live = delta > 0 && pane == focused;
                             send_msg(
                                 writer,
                                 &ClientMsg::Scroll {
