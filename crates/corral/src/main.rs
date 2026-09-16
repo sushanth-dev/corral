@@ -298,10 +298,14 @@ fn run(
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut mode = input::Mode::Input;
-    // The leader's `t` shortcut: on, the status bar's middle carries the
-    // active mode's keymap instead of the working directory. Off by
-    // default, since the directory is what the bar is for.
-    let mut keys_on = false;
+    // The leader's `t` shortcut opens the keymap dialogue over the panes.
+    // Off by default: it is something to consult, not something to sit in
+    // front of.
+    let mut keymaps = false;
+    // The status bar shortens the pane's directory against `$HOME`, so a
+    // path under home reads as `~`. Read once, since the environment does
+    // not change under us.
+    let home = std::env::var("HOME").unwrap_or_default();
     // The status bar's clock, re-read at most once per its refresh window
     // so the render stays free of the wall clock.
     let mut clock = clock::Clock::new();
@@ -344,7 +348,8 @@ fn run(
     // The selection cursor joins the diff key: a SelectMove changes no
     // pane state but must repaint the highlight. The clock's text joins
     // it for the same reason, so the bar's minute advances on an
-    // otherwise idle screen.
+    // otherwise idle screen. The bool is the keymap dialogue's state; its
+    // contents derive from the hint already in the key.
     type FrameKey = (
         Vec<PaneState>,
         PaneId,
@@ -461,6 +466,11 @@ fn run(
         if crossterm::event::poll(POLL)? {
             match crossterm::event::read()? {
                 crossterm::event::Event::Mouse(ev) => {
+                    // The dialogue is modal: a click or a wheel tick while
+                    // it is up would act on a pane the user cannot see.
+                    if keymaps {
+                        continue;
+                    }
                     match input::handle_mouse(ev, &panes, &mode, focused, &mut drag) {
                         Some(input::MouseAction::FocusPane(pane)) => {
                             send_msg(writer, &ClientMsg::FocusPane { pane })?;
@@ -507,7 +517,15 @@ fn run(
                     // follow its tick; a keystroke in between means the
                     // user is doing something else.
                     exit_copy_when_live = false;
-                    let action = input::handle(ev, &mut leader_armed, &mode, app_cursor, half_page);
+                    // The dialogue is modal: any key closes it and reaches
+                    // nothing else, so a key pressed while reading the list
+                    // cannot also act on the session.
+                    let action = if keymaps {
+                        keymaps = false;
+                        None
+                    } else {
+                        input::handle(ev, &mut leader_armed, &mode, app_cursor, half_page)
+                    };
                     match action {
                         Some(input::Action::Quit) => break,
                         Some(input::Action::EnterCopy) => {
@@ -721,7 +739,7 @@ fn run(
                             send_msg(writer, &ClientMsg::Key { bytes })?;
                         }
                         Some(input::Action::ToggleHint) => {
-                            keys_on = !keys_on;
+                            keymaps = !keymaps;
                         }
                         None => {}
                     }
@@ -781,7 +799,7 @@ fn run(
                 panes.clone(),
                 focused,
                 hint.clone(),
-                keys_on,
+                keymaps,
                 sel_cursor,
                 visible_cursor,
                 search_hits.clone(),
@@ -792,7 +810,7 @@ fn run(
                 panes.clone(),
                 focused,
                 hint.clone(),
-                keys_on,
+                keymaps,
                 sel_cursor,
                 visible_cursor,
                 search_hits.clone(),
@@ -821,12 +839,13 @@ fn run(
                     &panes,
                     focused,
                     hint,
-                    keys_on,
+                    keymaps,
                     &spans,
                     &search,
                     &current,
                     visible_cursor,
                     workspace,
+                    &home,
                     &clock_text,
                     theme,
                 );

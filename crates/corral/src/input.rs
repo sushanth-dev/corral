@@ -69,14 +69,15 @@ pub enum Action {
     PromptNext,
     /// Leader `o`: move focus to the next pane, wrapping.
     FocusNext,
-    /// Leader `t`: show or hide the hint bar.
+    /// Leader `t`: open the keymap dialogue.
     ToggleHint,
 }
 
 /// One entry in the leader table: the key after Ctrl+a, its description
-/// for the hint bar, and the action it dispatches. A single table backs
-/// both, so the hint can never list a binding `leader_action` does not
-/// also produce.
+/// for the keymap dialogue, and the action it dispatches. A single table
+/// backs both, so the dialogue can never list a binding `leader_action`
+/// does not also produce. A description is `<keys> <what>`: the dialogue
+/// reads the first word as the key to press and the rest as its effect.
 struct LeaderEntry {
     code: KeyCode,
     description: &'static str,
@@ -158,22 +159,25 @@ const LEADER_TABLE: &[LeaderEntry] = &[
     },
     LeaderEntry {
         code: KeyCode::Char('t'),
-        description: "t keymap bar",
+        description: "t keymaps",
         action: || Action::ToggleHint,
     },
 ];
 
-/// The input-mode hint text: every leader binding's description, in
-/// table order, with duplicates (h/l and the arrows both focus) folded
-/// into one entry.
-pub fn leader_hint() -> String {
-    let mut descriptions: Vec<&'static str> = Vec::new();
+/// Every leader binding as `(keys, what)`, in table order, with
+/// duplicates (h/l and the arrows both focus) folded into one entry.
+pub fn leader_keys() -> Vec<(&'static str, &'static str)> {
+    let mut keys: Vec<(&'static str, &'static str)> = Vec::new();
     for entry in LEADER_TABLE {
-        if !descriptions.contains(&entry.description) {
-            descriptions.push(entry.description);
+        let pair = entry
+            .description
+            .split_once(' ')
+            .unwrap_or((entry.description, ""));
+        if !keys.contains(&pair) {
+            keys.push(pair);
         }
     }
-    descriptions.join(" | ")
+    keys
 }
 
 // The Ctrl+a leader is the only key corral consumes in input mode. In
@@ -1068,29 +1072,27 @@ mod tests {
     }
 
     #[test]
-    fn leader_hint_lists_every_binding_from_the_table_once() {
-        let hint = leader_hint();
-        for description in [
-            "h/l focus",
-            "j/k focus",
-            "% split right",
-            "\" split down",
-            "o next pane",
-            "[ copy mode",
-            "c clear history",
-            "d quit",
-            "t keymap bar",
+    fn leader_keys_lists_every_binding_from_the_table_once() {
+        let keys = leader_keys();
+        for pair in [
+            ("h/l", "focus"),
+            ("j/k", "focus"),
+            ("%", "split right"),
+            ("\"", "split down"),
+            ("o", "next pane"),
+            ("[", "copy mode"),
+            ("c", "clear history"),
+            ("d", "quit"),
+            ("t", "keymaps"),
         ] {
-            assert!(
-                hint.contains(description),
-                "hint {hint:?} is missing {description:?}"
-            );
+            assert!(keys.contains(&pair), "{pair:?} is missing from {keys:?}");
         }
-        // h/l and the arrows share one description; it must not repeat.
+        assert_eq!(keys.len(), 9, "one entry per binding, got {keys:?}");
+        // h/l and the arrows share one binding; it must not repeat.
         assert_eq!(
-            hint.matches("h/l focus").count(),
+            keys.iter().filter(|(k, _)| *k == "h/l").count(),
             1,
-            "hint {hint:?} must fold h/l and the arrows into one entry"
+            "got {keys:?}"
         );
     }
 

@@ -110,6 +110,9 @@ mod bench {
                         &[],
                         None,
                         "bench",
+                        // No pane reports a directory here, so the bar's
+                        // shortening has nothing to work against.
+                        "",
                         "00:00 01-Jan-70",
                         &theme,
                     )
