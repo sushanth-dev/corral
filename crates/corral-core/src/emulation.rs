@@ -344,6 +344,14 @@ impl Emulator {
         }
         Ok((text, out))
     }
+
+    /// The pane's title as set by OSC 0/2, owned rather than borrowed:
+    /// `Terminal::title` returns a value valid only until the next
+    /// `vt_write`, so the worker must copy it out before feeding more
+    /// bytes. Empty when the pane never set one.
+    pub fn title(&mut self) -> Result<String> {
+        Ok(self.terminal.title()?.to_owned())
+    }
 }
 
 /// Append one cell to `line`, merging into the previous run when the
@@ -894,5 +902,26 @@ mod tests {
             .find(|r| r.text.contains("blue"))
             .unwrap();
         assert_eq!(run.bg, CellColor::Indexed(4), "got {:?}", run.bg);
+    }
+
+    #[test]
+    fn a_pane_that_never_set_a_title_returns_empty() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        assert_eq!(emu.title().unwrap(), "");
+    }
+
+    #[test]
+    fn an_osc_2_sequence_sets_the_title() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]2;My Title\x1b\\");
+        assert_eq!(emu.title().unwrap(), "My Title");
+    }
+
+    #[test]
+    fn a_later_title_replaces_the_earlier_one() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]2;First\x1b\\");
+        emu.feed(b"\x1b]2;Second\x1b\\");
+        assert_eq!(emu.title().unwrap(), "Second");
     }
 }

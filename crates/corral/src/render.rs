@@ -92,7 +92,29 @@ pub fn draw(
         paint_cursor(frame, p, cursor, theme);
     }
     paint_gutters(frame, panes, focused, theme);
+    paint_title(frame, panes, focused, theme);
     draw_hint(frame, hint, theme);
+}
+
+/// The focused pane's title (S4-3, OSC 0/2), overlaid on its own top-left
+/// corner and truncated to the pane's width: a title longer than the
+/// pane must never spill onto whatever is drawn to its right. Chrome,
+/// not pane content, so it paints in the theme's focused-gutter color,
+/// the same signal task 17 already uses to mark the active pane.
+fn paint_title(frame: &mut Frame, panes: &[PaneState], focused: PaneId, theme: &Theme) {
+    let Some(pane) = panes.iter().find(|p| p.id == focused) else {
+        return;
+    };
+    if pane.title.is_empty() {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    for (i, ch) in pane.title.chars().take(pane.rect.w as usize).enumerate() {
+        let x = pane.rect.x + i as u16;
+        buf[(x, pane.rect.y)]
+            .set_symbol(ch.encode_utf8(&mut [0; 4]))
+            .set_fg(theme.palette.focused_gutter);
+    }
 }
 
 /// The pane's visible rows as styled ratatui lines. Falls back to plain
@@ -356,6 +378,7 @@ mod tests {
             scroll: None,
             total_scrollback: 0,
             lines: vec![],
+            title: String::new(),
         }
     }
 
@@ -483,6 +506,44 @@ mod tests {
                 "cell ({x},5) fg {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_focused_panes_title_overlays_its_top_left_corner() {
+        let mut panes = panes();
+        panes[0].title = "shell".into();
+        let buf = draw_at(101, 10, &panes, 1);
+        assert_eq!(row(&buf, 0, 5), "shell");
+        assert_eq!(buf[(0, 0)].fg, test_theme().palette.focused_gutter);
+    }
+
+    #[test]
+    fn unfocused_panes_do_not_get_a_title_label() {
+        let mut panes = panes();
+        panes[0].title = "shell".into();
+        let buf = draw_at(101, 10, &panes, 2);
+        assert_eq!(
+            row(&buf, 0, 5),
+            "pane-",
+            "unfocused pane's own text must show"
+        );
+    }
+
+    #[test]
+    fn a_title_longer_than_the_pane_truncates_without_overpainting_the_neighbour() {
+        let mut panes = panes();
+        panes[0].title = "x".repeat(80);
+        let buf = draw_at(101, 10, &panes, 1);
+        for x in 0..50u16 {
+            assert_eq!(buf[(x, 0)].symbol(), "x", "col {x} must carry the title");
+        }
+        assert_eq!(buf[(50, 0)].symbol(), "│", "gutter column must survive");
+        assert_eq!(
+            buf[(51, 0)].symbol(),
+            "p",
+            "neighbouring pane's own text must survive, got {:?}",
+            buf[(51, 0)].symbol()
+        );
     }
 
     #[test]

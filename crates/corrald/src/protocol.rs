@@ -147,6 +147,10 @@ pub struct PaneState {
     /// The visible screen as styled runs (colors, attributes). Same row
     /// count as `text`; empty means "fall back to plain `text`".
     pub lines: Vec<StyledLine>,
+    /// The pane's title as set by OSC 0/2, empty if never set. Pane
+    /// state, not viewport state: it survives scrolling since it does
+    /// not come from the viewport window at all.
+    pub title: String,
 }
 
 /// Scroll position of one session's viewport in one pane, mirrored from
@@ -240,6 +244,7 @@ mod tests {
                 }),
                 total_scrollback: 96,
                 lines: vec![],
+                title: "my title".into(),
             }],
             focused: 1,
         };
@@ -249,6 +254,10 @@ mod tests {
         assert!(
             line.contains("\"scroll\":{\"offset\":12,\"total\":96}"),
             "scroll position must ride on the pane state: {line}"
+        );
+        assert!(
+            line.contains("\"title\":\"my title\""),
+            "title must ride on the pane state: {line}"
         );
         let back: ServerMsg = serde_json::from_str(&line).unwrap();
         assert!(matches!(back, ServerMsg::Frame { focused: 1, .. }));
@@ -373,6 +382,7 @@ mod tests {
                         },
                     ],
                 }],
+                title: String::new(),
             }],
             focused: 1,
         };
@@ -457,6 +467,7 @@ mod tests {
                 scroll: None,
                 total_scrollback: 3,
                 lines: vec![],
+                title: String::new(),
             }],
             focused: 1,
         };

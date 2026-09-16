@@ -1772,6 +1772,54 @@ mod tests {
     }
 
     #[test]
+    fn pane_title_from_osc_rides_the_frame_and_survives_scrolling() {
+        let sock = start_daemon("title");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf '\\033]2;My Pane\\007'; seq 1 60; sleep 30".into(),
+                ],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut reader = BufReader::new(client);
+        let titled = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.title == "My Pane"),
+            _ => false,
+        })
+        .expect("frame with the OSC title within 5s");
+        let ServerMsg::Frame { panes, .. } = titled else {
+            unreachable!()
+        };
+        assert_eq!(panes[0].title, "My Pane");
+
+        send(
+            reader.get_mut(),
+            &ClientMsg::Scroll {
+                target: crate::protocol::ScrollTarget::Delta(-10),
+            },
+        );
+        let scrolled = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.scroll.is_some()),
+            _ => false,
+        })
+        .expect("scrolled frame within 5s");
+        let ServerMsg::Frame { panes, .. } = scrolled else {
+            unreachable!()
+        };
+        assert_eq!(
+            panes[0].title, "My Pane",
+            "title is pane state, not viewport state; scrolling must not clear it"
+        );
+        drop(reader);
+    }
+
+    #[test]
     fn scroll_landed_reports_the_clamped_move_at_the_scrollback_boundary() {
         let sock = start_daemon("scroll-landed");
         let mut client = UnixStream::connect(&sock).unwrap();

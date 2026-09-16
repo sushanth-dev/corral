@@ -322,6 +322,7 @@ fn push_snapshot(id: PaneId, emu: &mut Emulator, cols: u16, rows: u16, out: &Sen
         scroll: None,
         total_scrollback: emu.scrollback_rows().unwrap_or(0),
         lines: emu.screen_lines().unwrap_or_default(),
+        title: emu.title().unwrap_or_default(),
     };
     let _ = out.send(PaneOut::Snapshot { pane: id, state });
 }
