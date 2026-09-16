@@ -352,14 +352,19 @@ impl Daemon {
                 }
             }
             ClientMsg::FocusNext => self.focus_next(),
-            ClientMsg::Scroll { target } => {
+            ClientMsg::Scroll { pane, target } => {
                 let target = match target {
                     crate::protocol::ScrollTarget::Delta(d) => ScrollTarget::Delta(*d),
                     crate::protocol::ScrollTarget::Row(r) => ScrollTarget::Row(*r),
                     crate::protocol::ScrollTarget::Top => ScrollTarget::Top,
                     crate::protocol::ScrollTarget::Bottom => ScrollTarget::Bottom,
                 };
-                self.scroll_session(session, self.focused, target)?;
+                // The wheel scrolls the pane under the pointer, which the
+                // client knows and the daemon does not, so the message names
+                // it. A pane that has since gone away just drops the scroll.
+                if self.panes.contains_key(pane) {
+                    self.scroll_session(session, *pane, target)?;
+                }
             }
             ClientMsg::Search {
                 needle,
@@ -1856,6 +1861,7 @@ mod tests {
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
+                pane: 1,
                 target: crate::protocol::ScrollTarget::Delta(-10),
             },
         );
@@ -1878,6 +1884,7 @@ mod tests {
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
+                pane: 1,
                 target: crate::protocol::ScrollTarget::Bottom,
             },
         );
@@ -1927,6 +1934,7 @@ mod tests {
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
+                pane: 1,
                 target: crate::protocol::ScrollTarget::Delta(-10),
             },
         );
@@ -1942,6 +1950,38 @@ mod tests {
             panes[0].title, "My Pane",
             "title is pane state, not viewport state; scrolling must not clear it"
         );
+        drop(reader);
+    }
+
+    #[test]
+    fn pane_pwd_from_osc_7_rides_the_frame_as_a_plain_path() {
+        // The status bar names the focused pane's directory, so the pane
+        // reports its own cwd with OSC 7 and the frame carries it decoded,
+        // not as the raw `file://` URI the sequence contains.
+        let sock = start_daemon("pwd");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        send(
+            &mut client,
+            &ClientMsg::CreatePane {
+                cmd: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf '\\033]7;file://localhost/tmp/here\\007'; sleep 30".into(),
+                ],
+                cwd: "/tmp".into(),
+                dir: Dir::Horizontal,
+            },
+        );
+        let mut reader = BufReader::new(client);
+        let reported = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => panes.iter().any(|p| p.pwd == "/tmp/here"),
+            _ => false,
+        })
+        .expect("frame with the OSC 7 directory within 5s");
+        let ServerMsg::Frame { panes, .. } = reported else {
+            unreachable!()
+        };
+        assert_eq!(panes[0].pwd, "/tmp/here");
         drop(reader);
     }
 
@@ -1974,6 +2014,7 @@ mod tests {
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
+                pane: 1,
                 target: crate::protocol::ScrollTarget::Delta(-12),
             },
         );
@@ -2006,6 +2047,7 @@ mod tests {
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
+                pane: 1,
                 target: crate::protocol::ScrollTarget::Delta(-12),
             },
         );
@@ -2016,6 +2058,77 @@ mod tests {
         };
         assert_eq!(moved, 0, "the viewport cannot move past the top");
         drop(reader);
+    }
+
+    #[test]
+    fn a_named_pane_scrolls_while_the_focused_pane_stays_live() {
+        // The wheel scrolls the pane under the pointer, which is not the
+        // pane the daemon happens to focus. The message names the pane so
+        // the daemon never has to guess, and the focused pane keeps
+        // following the live screen meanwhile.
+        let sock = start_daemon("wheel-pane");
+        let mut client = UnixStream::connect(&sock).unwrap();
+        for n in 0..2 {
+            send(
+                &mut client,
+                &ClientMsg::CreatePane {
+                    cmd: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        format!("seq 1 60; printf 'pane{n}-done'; sleep 30"),
+                    ],
+                    cwd: "/tmp".into(),
+                    dir: Dir::Horizontal,
+                },
+            );
+        }
+        let mut reader = BufReader::new(client);
+        let both = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => {
+                panes.len() == 2 && panes.iter().all(|p| p.text.contains("-done"))
+            }
+            _ => false,
+        })
+        .expect("two panes with their output within 5s");
+        let ServerMsg::Frame { panes, focused } = both else {
+            unreachable!()
+        };
+        let other = panes
+            .iter()
+            .find(|p| p.id != focused)
+            .expect("a pane that is not the focused one")
+            .id;
+        assert!(
+            panes.iter().all(|p| p.total_scrollback > 1),
+            "both panes need scrollback to scroll into: {:?}",
+            panes
+                .iter()
+                .map(|p| (p.id, p.total_scrollback, p.rect.h))
+                .collect::<Vec<_>>()
+        );
+
+        send(
+            reader.get_mut(),
+            &ClientMsg::Scroll {
+                pane: other,
+                target: crate::protocol::ScrollTarget::Top,
+            },
+        );
+        let scrolled = wait_for_msg(&mut reader, |m| match m {
+            ServerMsg::Frame { panes, .. } => {
+                panes.iter().any(|p| p.id == other && p.scroll.is_some())
+            }
+            _ => false,
+        })
+        .expect("frame with the named pane scrolled within 5s");
+        let ServerMsg::Frame { panes, .. } = scrolled else {
+            unreachable!()
+        };
+        assert!(
+            panes.iter().any(|p| p.id == focused && p.scroll.is_none()),
+            "the focused pane must stay live while another pane is scrolled, got {:?}",
+            panes.iter().map(|p| (p.id, p.scroll)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2153,6 +2266,7 @@ mod tests {
         send(
             ra.get_mut(),
             &ClientMsg::Scroll {
+                pane: 1,
                 target: crate::protocol::ScrollTarget::Delta(-12),
             },
         );
@@ -2327,6 +2441,7 @@ mod tests {
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
+                pane: 1,
                 target: crate::protocol::ScrollTarget::Top,
             },
         );
@@ -2344,6 +2459,7 @@ mod tests {
         send(
             reader.get_mut(),
             &ClientMsg::Scroll {
+                pane: 1,
                 target: crate::protocol::ScrollTarget::Top,
             },
         );

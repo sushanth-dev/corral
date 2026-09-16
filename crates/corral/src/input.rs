@@ -158,7 +158,7 @@ const LEADER_TABLE: &[LeaderEntry] = &[
     },
     LeaderEntry {
         code: KeyCode::Char('t'),
-        description: "t toggle hint",
+        description: "t keymap bar",
         action: || Action::ToggleHint,
     },
 ];
@@ -358,8 +358,14 @@ pub enum MouseAction {
         at: corral_core::tree::PaneId,
         ratio: f32,
     },
-    Scroll(isize),
-    EnterCopyThenScroll(isize),
+    Scroll {
+        pane: corral_core::tree::PaneId,
+        delta: isize,
+    },
+    EnterCopyThenScroll {
+        pane: corral_core::tree::PaneId,
+        delta: isize,
+    },
 }
 
 const WHEEL_DELTA: isize = 3;
@@ -468,13 +474,16 @@ fn gutter_at(
 
 /// Dispatches a mouse event: a click focuses the pane under it or starts
 /// tracking a gutter drag, a drag on a tracked gutter yields a ratio
-/// change, and wheel ticks scroll (entering copy mode first if the
-/// client is not there yet, per the plan). `drag` persists the gutter a
-/// button-down started tracking across the following drag events.
+/// change, and wheel ticks scroll the pane under the pointer, opening
+/// copy mode first when they move toward history in the focused pane. A
+/// wheel tick outside every pane (the status bar row, a gutter) does
+/// nothing. `drag` persists the gutter a button-down started tracking
+/// across the following drag events.
 pub fn handle_mouse(
     ev: crossterm::event::MouseEvent,
     panes: &[corrald::protocol::PaneState],
     mode: &Mode,
+    focused: corral_core::tree::PaneId,
     drag: &mut Option<(corral_core::tree::PaneId, Dir, corral_core::tree::Rect)>,
 ) -> Option<MouseAction> {
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -504,17 +513,39 @@ pub fn handle_mouse(
             *drag = None;
             None
         }
-        MouseEventKind::ScrollUp => Some(scroll_action(mode, -WHEEL_DELTA)),
-        MouseEventKind::ScrollDown => Some(scroll_action(mode, WHEEL_DELTA)),
+        MouseEventKind::ScrollUp => Some(scroll_action(
+            mode,
+            focused,
+            pane_at(panes, ev.column, ev.row)?,
+            -WHEEL_DELTA,
+        )),
+        MouseEventKind::ScrollDown => Some(scroll_action(
+            mode,
+            focused,
+            pane_at(panes, ev.column, ev.row)?,
+            WHEEL_DELTA,
+        )),
         _ => None,
     }
 }
 
-fn scroll_action(mode: &Mode, delta: isize) -> MouseAction {
-    if *mode == Mode::Input {
-        MouseAction::EnterCopyThenScroll(delta)
+/// A wheel tick on `pane`. Scrolling toward history opens copy mode when
+/// the client is not already there, so what the wheel revealed can be
+/// yanked; scrolling back toward the live screen is a plain viewport move
+/// and never opens copy mode. The pane is named on the action because the
+/// pointer picks it, not the daemon's focus. Copy mode only opens for the
+/// focused pane, since the copy cursor and yank read that pane's state,
+/// so a wheel tick on any other pane stays a plain viewport move.
+fn scroll_action(
+    mode: &Mode,
+    focused: corral_core::tree::PaneId,
+    pane: corral_core::tree::PaneId,
+    delta: isize,
+) -> MouseAction {
+    if *mode == Mode::Input && pane == focused && delta < 0 {
+        MouseAction::EnterCopyThenScroll { pane, delta }
     } else {
-        MouseAction::Scroll(delta)
+        MouseAction::Scroll { pane, delta }
     }
 }
 
@@ -1048,7 +1079,7 @@ mod tests {
             "[ copy mode",
             "c clear history",
             "d quit",
-            "t toggle hint",
+            "t keymap bar",
         ] {
             assert!(
                 hint.contains(description),
@@ -1474,6 +1505,7 @@ mod tests {
             total_scrollback: 0,
             lines: vec![],
             title: String::new(),
+            pwd: String::new(),
         }
     }
 
@@ -1518,6 +1550,7 @@ mod tests {
             mouse(MouseEventKind::Down(MouseButton::Left), 10, 5),
             &panes,
             &Mode::Input,
+            1,
             &mut drag,
         );
         assert_eq!(action, Some(MouseAction::FocusPane(1)));
@@ -1526,32 +1559,111 @@ mod tests {
             mouse(MouseEventKind::Down(MouseButton::Left), 60, 5),
             &panes,
             &Mode::Input,
+            1,
             &mut drag,
         );
         assert_eq!(action, Some(MouseAction::FocusPane(2)));
     }
 
     #[test]
-    fn wheel_up_yields_a_scroll_delta() {
+    fn wheel_up_yields_a_scroll_delta_for_the_pane_under_the_pointer() {
         let panes = two_panes();
         let mut drag = None;
-        // From input mode, the wheel enters copy mode on its way in.
+        // From input mode, the wheel enters copy mode on its way in, and
+        // the pane it names is the one under the pointer, not pane 1.
         let action = handle_mouse(
-            mouse(MouseEventKind::ScrollUp, 10, 5),
+            mouse(MouseEventKind::ScrollUp, 60, 5),
             &panes,
             &Mode::Input,
+            2, // focused
             &mut drag,
         );
-        assert_eq!(action, Some(MouseAction::EnterCopyThenScroll(-WHEEL_DELTA)));
+        assert_eq!(
+            action,
+            Some(MouseAction::EnterCopyThenScroll {
+                pane: 2,
+                delta: -WHEEL_DELTA,
+            })
+        );
 
         // Already in copy mode, it just scrolls.
         let action = handle_mouse(
             mouse(MouseEventKind::ScrollDown, 10, 5),
             &panes,
             &Mode::Copy,
+            2, // focused
             &mut drag,
         );
-        assert_eq!(action, Some(MouseAction::Scroll(WHEEL_DELTA)));
+        assert_eq!(
+            action,
+            Some(MouseAction::Scroll {
+                pane: 1,
+                delta: WHEEL_DELTA,
+            })
+        );
+    }
+
+    #[test]
+    fn wheel_up_on_an_unfocused_pane_scrolls_it_without_opening_copy_mode() {
+        // Copy mode belongs to the focused pane: its cursor and its yank
+        // read that pane's state. Scrolling a different pane is therefore
+        // a plain viewport move, not a mode change.
+        let panes = two_panes();
+        let mut drag = None;
+        let action = handle_mouse(
+            mouse(MouseEventKind::ScrollUp, 60, 5),
+            &panes,
+            &Mode::Input,
+            1, // focused
+            &mut drag,
+        );
+        assert_eq!(
+            action,
+            Some(MouseAction::Scroll {
+                pane: 2,
+                delta: -WHEEL_DELTA,
+            })
+        );
+    }
+
+    #[test]
+    fn wheel_down_in_input_mode_never_opens_copy_mode() {
+        // The viewport is already live in input mode, so a wheel-down has
+        // nothing to reveal. Opening copy mode here is what left the
+        // client stuck in it with the bar still reading copy mode.
+        let panes = two_panes();
+        let mut drag = None;
+        let action = handle_mouse(
+            mouse(MouseEventKind::ScrollDown, 10, 5),
+            &panes,
+            &Mode::Input,
+            2, // focused
+            &mut drag,
+        );
+        assert_eq!(
+            action,
+            Some(MouseAction::Scroll {
+                pane: 1,
+                delta: WHEEL_DELTA,
+            })
+        );
+    }
+
+    #[test]
+    fn a_wheel_tick_outside_every_pane_does_nothing() {
+        // The last row of the screen is the status bar, and the gutter is
+        // between panes. Neither belongs to a pane, so there is nothing
+        // to scroll.
+        let panes = two_panes();
+        let mut drag = None;
+        for (kind, col, row) in [
+            (MouseEventKind::ScrollUp, 10, 20),
+            (MouseEventKind::ScrollDown, 10, 20),
+            (MouseEventKind::ScrollUp, 50, 5),
+        ] {
+            let action = handle_mouse(mouse(kind, col, row), &panes, &Mode::Input, 1, &mut drag);
+            assert_eq!(action, None, "wheel at ({col}, {row}) must do nothing");
+        }
     }
 
     #[test]
@@ -1563,6 +1675,7 @@ mod tests {
             mouse(MouseEventKind::Down(MouseButton::Left), 50, 5),
             &panes,
             &Mode::Input,
+            2, // focused
             &mut drag,
         );
         assert_eq!(down, None, "a gutter press only arms the drag");
@@ -1572,6 +1685,7 @@ mod tests {
             mouse(MouseEventKind::Drag(MouseButton::Left), 25, 5),
             &panes,
             &Mode::Input,
+            2, // focused
             &mut drag,
         );
         match action {

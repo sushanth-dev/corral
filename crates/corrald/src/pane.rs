@@ -126,8 +126,8 @@ impl PaneWorker {
 fn run_worker(
     id: PaneId,
     mut pty: PtyHandle,
-    cols: u16,
-    rows: u16,
+    mut cols: u16,
+    mut rows: u16,
     out: Sender<PaneOut>,
     rx: Receiver<PaneCmd>,
 ) {
@@ -159,7 +159,15 @@ fn run_worker(
                 PaneCmd::Resize(w, h) => {
                     let _ = pty.resize(w, h);
                     if emu.resize(w, h).is_ok() {
-                        push_snapshot(id, &mut emu, w, h, &out);
+                        // The dims every later snapshot is stamped with
+                        // have to track the emulator's: the daemon decides
+                        // whether a client's window still describes its
+                        // pane by comparing the two, so a stale rect makes
+                        // every scroll into a pane that has been resized
+                        // look outdated and get thrown away.
+                        cols = w;
+                        rows = h;
+                        push_snapshot(id, &mut emu, cols, rows, &out);
                     }
                 }
                 PaneCmd::Window {
@@ -323,6 +331,7 @@ fn push_snapshot(id: PaneId, emu: &mut Emulator, cols: u16, rows: u16, out: &Sen
         total_scrollback: emu.scrollback_rows().unwrap_or(0),
         lines: emu.screen_lines().unwrap_or_default(),
         title: emu.title().unwrap_or_default(),
+        pwd: emu.pwd().unwrap_or_default(),
     };
     let _ = out.send(PaneOut::Snapshot { pane: id, state });
 }

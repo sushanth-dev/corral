@@ -30,11 +30,13 @@ pub fn draw(
     panes: &[PaneState],
     focused: PaneId,
     hint: Hint,
-    hint_on: bool,
+    keys_on: bool,
     spans: &[(PaneId, SpanList)],
     search: &[(PaneId, SpanList)],
     current: &[(PaneId, SpanList)],
     cursor: Option<(usize, usize)>,
+    workspace: &str,
+    clock: &str,
     theme: &Theme,
 ) {
     for pane in panes {
@@ -93,29 +95,23 @@ pub fn draw(
         paint_cursor(frame, p, cursor, theme);
     }
     paint_gutters(frame, panes, focused, theme);
-    paint_title(frame, panes, focused, theme);
-    draw_hint(frame, hint, hint_on, theme);
+    let dir = pane_dir(panes.iter().find(|p| p.id == focused));
+    draw_status(frame, workspace, dir, &hint, keys_on, clock, theme);
 }
 
-/// The focused pane's title (S4-3, OSC 0/2), overlaid on its own top-left
-/// corner and truncated to the pane's width: a title longer than the
-/// pane must never spill onto whatever is drawn to its right. Chrome,
-/// not pane content, so it paints in the theme's focused-gutter color,
-/// the same signal task 17 already uses to mark the active pane.
-fn paint_title(frame: &mut Frame, panes: &[PaneState], focused: PaneId, theme: &Theme) {
-    let Some(pane) = panes.iter().find(|p| p.id == focused) else {
-        return;
-    };
-    if pane.title.is_empty() {
-        return;
-    }
-    let buf = frame.buffer_mut();
-    for (i, ch) in pane.title.chars().take(pane.rect.w as usize).enumerate() {
-        let x = pane.rect.x + i as u16;
-        buf[(x, pane.rect.y)]
-            .set_symbol(ch.encode_utf8(&mut [0; 4]))
-            .set_fg(theme.palette.focused_gutter);
-    }
+/// The directory the status bar shows: the focused pane's OSC 7 working
+/// directory when the shell reported one, else its OSC title, which every
+/// common shell keeps in sync with the cwd. Empty when the pane has
+/// reported neither.
+fn pane_dir(pane: Option<&PaneState>) -> &str {
+    pane.map(|p| {
+        if p.pwd.is_empty() {
+            p.title.as_str()
+        } else {
+            p.pwd.as_str()
+        }
+    })
+    .unwrap_or("")
 }
 
 /// The pane's visible rows as styled ratatui lines. Falls back to plain
@@ -269,29 +265,23 @@ fn paint_spans(frame: &mut Frame, pane: &PaneState, spans: &SpanList, style: Sty
 // content. This is the copy map the copy-mode hint lists.
 const COPY_KEYS: &str = "hjkl move | { } prompt | ctrl+o yank cmd | v select | q exit";
 
-// One status row on the last screen line, over everything else. Always
-// on, with the active mode leftmost so it is never the part that gets
-// cut off; in copy mode it also carries the scroll position and the
-// key hints above (including ctrl+o, which has no other affordance).
-// `hint_on` is the leader's `t` toggle: the row stays reserved either
-// way (reclaiming it would resize every pane and reflow their PTYs on
-// each toggle), it just renders empty when off.
-fn draw_hint(frame: &mut Frame, hint: Hint, hint_on: bool, theme: &Theme) {
+/// The status row on the last screen line, over everything else, always
+/// present. Tmux's shape: the workspace in brackets on the left, the
+/// mode and the focused pane's working directory in the middle, the
+/// clock on the right. The leader's `t` swaps the middle for the mode's
+/// keymap, the shortcut the panes' own keys would otherwise crowd out.
+fn draw_status(
+    frame: &mut Frame,
+    workspace: &str,
+    dir: &str,
+    hint: &Hint,
+    keys_on: bool,
+    clock: &str,
+    theme: &Theme,
+) {
     let area = frame.area();
     let row = area.height.saturating_sub(1);
-    let text = if !hint_on {
-        String::new()
-    } else {
-        match hint {
-            Hint::None => format!(" input mode  ctrl+a: {} ", crate::input::leader_hint()),
-            Hint::Copy(None) => format!(" copy mode  {COPY_KEYS} "),
-            Hint::Copy(Some((offset, total))) => {
-                format!(" copy mode {offset}/{total}  {COPY_KEYS} ")
-            }
-            Hint::Select => " copy mode select  y yank | esc cancel ".to_string(),
-            Hint::Search(needle) => format!(" search: {needle} "),
-        }
-    };
+    let text = status_row(area.width as usize, workspace, dir, hint, keys_on, clock);
     let style = Style::new()
         .fg(theme.palette.hint_fg)
         .bg(theme.palette.hint_bg);
@@ -306,6 +296,88 @@ fn draw_hint(frame: &mut Frame, hint: Hint, hint_on: bool, theme: &Theme) {
             height: 1,
         },
     );
+}
+
+/// Compose one status row: left zone, middle, padding, right zone, the
+/// same split tmux gives `status-left`, the window list, and
+/// `status-right`. The middle is the only part that gives way when the
+/// row is narrow.
+fn status_row(
+    width: usize,
+    workspace: &str,
+    dir: &str,
+    hint: &Hint,
+    keys_on: bool,
+    clock: &str,
+) -> String {
+    let left = format!("[{workspace}] ");
+    let right = format!(" {clock}");
+    let room = width.saturating_sub(left.chars().count() + right.chars().count());
+    // A key list reads from its first word, and a needle is typed from
+    // its front, so both give way at the right. A path reads from its
+    // last component, so it gives way at the left.
+    let middle = if keys_on || matches!(hint, Hint::Search(_)) {
+        truncate_right(&keymap_for(hint), room)
+    } else {
+        truncate_left(&format!("{}{dir}", mode_tag(hint)), room)
+    };
+    let pad = " ".repeat(
+        width.saturating_sub(left.chars().count() + middle.chars().count() + right.chars().count()),
+    );
+    format!("{left}{middle}{pad}{right}")
+}
+
+/// The mode marker that leads the status text when the keymaps are
+/// hidden, so the mode stays visible on its own. Empty in input mode,
+/// where there is nothing to report, and in search, whose needle is the
+/// report.
+fn mode_tag(hint: &Hint) -> String {
+    match hint {
+        Hint::None | Hint::Search(_) => String::new(),
+        Hint::Copy(None) => "[copy] ".into(),
+        Hint::Copy(Some((offset, total))) => format!("[copy {offset}/{total}] "),
+        Hint::Select => "[select] ".into(),
+    }
+}
+
+/// The key hints for the active mode: what the `t` shortcut puts in the
+/// middle of the status row. Copy mode lists the copy map above.
+fn keymap_for(hint: &Hint) -> String {
+    match hint {
+        Hint::None => format!("input mode  ctrl+a: {}", crate::input::leader_hint()),
+        Hint::Copy(None) => format!("copy mode  {COPY_KEYS}"),
+        Hint::Copy(Some((offset, total))) => format!("copy mode {offset}/{total}  {COPY_KEYS}"),
+        Hint::Select => "copy mode select  y yank | esc cancel".to_string(),
+        Hint::Search(needle) => format!("search: {needle}"),
+    }
+}
+
+/// Trim `text` to `room` characters, cutting from the left behind a
+/// leading ellipsis, so the end of a long path survives. `room` of 0
+/// leaves nothing.
+fn truncate_left(text: &str, room: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= room {
+        return text.to_string();
+    }
+    if room == 0 {
+        return String::new();
+    }
+    let tail: String = chars[chars.len() - (room - 1)..].iter().collect();
+    format!("…{tail}")
+}
+
+/// Trim `text` to `room` characters, cutting from the right behind a
+/// trailing ellipsis, so the start of a long key list survives.
+fn truncate_right(text: &str, room: usize) -> String {
+    if text.chars().count() <= room {
+        return text.to_string();
+    }
+    if room == 0 {
+        return String::new();
+    }
+    let head: String = text.chars().take(room - 1).collect();
+    format!("{head}…")
 }
 
 // tree.rects leaves a 1-cell gutter between siblings that no pane rect
@@ -387,6 +459,7 @@ mod tests {
             total_scrollback: 0,
             lines: vec![],
             title: String::new(),
+            pwd: String::new(),
         }
     }
 
@@ -419,6 +492,12 @@ mod tests {
         }
     }
 
+    // The bar's outer zones are fixed for every test that is not about
+    // them, so the assertions read the parts under test rather than the
+    // clock's minute.
+    const WORKSPACE: &str = "corral-test";
+    const CLOCK: &str = "14:23 16-Sep-26";
+
     fn draw_at(
         width: u16,
         height: u16,
@@ -450,6 +529,24 @@ mod tests {
         search: &[(u32, SpanList)],
         cursor: Option<(usize, usize)>,
     ) -> ratatui::buffer::Buffer {
+        draw_keys(
+            width, height, panes, focused, hint, spans, search, cursor, false,
+        )
+    }
+
+    // `draw_full` with the keymaps up, which is the `t` shortcut's state.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_keys(
+        width: u16,
+        height: u16,
+        panes: &[PaneState],
+        focused: u32,
+        hint: Hint,
+        spans: &[(u32, SpanList)],
+        search: &[(u32, SpanList)],
+        cursor: Option<(usize, usize)>,
+        keys_on: bool,
+    ) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut term = TuiTerminal::new(backend).unwrap();
         let theme = test_theme();
@@ -459,11 +556,13 @@ mod tests {
                 panes,
                 focused,
                 hint,
-                true,
+                keys_on,
                 spans,
                 search,
                 &[],
                 cursor,
+                WORKSPACE,
+                CLOCK,
                 &theme,
             )
         })
@@ -530,41 +629,58 @@ mod tests {
     }
 
     #[test]
-    fn the_focused_panes_title_overlays_its_top_left_corner() {
+    fn the_status_bar_shows_the_workspace_the_focused_panes_directory_and_the_clock() {
         let mut panes = panes();
-        panes[0].title = "shell".into();
+        panes[0].pwd = "/tmp/project".into();
         let buf = draw_at(101, 10, &panes, 1);
-        assert_eq!(row(&buf, 0, 5), "shell");
-        assert_eq!(buf[(0, 0)].fg, test_theme().palette.focused_gutter);
+        let bar = row(&buf, 9, 101);
+        assert!(bar.starts_with("[corral-test] "), "got {bar:?}");
+        assert!(bar.ends_with(" 14:23 16-Sep-26"), "got {bar:?}");
+        assert!(bar.contains("/tmp/project"), "got {bar:?}");
     }
 
     #[test]
-    fn unfocused_panes_do_not_get_a_title_label() {
+    fn the_bar_falls_back_to_the_title_when_no_directory_was_reported() {
         let mut panes = panes();
-        panes[0].title = "shell".into();
+        panes[0].title = "demo-title".into();
+        let buf = draw_at(101, 10, &panes, 1);
+        assert!(row(&buf, 9, 101).contains("demo-title"));
+    }
+
+    #[test]
+    fn the_bar_shows_the_focused_panes_directory_and_no_other() {
+        let mut panes = panes();
+        panes[0].pwd = "/one".into();
+        panes[1].pwd = "/two".into();
         let buf = draw_at(101, 10, &panes, 2);
-        assert_eq!(
-            row(&buf, 0, 5),
-            "pane-",
-            "unfocused pane's own text must show"
+        let bar = row(&buf, 9, 101);
+        assert!(bar.contains("/two"), "focused pane's dir, got {bar:?}");
+        assert!(!bar.contains("/one"), "unfocused pane's dir, got {bar:?}");
+        // The pane's top-left corner carries its own text, not a label.
+        assert_eq!(row(&buf, 0, 5), "pane-");
+    }
+
+    #[test]
+    fn a_directory_too_long_for_the_bar_keeps_its_tail() {
+        let mut panes = panes();
+        panes[0].pwd = format!("/long/{}", "d".repeat(120));
+        let buf = draw_at(60, 10, &panes, 1);
+        let bar = row(&buf, 9, 60);
+        assert!(bar.contains('…'), "the cut must be marked, got {bar:?}");
+        assert!(
+            bar.contains(&"d".repeat(10)),
+            "the tail must survive the cut, got {bar:?}"
         );
     }
 
     #[test]
-    fn a_title_longer_than_the_pane_truncates_without_overpainting_the_neighbour() {
-        let mut panes = panes();
-        panes[0].title = "x".repeat(80);
-        let buf = draw_at(101, 10, &panes, 1);
-        for x in 0..50u16 {
-            assert_eq!(buf[(x, 0)].symbol(), "x", "col {x} must carry the title");
-        }
-        assert_eq!(buf[(50, 0)].symbol(), "│", "gutter column must survive");
-        assert_eq!(
-            buf[(51, 0)].symbol(),
-            "p",
-            "neighbouring pane's own text must survive, got {:?}",
-            buf[(51, 0)].symbol()
-        );
+    fn the_bar_shows_its_outer_zones_when_the_pane_reports_no_directory() {
+        let panes = vec![pane(1, 0, 0, 10, 3, "pane-content")];
+        let buf = draw_at(40, 4, &panes, 1);
+        let bar = row(&buf, 3, 40);
+        assert!(bar.starts_with("[corral-test] "), "got {bar:?}");
+        assert!(bar.ends_with(" 14:23 16-Sep-26"), "got {bar:?}");
+        assert!(!bar.contains("pane-content"), "the bar owns the last row");
     }
 
     #[test]
@@ -637,27 +753,19 @@ mod tests {
     }
 
     #[test]
-    fn copy_mode_hint_renders_on_the_last_row() {
+    fn the_keymap_shortcut_lists_the_copy_map_on_the_last_row() {
         let panes = panes();
-        let backend = TestBackend::new(101, 10);
-        let mut term = TuiTerminal::new(backend).unwrap();
-        let theme = test_theme();
-        term.draw(|f| {
-            draw(
-                f,
-                &panes,
-                1,
-                Hint::Copy(Some((12, 96))),
-                true,
-                &[],
-                &[],
-                &[],
-                None,
-                &theme,
-            )
-        })
-        .unwrap();
-        let buf = term.backend().buffer().clone();
+        let buf = draw_keys(
+            101,
+            10,
+            &panes,
+            1,
+            Hint::Copy(Some((12, 96))),
+            &[],
+            &[],
+            None,
+            true,
+        );
         assert!(row(&buf, 9, 101).contains("copy mode"));
         assert!(row(&buf, 9, 101).contains("12/96"));
         // Content rows stay untouched.
@@ -665,62 +773,55 @@ mod tests {
     }
 
     #[test]
-    fn copy_mode_hint_without_position_shows_mode_only() {
+    fn copy_mode_keymap_without_position_shows_mode_only() {
         let panes = panes();
-        let backend = TestBackend::new(101, 10);
-        let mut term = TuiTerminal::new(backend).unwrap();
-        let theme = test_theme();
-        term.draw(|f| {
-            draw(
-                f,
-                &panes,
-                1,
-                Hint::Copy(None),
-                true,
-                &[],
-                &[],
-                &[],
-                None,
-                &theme,
-            )
-        })
-        .unwrap();
-        let buf = term.backend().buffer().clone();
+        let buf = draw_keys(101, 10, &panes, 1, Hint::Copy(None), &[], &[], None, true);
         assert!(row(&buf, 9, 101).contains("copy mode"));
-        assert!(!row(&buf, 9, 101).contains("/"));
+        assert!(!row(&buf, 9, 101).contains('/'));
     }
 
     #[test]
-    fn input_mode_hint_lists_every_leader_binding_from_the_table() {
+    fn input_mode_keymap_lists_every_leader_binding_from_the_table() {
         let panes = panes();
-        let buf = draw_full(200, 10, &panes, 1, Hint::None, &[], &[], None);
+        let buf = draw_keys(200, 10, &panes, 1, Hint::None, &[], &[], None, true);
         let bottom = row(&buf, 9, 200);
         assert!(bottom.contains("input mode"));
         assert!(bottom.contains(&crate::input::leader_hint()));
     }
 
     #[test]
-    fn toggling_the_hint_off_hides_the_text_but_keeps_the_row_reserved() {
+    fn the_keymap_shortcut_swaps_the_bar_between_the_keymaps_and_the_directory() {
+        let mut panes = panes();
+        panes[0].pwd = "/tmp/project".into();
+        // Off, the bar reports the mode and the directory.
+        let buf = draw_keys(101, 10, &panes, 1, Hint::Copy(None), &[], &[], None, false);
+        let off = row(&buf, 9, 101);
+        assert!(off.contains("[copy] /tmp/project"), "got {off:?}");
+        assert!(!off.contains("yank"), "keymaps stay hidden, got {off:?}");
+        // On, the same row carries the keymaps instead.
+        let buf = draw_keys(101, 10, &panes, 1, Hint::Copy(None), &[], &[], None, true);
+        let on = row(&buf, 9, 101);
+        assert!(on.contains("yank"), "got {on:?}");
+        // The row is reserved either way, never reclaimed: reclaiming it
+        // would resize every pane and reflow their PTYs.
+        assert_eq!(buf.area.height, 10);
+    }
+
+    #[test]
+    fn a_typed_search_needle_stays_on_the_bar_with_the_keymaps_down() {
         let panes = panes();
-        let backend = TestBackend::new(101, 10);
-        let mut term = TuiTerminal::new(backend).unwrap();
-        let theme = test_theme();
-        term.draw(|f| draw(f, &panes, 1, Hint::None, false, &[], &[], &[], None, &theme))
-            .unwrap();
-        let buf = term.backend().buffer().clone();
-        assert!(
-            !row(&buf, 9, 101).contains("input mode"),
-            "hint text must not render when off"
+        let buf = draw_keys(
+            101,
+            10,
+            &panes,
+            1,
+            Hint::Search("needle".into()),
+            &[],
+            &[],
+            None,
+            false,
         );
-        assert_eq!(
-            buf.area.height, 10,
-            "the last row stays reserved, not reclaimed"
-        );
-        // Toggled back on, the same draw call fills it in again.
-        term.draw(|f| draw(f, &panes, 1, Hint::None, true, &[], &[], &[], None, &theme))
-            .unwrap();
-        let buf = term.backend().buffer().clone();
-        assert!(row(&buf, 9, 101).contains("input mode"));
+        assert!(row(&buf, 9, 101).contains("search: needle"));
     }
 
     #[test]
@@ -932,11 +1033,13 @@ mod tests {
                 &panes,
                 1,
                 Hint::None,
-                true,
+                false,
                 &[],
                 &[(1, hit_spans)],
                 &[(1, current)],
                 None,
+                WORKSPACE,
+                CLOCK,
                 &theme,
             )
         })

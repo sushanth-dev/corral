@@ -1,6 +1,7 @@
 mod attach;
 mod benchmark;
 mod clipboard;
+mod clock;
 mod input;
 mod render;
 mod selection;
@@ -175,6 +176,9 @@ fn ensure_known(known: &[WorkspaceInfo], wanted: &str) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     let request = parse_args(std::env::args().skip(1))?;
     let path = socket_path();
+    // The status bar's left zone. Resolved before the screen is taken
+    // over, so the bar never has an empty workspace name.
+    let workspace = workspace_id(&path);
 
     // The picker runs before the screen is taken over: fzf and the
     // numbered prompt both draw on the plain terminal, and neither works
@@ -205,7 +209,7 @@ fn main() -> anyhow::Result<()> {
     let mut stdout = std::io::stdout();
     let _ = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen);
     let _ = crossterm::execute!(stdout, crossterm::event::EnableMouseCapture);
-    let result = run(stream, &mut writer, &theme);
+    let result = run(stream, &mut writer, &workspace, &theme);
     let _ = crossterm::execute!(stdout, crossterm::event::DisableMouseCapture);
     let _ = crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen);
     crossterm::terminal::disable_raw_mode()?;
@@ -213,15 +217,28 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn pane_command() -> (String, Vec<String>) {
-    // CORRAL_SHELL wins over SHELL so a non-login-shell choice (fish) can
-    // be set per-machine without changing the login shell.
-    let shell = std::env::var("CORRAL_SHELL")
-        .or_else(|_| std::env::var("SHELL"))
-        .unwrap_or_else(|_| "/bin/sh".into());
+    // The user's own login shell, run as a login shell so their profile is
+    // read. No override: one shell per machine keeps the panes identical to
+    // the terminal the client was launched from.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     (shell, vec!["-l".into()])
 }
 
-fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> anyhow::Result<()> {
+/// The workspace id the daemon serves on the socket the client connected
+/// to. Both ends derive it from the same path (see `Daemon::workspace_id`),
+/// so the client reads it back for the status bar without asking.
+fn workspace_id(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn run(
+    stream: UnixStream,
+    writer: &mut UnixStream,
+    workspace: &str,
+    theme: &theme::Theme,
+) -> anyhow::Result<()> {
     send_msg(writer, &ClientMsg::Attach)?;
     // Size the daemon to the real terminal. The daemon answers Attach
     // with the current layout immediately, so this first read tells us
@@ -281,9 +298,13 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut mode = input::Mode::Input;
-    // Toggled by the leader's `t`; the hint's reserved row stays on
-    // screen either way (see render::draw_hint).
-    let mut hint_on = true;
+    // The leader's `t` shortcut: on, the status bar's middle carries the
+    // active mode's keymap instead of the working directory. Off by
+    // default, since the directory is what the bar is for.
+    let mut keys_on = false;
+    // The status bar's clock, re-read at most once per its refresh window
+    // so the render stays free of the wall clock.
+    let mut clock = clock::Clock::new();
     let mut selection: Option<selection::Selection> = None;
     // Copy-mode cursor: viewport-relative (row, col). Set on entering
     // copy mode, moved by hjkl, and placed on prompts by PromptLanded.
@@ -292,6 +313,11 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
     // The client applies the reply before reading the next key, so one
     // slot is enough: nothing can move the cursor in between.
     let mut copy_scroll_pending: Option<isize> = None;
+    // Set by a wheel tick toward the live screen: copy mode ends when the
+    // frame that follows reports the viewport live again. A flag rather
+    // than a check on the frame alone, because entering copy mode at the
+    // bottom of the scrollback also reads as live and must not exit.
+    let mut exit_copy_when_live = false;
     // Search prompt state: the needle being typed, and the last submitted
     // needle that n/N repeat.
     let mut search_needle = String::new();
@@ -316,7 +342,9 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
     // cursor move resets the terminal's blink timer. Redrawing only when
     // a frame actually differs keeps the blink alive while idle.
     // The selection cursor joins the diff key: a SelectMove changes no
-    // pane state but must repaint the highlight.
+    // pane state but must repaint the highlight. The clock's text joins
+    // it for the same reason, so the bar's minute advances on an
+    // otherwise idle screen.
     type FrameKey = (
         Vec<PaneState>,
         PaneId,
@@ -325,6 +353,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
         Option<(usize, usize)>,
         Option<(usize, usize)>,
         Option<(PaneId, Vec<usize>, usize)>,
+        String,
     );
     let mut last_drawn: Option<FrameKey> = None;
     loop {
@@ -365,6 +394,23 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
                 } => {
                     panes = p;
                     focused = f;
+                    // A wheel tick that scrolled back to the live screen
+                    // ends copy mode, so the bar and the keys return to
+                    // input mode instead of staying in a mode whose
+                    // viewport no longer exists.
+                    if exit_copy_when_live
+                        && panes
+                            .iter()
+                            .find(|p| p.id == focused)
+                            .is_some_and(|p| p.scroll.is_none())
+                    {
+                        mode = input::Mode::Input;
+                        selection = None;
+                        copy_cursor = None;
+                        copy_scroll_pending = None;
+                        search_hits = None;
+                        exit_copy_when_live = false;
+                    }
                 }
                 ServerMsg::Exited { .. } => {}
                 // Only the listing connection asks for this, so the run
@@ -415,33 +461,39 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
         if crossterm::event::poll(POLL)? {
             match crossterm::event::read()? {
                 crossterm::event::Event::Mouse(ev) => {
-                    match input::handle_mouse(ev, &panes, &mode, &mut drag) {
+                    match input::handle_mouse(ev, &panes, &mode, focused, &mut drag) {
                         Some(input::MouseAction::FocusPane(pane)) => {
                             send_msg(writer, &ClientMsg::FocusPane { pane })?;
                         }
                         Some(input::MouseAction::SetSplitRatio { at, ratio }) => {
                             send_msg(writer, &ClientMsg::SetSplitRatio { at, ratio })?;
                         }
-                        Some(input::MouseAction::Scroll(delta)) => {
-                            copy_scroll_pending = Some(delta);
+                        Some(input::MouseAction::Scroll { pane, delta }) => {
+                            // A wheel tick toward the live screen leaves copy
+                            // mode once the viewport is live again; the frame
+                            // that follows says whether it got there. The
+                            // cursor is left where the wheel found it: the
+                            // mid-row repositioning belongs to the half-page
+                            // keys, not to every tick.
+                            exit_copy_when_live = delta > 0;
                             send_msg(
                                 writer,
                                 &ClientMsg::Scroll {
+                                    pane,
                                     target: corrald::protocol::ScrollTarget::Delta(delta),
                                 },
                             )?;
                         }
-                        Some(input::MouseAction::EnterCopyThenScroll(delta)) => {
+                        Some(input::MouseAction::EnterCopyThenScroll { pane, delta }) => {
                             mode = input::Mode::Copy;
-                            let bottom = focused_pane.map(|p| p.rect.h as usize).unwrap_or(1);
-                            copy_cursor = Some(initial_copy_cursor(
-                                focused_pane.and_then(|p| p.cursor),
-                                bottom,
-                            ));
-                            copy_scroll_pending = Some(delta);
+                            let target = panes.iter().find(|p| p.id == pane);
+                            let height = target.map(|p| p.rect.h as usize).unwrap_or(1);
+                            copy_cursor =
+                                Some(initial_copy_cursor(target.and_then(|p| p.cursor), height));
                             send_msg(
                                 writer,
                                 &ClientMsg::Scroll {
+                                    pane,
                                     target: corrald::protocol::ScrollTarget::Delta(delta),
                                 },
                             )?;
@@ -451,6 +503,10 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
                     continue;
                 }
                 crossterm::event::Event::Key(ev) => {
+                    // A pending wheel exit only covers the frames that
+                    // follow its tick; a keystroke in between means the
+                    // user is doing something else.
+                    exit_copy_when_live = false;
                     let action = input::handle(ev, &mut leader_armed, &mode, app_cursor, half_page);
                     match action {
                         Some(input::Action::Quit) => break,
@@ -472,6 +528,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
                             send_msg(
                                 writer,
                                 &ClientMsg::Scroll {
+                                    pane: focused,
                                     target: corrald::protocol::ScrollTarget::Bottom,
                                 },
                             )?;
@@ -490,6 +547,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
                                     send_msg(
                                         writer,
                                         &ClientMsg::Scroll {
+                                            pane: focused,
                                             target: corrald::protocol::ScrollTarget::Delta(-1),
                                         },
                                     )?;
@@ -497,6 +555,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
                                     send_msg(
                                         writer,
                                         &ClientMsg::Scroll {
+                                            pane: focused,
                                             target: corrald::protocol::ScrollTarget::Delta(1),
                                         },
                                     )?;
@@ -504,7 +563,13 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
                             }
                         }
                         Some(input::Action::CopyScroll(target)) => {
-                            send_msg(writer, &ClientMsg::Scroll { target })?;
+                            send_msg(
+                                writer,
+                                &ClientMsg::Scroll {
+                                    pane: focused,
+                                    target,
+                                },
+                            )?;
                             // g/G pin the copy cursor to the new viewport edge.
                             // Ctrl+u/Ctrl+d (Delta) scroll the content under a
                             // cursor that lands on the pane's middle row instead:
@@ -656,7 +721,7 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
                             send_msg(writer, &ClientMsg::Key { bytes })?;
                         }
                         Some(input::Action::ToggleHint) => {
-                            hint_on = !hint_on;
+                            keys_on = !keys_on;
                         }
                         None => {}
                     }
@@ -710,25 +775,28 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
         // The whole hint joins the diff key: collapsing it to a bool
         // would skip the repaint that reveals the search prompt when a
         // Copy frame turns into a Search frame.
+        let clock_text = clock.text().to_string();
         let frame_changed = last_drawn.as_ref()
             != Some(&(
                 panes.clone(),
                 focused,
                 hint.clone(),
-                hint_on,
+                keys_on,
                 sel_cursor,
                 visible_cursor,
                 search_hits.clone(),
+                clock_text.clone(),
             ));
         if frame_changed {
             last_drawn = Some((
                 panes.clone(),
                 focused,
                 hint.clone(),
-                hint_on,
+                keys_on,
                 sel_cursor,
                 visible_cursor,
                 search_hits.clone(),
+                clock_text.clone(),
             ));
             terminal.draw(|f| {
                 // Selection spans render reversed over the focused pane's
@@ -753,11 +821,13 @@ fn run(stream: UnixStream, writer: &mut UnixStream, theme: &theme::Theme) -> any
                     &panes,
                     focused,
                     hint,
-                    hint_on,
+                    keys_on,
                     &spans,
                     &search,
                     &current,
                     visible_cursor,
+                    workspace,
+                    &clock_text,
                     theme,
                 );
                 // Position the real cursor inside the frame. Full-screen

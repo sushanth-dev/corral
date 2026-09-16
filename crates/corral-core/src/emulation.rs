@@ -352,6 +352,58 @@ impl Emulator {
     pub fn title(&mut self) -> Result<String> {
         Ok(self.terminal.title()?.to_owned())
     }
+
+    /// The pane's working directory as reported by OSC 7, decoded to a
+    /// plain path. libghostty hands back the raw `file://host/path` URI, so
+    /// the scheme and authority are stripped and percent-escapes decoded.
+    /// Empty when the pane never reported one, or reported something that
+    /// is not a `file://` URI.
+    pub fn pwd(&mut self) -> Result<String> {
+        Ok(pwd_path(self.terminal.pwd()?).unwrap_or_default())
+    }
+}
+
+/// Strip the `file://` scheme and authority from an OSC 7 report, leaving
+/// the path. Returns `None` for any other URI scheme.
+fn pwd_path(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let at = rest.find('/')?;
+    Some(percent_decode(&rest[at..]))
+}
+
+/// Decode `%XX` escapes, leaving anything malformed as literal text.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
+            (b'%', Some(&hi), Some(&lo)) => match (hex_digit(hi), hex_digit(lo)) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi * 16 + lo);
+                    i += 3;
+                }
+                _ => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
+            _ => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Append one cell to `line`, merging into the previous run when the
@@ -923,5 +975,54 @@ mod tests {
         emu.feed(b"\x1b]2;First\x1b\\");
         emu.feed(b"\x1b]2;Second\x1b\\");
         assert_eq!(emu.title().unwrap(), "Second");
+    }
+
+    #[test]
+    fn a_pane_that_never_reported_a_pwd_returns_empty() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        assert_eq!(emu.pwd().unwrap(), "");
+    }
+
+    #[test]
+    fn an_osc_7_sequence_sets_the_pwd_without_the_uri_parts() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]7;file://localhost/tmp/project\x1b\\");
+        assert_eq!(emu.pwd().unwrap(), "/tmp/project");
+    }
+
+    #[test]
+    fn a_later_pwd_replaces_the_earlier_one() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]7;file://localhost/tmp/one\x1b\\");
+        emu.feed(b"\x1b]7;file://localhost/tmp/two\x1b\\");
+        assert_eq!(emu.pwd().unwrap(), "/tmp/two");
+    }
+
+    #[test]
+    fn a_pwd_with_escapes_is_decoded() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]7;file://localhost/tmp/with%20space\x1b\\");
+        assert_eq!(emu.pwd().unwrap(), "/tmp/with space");
+    }
+
+    #[test]
+    fn a_pwd_report_without_a_host_is_still_a_path() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]7;file:///tmp/bare\x1b\\");
+        assert_eq!(emu.pwd().unwrap(), "/tmp/bare");
+    }
+
+    #[test]
+    fn a_non_file_uri_reports_no_pwd() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]7;ssh://host/tmp/project\x1b\\");
+        assert_eq!(emu.pwd().unwrap(), "");
+    }
+
+    #[test]
+    fn a_truncated_escape_is_left_literal() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]7;file://localhost/tmp/a%2\x1b\\");
+        assert_eq!(emu.pwd().unwrap(), "/tmp/a%2");
     }
 }

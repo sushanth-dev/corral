@@ -34,7 +34,11 @@ pub enum ClientMsg {
     },
     /// Move focus to the next pane in tree order, wrapping.
     FocusNext,
+    /// Scroll one pane's viewport. The pane is named rather than taken
+    /// from the daemon's focus: the wheel scrolls the pane under the
+    /// pointer, which is not always the focused one.
     Scroll {
+        pane: PaneId,
         target: ScrollTarget,
     },
     Search {
@@ -162,6 +166,10 @@ pub struct PaneState {
     /// state, not viewport state: it survives scrolling since it does
     /// not come from the viewport window at all.
     pub title: String,
+    /// The pane's working directory as reported by OSC 7, decoded to a
+    /// plain path, empty if never reported. The status bar shows this
+    /// for the focused pane, the way tmux shows the active pane's path.
+    pub pwd: String,
 }
 
 /// Scroll position of one session's viewport in one pane, mirrored from
@@ -200,12 +208,15 @@ mod tests {
             },
             ClientMsg::FocusNext,
             ClientMsg::Scroll {
+                pane: 1,
                 target: ScrollTarget::Delta(-10),
             },
             ClientMsg::Scroll {
+                pane: 2,
                 target: ScrollTarget::Top,
             },
             ClientMsg::Scroll {
+                pane: 2,
                 target: ScrollTarget::Bottom,
             },
             ClientMsg::Search {
@@ -258,6 +269,7 @@ mod tests {
                 total_scrollback: 96,
                 lines: vec![],
                 title: "my title".into(),
+                pwd: String::new(),
             }],
             focused: 1,
         };
@@ -396,6 +408,7 @@ mod tests {
                     ],
                 }],
                 title: String::new(),
+                pwd: String::new(),
             }],
             focused: 1,
         };
@@ -481,6 +494,7 @@ mod tests {
                 total_scrollback: 3,
                 lines: vec![],
                 title: String::new(),
+                pwd: String::new(),
             }],
             focused: 1,
         };

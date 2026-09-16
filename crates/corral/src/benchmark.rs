@@ -79,6 +79,7 @@ mod bench {
                 total_scrollback: 0,
                 lines: vec![],
                 title: String::new(),
+                pwd: String::new(),
             });
         }
 
@@ -103,11 +104,13 @@ mod bench {
                         &snapshot,
                         focused,
                         render::Hint::None,
-                        true,
+                        false,
                         &[],
                         &[],
                         &[],
                         None,
+                        "bench",
+                        "00:00 01-Jan-70",
                         &theme,
                     )
                 })
