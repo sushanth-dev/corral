@@ -433,6 +433,7 @@ fn status_row(
     }
     let used = block.chars().count()
         + workspace.chars().count()
+        + 1
         + rest.chars().count()
         + SEPARATOR.chars().count()
         + clock.chars().count();
@@ -444,6 +445,10 @@ fn status_row(
                 .bg(theme.palette.mode_bg)
                 .add_modifier(Modifier::BOLD),
         ),
+        // One cell of the bar's own background between the block and the
+        // name; the block's trailing padding is highlighted, so without
+        // this the two read as glued together.
+        Span::raw(" "),
         Span::styled(
             workspace.to_string(),
             Style::new().fg(theme.palette.mode_bg),
@@ -833,7 +838,7 @@ mod tests {
         panes[0].pwd = format!("{HOME}/Dev/app");
         let buf = draw_at(101, 10, &panes, 1);
         let bar = row(&buf, 9, 101);
-        assert!(bar.starts_with(" NORMAL corral-test | "), "got {bar:?}");
+        assert!(bar.starts_with(" NORMAL  corral-test | "), "got {bar:?}");
         assert!(bar.contains("~/D/app"), "got {bar:?}");
         assert!(bar.ends_with(" | 14:23 16-Sep-26"), "got {bar:?}");
     }
@@ -871,7 +876,7 @@ mod tests {
         // clock off the right edge.
         let buf = draw_at(50, 4, &panes, 1);
         let bar = row(&buf, 3, 50);
-        assert_eq!(bar, " NORMAL corral-test | 1/1        | 14:23 16-Sep-26");
+        assert_eq!(bar, " NORMAL  corral-test | 1/1       | 14:23 16-Sep-26");
         assert!(!bar.contains("pane-content"), "the bar owns the last row");
     }
 
@@ -880,7 +885,7 @@ mod tests {
         let panes = panes();
         let buf = draw_at(101, 10, &panes, 1);
         let theme = test_theme();
-        let offset = " NORMAL ".chars().count() as u16;
+        let offset = " NORMAL  ".chars().count() as u16;
         for x in offset..offset + WORKSPACE.chars().count() as u16 {
             assert_eq!(buf[(x, 9)].fg, theme.palette.mode_bg, "name cell {x}");
         }
