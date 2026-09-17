@@ -45,11 +45,11 @@ struct RawPalette {
     picker_selected_bg: String,
 }
 
-// Defaults mirror the bundled Catppuccin Mocha chrome: mantle for the bar
-// and picker, blue for the mode block, overlay0 for what the eye passes
-// over.
+// Defaults mirror the bundled Catppuccin Mocha chrome: the bar and picker
+// sit on the terminal's own background so they blend with the panes, blue
+// for the mode block, overlay0 for what the eye passes over.
 fn default_bar_bg() -> String {
-    "#181825".into()
+    "default".into()
 }
 fn default_bar_fg() -> String {
     "#a6adc8".into()
@@ -64,7 +64,7 @@ fn default_muted() -> String {
     "#7f849c".into()
 }
 fn default_picker_bg() -> String {
-    "#181825".into()
+    "default".into()
 }
 fn default_picker_selected_bg() -> String {
     "#313244".into()
@@ -114,9 +114,18 @@ pub struct Theme {
     pub palette: Palette,
 }
 
-/// A `#rrggbb` string to `Color::Rgb`. The `#` and exactly six hex digits
-/// are required; anything else is a malformed theme file, not a color to
-/// guess at.
+/// A palette value to a color. `"default"` means the terminal's own
+/// background (`Color::Reset`), which is how the bar and picker blend with
+/// the panes instead of seaming against them; anything else must be
+/// `#rrggbb`. The `#` and exactly six hex digits are required; anything
+/// else is a malformed theme file, not a color to guess at.
+fn parse_color(field: &str, value: &str) -> Result<Color> {
+    if value == "default" {
+        return Ok(Color::Reset);
+    }
+    parse_hex(field, value)
+}
+
 fn parse_hex(field: &str, value: &str) -> Result<Color> {
     let digits = value
         .strip_prefix('#')
@@ -142,13 +151,13 @@ impl Palette {
             current_hit_fg: parse_hex("current_hit_fg", &raw.current_hit_fg)?,
             hint_bg: parse_hex("hint_bg", &raw.hint_bg)?,
             hint_fg: parse_hex("hint_fg", &raw.hint_fg)?,
-            bar_bg: parse_hex("bar_bg", &raw.bar_bg)?,
-            bar_fg: parse_hex("bar_fg", &raw.bar_fg)?,
-            mode_bg: parse_hex("mode_bg", &raw.mode_bg)?,
-            mode_fg: parse_hex("mode_fg", &raw.mode_fg)?,
-            muted: parse_hex("muted", &raw.muted)?,
-            picker_bg: parse_hex("picker_bg", &raw.picker_bg)?,
-            picker_selected_bg: parse_hex("picker_selected_bg", &raw.picker_selected_bg)?,
+            bar_bg: parse_color("bar_bg", &raw.bar_bg)?,
+            bar_fg: parse_color("bar_fg", &raw.bar_fg)?,
+            mode_bg: parse_color("mode_bg", &raw.mode_bg)?,
+            mode_fg: parse_color("mode_fg", &raw.mode_fg)?,
+            muted: parse_color("muted", &raw.muted)?,
+            picker_bg: parse_color("picker_bg", &raw.picker_bg)?,
+            picker_selected_bg: parse_color("picker_selected_bg", &raw.picker_selected_bg)?,
         })
     }
 }
@@ -221,12 +230,12 @@ mod tests {
         assert_eq!(theme.palette.focused_gutter, Color::Rgb(0x89, 0xb4, 0xfa));
         assert_eq!(theme.palette.search_bg, Color::Rgb(0xf9, 0xe2, 0xaf));
         assert_eq!(theme.palette.current_hit_bg, Color::Rgb(0xcb, 0xa6, 0xf7));
-        assert_eq!(theme.palette.bar_bg, Color::Rgb(0x18, 0x18, 0x25));
+        assert_eq!(theme.palette.bar_bg, Color::Reset);
         assert_eq!(theme.palette.bar_fg, Color::Rgb(0xa6, 0xad, 0xc8));
         assert_eq!(theme.palette.mode_bg, Color::Rgb(0x89, 0xb4, 0xfa));
         assert_eq!(theme.palette.mode_fg, Color::Rgb(0x11, 0x11, 0x1b));
         assert_eq!(theme.palette.muted, Color::Rgb(0x7f, 0x84, 0x9c));
-        assert_eq!(theme.palette.picker_bg, Color::Rgb(0x18, 0x18, 0x25));
+        assert_eq!(theme.palette.picker_bg, Color::Reset);
         assert_eq!(
             theme.palette.picker_selected_bg,
             Color::Rgb(0x31, 0x32, 0x44)
@@ -247,7 +256,8 @@ mod tests {
         }"##;
         let theme = Theme::from_json(legacy).expect("legacy theme must parse");
         assert_eq!(theme.name, "Legacy");
-        assert_eq!(theme.palette.bar_bg, Color::Rgb(0x18, 0x18, 0x25));
+        assert_eq!(theme.palette.bar_bg, Color::Reset);
+        assert_eq!(theme.palette.picker_bg, Color::Reset);
         assert_eq!(
             theme.palette.picker_selected_bg,
             Color::Rgb(0x31, 0x32, 0x44)
@@ -292,6 +302,14 @@ mod tests {
     #[test]
     fn non_hex_digits_are_rejected() {
         assert!(parse_hex("gutter", "#zzzzzz").is_err());
+    }
+
+    #[test]
+    fn default_parses_to_the_terminal_background_but_a_bad_color_still_fails() {
+        assert_eq!(parse_color("bar_bg", "default").unwrap(), Color::Reset);
+        assert!(parse_color("bar_bg", "defaults").is_err());
+        assert!(parse_color("bar_bg", "Default").is_err());
+        assert!(parse_color("bar_bg", "#ff0000").is_ok());
     }
 
     #[test]
