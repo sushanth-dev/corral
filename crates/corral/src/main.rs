@@ -298,10 +298,10 @@ fn run(
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut mode = input::Mode::Input;
-    // The leader's `t` shortcut opens the keymap dialogue over the panes.
-    // Off by default: it is something to consult, not something to sit in
-    // front of.
-    let mut keymaps = false;
+    // The leader's `t` shortcut opens the binding picker over the panes.
+    // None by default: it is something to consult, not something to sit
+    // in front of.
+    let mut picker: Option<input::Picker> = None;
     // The status bar shortens the pane's directory against `$HOME`, so a
     // path under home reads as `~`. Read once, since the environment does
     // not change under us.
@@ -348,18 +348,20 @@ fn run(
     // The selection cursor joins the diff key: a SelectMove changes no
     // pane state but must repaint the highlight. The clock's text joins
     // it for the same reason, so the bar's minute advances on an
-    // otherwise idle screen. The bool is the keymap dialogue's state; its
-    // contents derive from the hint already in the key.
+    // otherwise idle screen. The picker joins it too: its query and
+    // selection move the highlight inside the picker window.
     type FrameKey = (
         Vec<PaneState>,
         PaneId,
         render::Hint,
-        bool,
+        Option<(String, usize)>,
         Option<(usize, usize)>,
         Option<(usize, usize)>,
         Option<(PaneId, Vec<usize>, usize)>,
         String,
     );
+    // The picker's slice of the frame key: query and selected index.
+    let picker_key = |p: &Option<input::Picker>| p.as_ref().map(|p| (p.query.clone(), p.selected));
     let mut last_drawn: Option<FrameKey> = None;
     loop {
         // Drain socket lines (nonblocking): frames land in the pane state
@@ -466,9 +468,9 @@ fn run(
         if crossterm::event::poll(POLL)? {
             match crossterm::event::read()? {
                 crossterm::event::Event::Mouse(ev) => {
-                    // The dialogue is modal: a click or a wheel tick while
+                    // The picker is modal: a click or a wheel tick while
                     // it is up would act on a pane the user cannot see.
-                    if keymaps {
+                    if picker.is_some() {
                         continue;
                     }
                     match input::handle_mouse(ev, &panes, &mode, focused, &mut drag) {
@@ -520,12 +522,22 @@ fn run(
                     // follow its tick; a keystroke in between means the
                     // user is doing something else.
                     exit_copy_when_live = false;
-                    // The dialogue is modal: any key closes it and reaches
-                    // nothing else, so a key pressed while reading the list
-                    // cannot also act on the session.
-                    let action = if keymaps {
-                        keymaps = false;
-                        None
+                    // The picker is modal: it consumes keys until esc or
+                    // enter, so a key pressed while filtering cannot also
+                    // act on the session. Enter hands the selected
+                    // binding's action to the same dispatch below.
+                    let action = if let Some(p) = picker.as_mut() {
+                        match input::handle_picker(ev, p) {
+                            input::PickerOutcome::Run(action) => {
+                                picker = None;
+                                Some(action)
+                            }
+                            input::PickerOutcome::Close => {
+                                picker = None;
+                                None
+                            }
+                            input::PickerOutcome::Stay => None,
+                        }
                     } else {
                         input::handle(ev, &mut leader_armed, &mode, app_cursor, half_page)
                     };
@@ -742,7 +754,7 @@ fn run(
                             send_msg(writer, &ClientMsg::Key { bytes })?;
                         }
                         Some(input::Action::ToggleHint) => {
-                            keymaps = !keymaps;
+                            picker = Some(input::Picker::new());
                         }
                         None => {}
                     }
@@ -797,12 +809,13 @@ fn run(
         // would skip the repaint that reveals the search prompt when a
         // Copy frame turns into a Search frame.
         let clock_text = clock.text().to_string();
+        let picker_state = picker_key(&picker);
         let frame_changed = last_drawn.as_ref()
             != Some(&(
                 panes.clone(),
                 focused,
                 hint.clone(),
-                keymaps,
+                picker_state.clone(),
                 sel_cursor,
                 visible_cursor,
                 search_hits.clone(),
@@ -813,7 +826,7 @@ fn run(
                 panes.clone(),
                 focused,
                 hint.clone(),
-                keymaps,
+                picker_state,
                 sel_cursor,
                 visible_cursor,
                 search_hits.clone(),
@@ -842,7 +855,7 @@ fn run(
                     &panes,
                     focused,
                     hint,
-                    keymaps,
+                    picker.as_ref(),
                     &spans,
                     &search,
                     &current,

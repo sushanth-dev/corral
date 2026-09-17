@@ -103,7 +103,7 @@ mod bench {
                         &snapshot,
                         focused,
                         render::Hint::None,
-                        false,
+                        None,
                         &[],
                         &[],
                         &[],

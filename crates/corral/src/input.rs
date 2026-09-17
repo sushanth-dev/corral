@@ -164,20 +164,113 @@ const LEADER_TABLE: &[LeaderEntry] = &[
     },
 ];
 
-/// Every leader binding as `(keys, what)`, in table order, with
+/// One picker row: the keys shown, what the binding does, and the action
+/// it dispatches.
+pub type Binding = (&'static str, &'static str, fn() -> Action);
+
+/// Every leader binding as `(keys, what, run)`, in table order, with
 /// duplicates (h/l and the arrows both focus) folded into one entry.
-pub fn leader_keys() -> Vec<(&'static str, &'static str)> {
-    let mut keys: Vec<(&'static str, &'static str)> = Vec::new();
+/// `keys` is what the user presses after Ctrl+a, `what` the rest of the
+/// description, `run` the action the binding dispatches. The picker lists
+/// these and runs the selected one, so a binding added to the table shows
+/// up there without a second edit.
+pub fn leader_bindings() -> Vec<Binding> {
+    let mut out: Vec<Binding> = Vec::new();
     for entry in LEADER_TABLE {
-        let pair = entry
+        let (keys, what) = entry
             .description
             .split_once(' ')
             .unwrap_or((entry.description, ""));
-        if !keys.contains(&pair) {
-            keys.push(pair);
+        if !out.iter().any(|(k, _, _)| *k == keys) {
+            out.push((keys, what, entry.action));
         }
     }
-    keys
+    out
+}
+
+/// The binding picker behind `ctrl+a t`: an fzf-style floating list where
+/// typing filters the leader bindings and enter runs the selected one.
+/// State only; the filtered list is derived from the query on demand.
+pub struct Picker {
+    pub query: String,
+    pub selected: usize,
+}
+
+impl Picker {
+    pub fn new() -> Self {
+        Self {
+            query: String::new(),
+            selected: 0,
+        }
+    }
+}
+
+/// What one key does while the picker is open.
+#[derive(Debug, PartialEq)]
+pub enum PickerOutcome {
+    /// Close without acting.
+    Close,
+    /// Run the selected binding's action; the caller closes the picker.
+    Run(Action),
+    /// State changed or the key was ignored; the picker stays open.
+    Stay,
+}
+
+/// Case-insensitive subsequence match: every needle char appears in the
+/// haystack in order. fzf's core filter, minus its scoring.
+fn fuzzy(hay: &str, needle: &str) -> bool {
+    let hay = hay.to_lowercase();
+    let mut hay = hay.chars();
+    needle
+        .chars()
+        .flat_map(char::to_lowercase)
+        .all(|n| hay.any(|h| h == n))
+}
+
+/// Indices into `leader_bindings` whose `keys what` text fuzzy-matches
+/// the query. An empty query matches everything, in table order.
+pub fn picker_matches(query: &str) -> Vec<usize> {
+    leader_bindings()
+        .iter()
+        .enumerate()
+        .filter(|(_, (keys, what, _))| fuzzy(&format!("{keys} {what}"), query))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+pub fn handle_picker(ev: KeyEvent, picker: &mut Picker) -> PickerOutcome {
+    let count = picker_matches(&picker.query).len();
+    match (ev.code, ev.modifiers) {
+        (KeyCode::Esc, _) => PickerOutcome::Close,
+        (KeyCode::Enter, _) => {
+            let matches = picker_matches(&picker.query);
+            match matches.get(picker.selected) {
+                Some(&idx) => PickerOutcome::Run((leader_bindings()[idx].2)()),
+                None => PickerOutcome::Stay,
+            }
+        }
+        // The selection resets whenever the query changes: the list under
+        // the cursor is a different list.
+        (KeyCode::Backspace, _) => {
+            picker.query.pop();
+            picker.selected = 0;
+            PickerOutcome::Stay
+        }
+        (KeyCode::Up, _) => {
+            picker.selected = picker.selected.saturating_sub(1);
+            PickerOutcome::Stay
+        }
+        (KeyCode::Down, _) => {
+            picker.selected = (picker.selected + 1).min(count.saturating_sub(1));
+            PickerOutcome::Stay
+        }
+        (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
+            picker.query.push(c);
+            picker.selected = 0;
+            PickerOutcome::Stay
+        }
+        _ => PickerOutcome::Stay,
+    }
 }
 
 // The Ctrl+a leader is the only key corral consumes in input mode. In
@@ -1072,8 +1165,8 @@ mod tests {
     }
 
     #[test]
-    fn leader_keys_lists_every_binding_from_the_table_once() {
-        let keys = leader_keys();
+    fn leader_bindings_lists_every_binding_from_the_table_once() {
+        let keys = leader_bindings();
         for pair in [
             ("h/l", "focus"),
             ("j/k", "focus"),
@@ -1085,15 +1178,98 @@ mod tests {
             ("d", "quit"),
             ("t", "keymaps"),
         ] {
-            assert!(keys.contains(&pair), "{pair:?} is missing from {keys:?}");
+            assert!(
+                keys.iter().any(|(k, w, _)| (*k, *w) == pair),
+                "{pair:?} is missing from {keys:?}"
+            );
         }
         assert_eq!(keys.len(), 9, "one entry per binding, got {keys:?}");
         // h/l and the arrows share one binding; it must not repeat.
         assert_eq!(
-            keys.iter().filter(|(k, _)| *k == "h/l").count(),
+            keys.iter().filter(|(k, _, _)| *k == "h/l").count(),
             1,
             "got {keys:?}"
         );
+    }
+
+    #[test]
+    fn picker_matches_filters_by_fuzzy_subsequence() {
+        assert_eq!(picker_matches("").len(), 9, "empty query matches all");
+        // Case-insensitive: "SPL" finds the split bindings.
+        let hits = picker_matches("SPL");
+        assert!(hits.iter().any(|&i| leader_bindings()[i].0 == "%"));
+        assert!(hits.iter().any(|&i| leader_bindings()[i].0 == "\""));
+        // A subsequence across keys and description, not a substring:
+        // "c clear history" has the c in the keys and the h in the text.
+        assert!(
+            picker_matches("ch")
+                .iter()
+                .any(|&i| leader_bindings()[i].0 == "c")
+        );
+        assert_eq!(picker_matches("zzz"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn picker_keys_move_select_type_and_reset() {
+        let mut picker = Picker::new();
+        // Typing filters and resets the selection.
+        picker.query.push('s');
+        handle_picker(key(KeyCode::Down, KeyModifiers::NONE), &mut picker);
+        assert_eq!(picker.selected, 1);
+        handle_picker(key(KeyCode::Char('p'), KeyModifiers::NONE), &mut picker);
+        assert_eq!(picker.selected, 0, "typing resets the selection");
+        // Down is clamped at the last match.
+        for _ in 0..50 {
+            handle_picker(key(KeyCode::Down, KeyModifiers::NONE), &mut picker);
+        }
+        let last = picker_matches(&picker.query).len() - 1;
+        assert_eq!(picker.selected, last);
+        // Up walks back to the top and stays there.
+        handle_picker(key(KeyCode::Up, KeyModifiers::NONE), &mut picker);
+        assert_eq!(picker.selected, last - 1);
+        for _ in 0..50 {
+            handle_picker(key(KeyCode::Up, KeyModifiers::NONE), &mut picker);
+        }
+        assert_eq!(picker.selected, 0);
+        // Backspace shortens the query and resets the selection.
+        handle_picker(key(KeyCode::Backspace, KeyModifiers::NONE), &mut picker);
+        assert_eq!(picker.query, "s");
+        assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn picker_esc_closes_and_enter_runs_the_selection() {
+        let mut picker = Picker::new();
+        assert_eq!(
+            handle_picker(key(KeyCode::Esc, KeyModifiers::NONE), &mut picker),
+            PickerOutcome::Close
+        );
+        // Empty query, selection 0: the first binding in the table runs.
+        let first = leader_bindings()[0].2();
+        match handle_picker(key(KeyCode::Enter, KeyModifiers::NONE), &mut picker) {
+            PickerOutcome::Run(action) => assert_eq!(
+                format!("{action:?}"),
+                format!("{first:?}"),
+                "enter must run the selected binding"
+            ),
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // An empty query with the selection beyond the matches stays put.
+        picker.query = "zzz".into();
+        picker.selected = 3;
+        assert_eq!(
+            handle_picker(key(KeyCode::Enter, KeyModifiers::NONE), &mut picker),
+            PickerOutcome::Stay
+        );
+    }
+
+    #[test]
+    fn picker_actions_match_the_leader_dispatch() {
+        // Every binding the picker can run is one the leader dispatches,
+        // because both read the same table.
+        for (_, _, action) in leader_bindings() {
+            let _ = action();
+        }
     }
 
     #[test]

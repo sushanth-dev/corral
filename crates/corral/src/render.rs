@@ -30,7 +30,7 @@ pub fn draw(
     panes: &[PaneState],
     focused: PaneId,
     hint: Hint,
-    keymaps: bool,
+    picker: Option<&crate::input::Picker>,
     spans: &[(PaneId, SpanList)],
     search: &[(PaneId, SpanList)],
     current: &[(PaneId, SpanList)],
@@ -100,9 +100,9 @@ pub fn draw(
     draw_status(
         frame, workspace, dir, &hint, panes, focused, home, clock, theme,
     );
-    // The dialogue paints last, over the panes and the status row both.
-    if keymaps {
-        draw_keymaps(frame, &hint, theme);
+    // The picker paints last, over the panes and the status row both.
+    if let Some(picker) = picker {
+        draw_picker(frame, picker, theme);
     }
 }
 
@@ -320,12 +320,6 @@ fn paint_spans(frame: &mut Frame, pane: &PaneState, spans: &SpanList, style: Sty
     }
 }
 
-// The copy-mode keymap. The client reserves the last terminal row for
-// the status bar (see the client's initial Resize), so the bar always
-// has somewhere to draw and never gets overwritten by pane content; the
-// `t` dialogue lists these bindings over the panes.
-const COPY_KEYS: &str = "hjkl move | { } prompt | ctrl+o yank cmd | v select | q exit";
-
 /// The status row on the last screen line, over everything else, always
 /// present. Four zones: the workspace on the left, then the focused
 /// pane's directory and its place in the frame, then the clock flush
@@ -371,9 +365,25 @@ fn draw_status(
     );
 }
 
-/// Compose one status row: the name, the directory, the pane index and
-/// the clock, each held apart by a bar. The name carries the theme's
-/// accent, which is what tells it apart from the path beside it.
+/// The mode's name as the statusline's leftmost block shows it, Neovim
+/// style: a colored block that says the mode in words. Copy carries its
+/// viewport position, since that is the mode's whole state.
+fn mode_block(hint: &Hint) -> String {
+    match hint {
+        Hint::None => " NORMAL ".to_string(),
+        Hint::Copy(None) => " COPY ".to_string(),
+        Hint::Copy(Some((offset, total))) => format!(" COPY {offset}/{total} "),
+        Hint::Select => " SELECT ".to_string(),
+        Hint::Search(_) => " SEARCH ".to_string(),
+    }
+}
+
+/// Compose one status row, lualine style: a mode block in its own
+/// background at the left edge, then the name, the directory, the pane
+/// index and the clock as segments on the bar's own background, the
+/// clock flush right. The mode block's background is the theme's accent,
+/// which is what makes the mode readable at a glance; the name keeps the
+/// same accent as its foreground.
 #[allow(clippy::too_many_arguments)]
 fn status_row(
     width: usize,
@@ -385,22 +395,33 @@ fn status_row(
     clock: &str,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
-    let sep = SEPARATOR.chars().count();
-    let panes_part = if panes_zone.is_empty() {
-        0
-    } else {
-        sep + panes_zone.chars().count()
-    };
-    let room = width
-        .saturating_sub(workspace.chars().count() + sep + panes_part + sep + clock.chars().count());
     // A needle is typed from its front, so it gives way at the right; a
     // path reads from its last component, so it gives way at the left.
+    // The directory zone is the only one that shrinks: everything else
+    // on the row is fixed-width.
+    let block = mode_block(hint);
+    let dir_full = match hint {
+        Hint::Search(needle) => format!("search: {needle}"),
+        _ => shorten_path(dir, home),
+    };
+    let mut rest = String::new();
+    for zone in [dir_full.as_str(), panes_zone] {
+        if zone.is_empty() {
+            continue;
+        }
+        rest.push_str(SEPARATOR);
+        rest.push_str(zone);
+    }
+    let fixed = block.chars().count()
+        + workspace.chars().count()
+        + SEPARATOR.chars().count()
+        + clock.chars().count();
+    let dir_room = width
+        .saturating_sub(fixed)
+        .saturating_sub(rest.chars().count() - dir_full.chars().count());
     let dir_zone = match hint {
-        Hint::Search(needle) => truncate_right(&format!("search: {needle}"), room),
-        _ => truncate_left(
-            &format!("{}{}", mode_tag(hint), shorten_path(dir, home)),
-            room,
-        ),
+        Hint::Search(_) => truncate_right(&dir_full, dir_room),
+        _ => truncate_left(&dir_full, dir_room),
     };
     let mut rest = String::new();
     for zone in [dir_zone.as_str(), panes_zone] {
@@ -410,11 +431,19 @@ fn status_row(
         rest.push_str(SEPARATOR);
         rest.push_str(zone);
     }
-    let used = workspace.chars().count()
+    let used = block.chars().count()
+        + workspace.chars().count()
         + rest.chars().count()
         + SEPARATOR.chars().count()
         + clock.chars().count();
     vec![
+        Span::styled(
+            block,
+            Style::new()
+                .fg(theme.palette.cursor_fg)
+                .bg(theme.palette.focused_gutter)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             workspace.to_string(),
             Style::new().fg(theme.palette.focused_gutter),
@@ -436,79 +465,64 @@ fn pane_zone(panes: &[PaneState], focused: PaneId) -> String {
         .unwrap_or_default()
 }
 
-/// The mode marker that leads the directory zone, so the mode stays
-/// visible on the bar without the keymaps. Empty in input mode, where
-/// there is nothing to report, and in search, whose needle is the report.
-fn mode_tag(hint: &Hint) -> String {
-    match hint {
-        Hint::None | Hint::Search(_) => String::new(),
-        Hint::Copy(None) => "[copy] ".into(),
-        Hint::Copy(Some((offset, total))) => format!("[copy {offset}/{total}] "),
-        Hint::Select => "[select] ".into(),
-    }
-}
-
-/// The head of the `t` dialogue: the mode whose keys are listed below it.
-fn keymap_header(hint: &Hint) -> String {
-    match hint {
-        Hint::None => "input mode".to_string(),
-        Hint::Copy(None) => "copy mode".to_string(),
-        Hint::Copy(Some((offset, total))) => format!("copy mode {offset}/{total}"),
-        Hint::Select => "copy mode select".to_string(),
-        Hint::Search(needle) => format!("search: {needle}"),
-    }
-}
-
-/// The body of the `t` dialogue: one line per binding of the mode in
-/// hand. Input mode reads the leader table, so a binding added there
-/// shows up here without a second edit.
-fn keymap_lines(hint: &Hint) -> Vec<String> {
-    let mut lines = vec![keymap_header(hint)];
-    match hint {
-        Hint::None => {
-            for (keys, what) in crate::input::leader_keys() {
-                lines.push(format!("  {keys:<4}  {what}"));
-            }
-        }
-        Hint::Copy(_) => {
-            for item in COPY_KEYS.split(" | ") {
-                lines.push(format!("  {item}"));
-            }
-        }
-        Hint::Select => {
-            lines.push("  y    yank".to_string());
-            lines.push("  esc  cancel".to_string());
-        }
-        // Search is a prompt rather than a submode: the needle is the
-        // whole report, and the keys that drive it are copy mode's.
-        Hint::Search(_) => {}
-    }
-    lines.push(String::new());
-    lines.push("  any key closes".to_string());
-    lines
-}
-
-/// The `ctrl+a t` dialogue: the keys of the mode in hand, over the panes.
-/// The status bar is one row and cannot hold a list this tall, so the
-/// list gets a box instead. Any key closes it, which the box says.
-fn draw_keymaps(frame: &mut Frame, hint: &Hint, theme: &Theme) {
+/// The binding picker over the panes, fzf style: a centered floating
+/// window with the query as a prompt line, the filtered bindings below,
+/// and the selected line in the accent. Enter runs it, esc closes; the
+/// footer says so. The list comes from the same table the leader
+/// dispatches through, so the two can never disagree.
+fn draw_picker(frame: &mut Frame, picker: &crate::input::Picker, theme: &Theme) {
     let area = frame.area();
-    let lines = keymap_lines(hint);
-    let body = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-    // A cell of padding inside each vertical border, plus the borders.
-    // The last screen row belongs to the status bar, so a tall list
-    // gives way at the bottom rather than covering the bar.
-    let width = (body as u16 + 4).min(area.width);
+    let matches = crate::input::picker_matches(&picker.query);
+    let bindings = crate::input::leader_bindings();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!(" {} ", picker.query),
+        Style::new()
+            .fg(theme.palette.cursor_fg)
+            .bg(theme.palette.cursor_bg),
+    )));
+    for (row, idx) in matches.iter().enumerate() {
+        let (keys, what, _) = bindings[*idx];
+        let text = format!("  {keys:<4}  {what}");
+        let line = if row == picker.selected {
+            Line::from(Span::styled(
+                text,
+                Style::new()
+                    .fg(theme.palette.cursor_fg)
+                    .bg(theme.palette.focused_gutter),
+            ))
+        } else {
+            Line::from(Span::raw(text))
+        };
+        lines.push(line);
+    }
+    if matches.is_empty() {
+        lines.push(Line::from(Span::raw("  no match")));
+    }
+    lines.push(Line::from(Span::raw(String::new())));
+    lines.push(Line::from(Span::raw(
+        "  type filters | enter runs | esc closes",
+    )));
+    // Sized to the content, capped to the screen minus the status row.
+    let body = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(0)
+        .max(" corral keys ".len());
+    let width = (body as u16 + 2).min(area.width);
     let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(1));
     let style = Style::new()
         .fg(theme.palette.hint_fg)
         .bg(theme.palette.hint_bg);
-    let text: Vec<Line<'static>> = lines.into_iter().map(Line::raw).collect();
-    let para = Paragraph::new(text)
-        .style(style)
-        .block(Block::bordered().title(" keymaps ").style(style));
+    let block = Block::bordered()
+        .title(Span::styled(
+            " corral keys ",
+            Style::new().fg(theme.palette.focused_gutter),
+        ))
+        .border_style(style);
     frame.render_widget(
-        para,
+        Paragraph::new(lines).style(style).block(block),
         RRect {
             x: area.x + area.width.saturating_sub(width) / 2,
             y: area.y + area.height.saturating_sub(height) / 2,
@@ -698,11 +712,11 @@ mod tests {
         cursor: Option<(usize, usize)>,
     ) -> ratatui::buffer::Buffer {
         draw_keys(
-            width, height, panes, focused, hint, spans, search, cursor, false,
+            width, height, panes, focused, hint, spans, search, cursor, None,
         )
     }
 
-    // `draw_full` with the `t` dialogue open.
+    // `draw_full` with the `t` picker open.
     #[allow(clippy::too_many_arguments)]
     fn draw_keys(
         width: u16,
@@ -713,7 +727,7 @@ mod tests {
         spans: &[(u32, SpanList)],
         search: &[(u32, SpanList)],
         cursor: Option<(usize, usize)>,
-        keymaps: bool,
+        picker: Option<&crate::input::Picker>,
     ) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut term = TuiTerminal::new(backend).unwrap();
@@ -724,7 +738,7 @@ mod tests {
                 panes,
                 focused,
                 hint,
-                keymaps,
+                picker,
                 spans,
                 search,
                 &[],
@@ -738,7 +752,6 @@ mod tests {
         .unwrap();
         term.backend().buffer().clone()
     }
-
     fn row(buf: &ratatui::buffer::Buffer, y: u16, w: u16) -> String {
         (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect()
     }
@@ -812,7 +825,7 @@ mod tests {
         panes[0].pwd = format!("{HOME}/Dev/app");
         let buf = draw_at(101, 10, &panes, 1);
         let bar = row(&buf, 9, 101);
-        assert!(bar.starts_with("corral-test | "), "got {bar:?}");
+        assert!(bar.starts_with(" NORMAL corral-test | "), "got {bar:?}");
         assert!(bar.contains("~/D/app"), "got {bar:?}");
         assert!(bar.ends_with(" | 14:23 16-Sep-26"), "got {bar:?}");
     }
@@ -846,9 +859,11 @@ mod tests {
     #[test]
     fn the_bar_shows_its_outer_zones_when_the_pane_reports_no_directory() {
         let panes = vec![pane(1, 0, 0, 10, 3, "pane-content")];
-        let buf = draw_at(40, 4, &panes, 1);
-        let bar = row(&buf, 3, 40);
-        assert_eq!(bar, "corral-test | 1/1      | 14:23 16-Sep-26");
+        // Wide enough for every zone: at 40 the mode block would crowd the
+        // clock off the right edge.
+        let buf = draw_at(50, 4, &panes, 1);
+        let bar = row(&buf, 3, 50);
+        assert_eq!(bar, " NORMAL corral-test | 1/1        | 14:23 16-Sep-26");
         assert!(!bar.contains("pane-content"), "the bar owns the last row");
     }
 
@@ -857,7 +872,8 @@ mod tests {
         let panes = panes();
         let buf = draw_at(101, 10, &panes, 1);
         let theme = test_theme();
-        for x in 0..WORKSPACE.chars().count() as u16 {
+        let offset = " NORMAL ".chars().count() as u16;
+        for x in offset..offset + WORKSPACE.chars().count() as u16 {
             assert_eq!(
                 buf[(x, 9)].fg,
                 theme.palette.focused_gutter,
@@ -865,7 +881,7 @@ mod tests {
             );
         }
         // The zones after the name keep the bar's own foreground.
-        let after = WORKSPACE.chars().count() as u16 + 1;
+        let after = offset + WORKSPACE.chars().count() as u16 + 1;
         assert_eq!(buf[(after, 9)].fg, theme.palette.hint_fg, "cell {after}");
         assert_eq!(buf[(after, 9)].bg, theme.palette.hint_bg, "cell {after}");
     }
@@ -1013,8 +1029,9 @@ mod tests {
     }
 
     #[test]
-    fn the_keymap_dialogue_lists_the_copy_map_over_the_panes() {
+    fn the_picker_lists_the_leader_bindings_over_the_panes() {
         let panes = panes();
+        let picker = crate::input::Picker::new();
         let buf = draw_keys(
             101,
             20,
@@ -1024,66 +1041,103 @@ mod tests {
             &[],
             &[],
             None,
-            true,
+            Some(&picker),
         );
         let screen = screen_text(&buf, 20, 101);
-        assert!(screen.contains("copy mode 12/96"), "got {screen:?}");
-        assert!(screen.contains("hjkl move"), "got {screen:?}");
-        assert!(screen.contains("any key closes"), "got {screen:?}");
+        assert!(screen.contains(" COPY 12/96"), "got {screen:?}");
+        assert!(screen.contains("h/l"), "got {screen:?}");
+        assert!(screen.contains("type filters"), "got {screen:?}");
         // The box sits over the panes: this cell is inside pane one and
-        // inside the box, and it carries the box's background.
-        assert_eq!(buf[(40, 5)].bg, test_theme().palette.hint_bg);
+        // inside the box, on an unselected row, and it carries the box's
+        // background. (Row 5 is the selected binding, in the accent.)
+        assert_eq!(buf[(40, 6)].bg, test_theme().palette.hint_bg);
     }
 
     #[test]
-    fn the_dialogue_header_names_the_mode_in_hand() {
-        assert_eq!(keymap_header(&Hint::None), "input mode");
-        assert_eq!(keymap_header(&Hint::Copy(None)), "copy mode");
-        assert_eq!(
-            keymap_header(&Hint::Copy(Some((12, 96)))),
-            "copy mode 12/96"
+    fn the_picker_prompt_shows_the_query() {
+        let panes = panes();
+        let mut picker = crate::input::Picker::new();
+        picker.query = "spl".into();
+        let buf = draw_keys(
+            101,
+            20,
+            &panes,
+            1,
+            Hint::None,
+            &[],
+            &[],
+            None,
+            Some(&picker),
         );
-        assert_eq!(keymap_header(&Hint::Select), "copy mode select");
-        assert_eq!(keymap_header(&Hint::Search("nee".into())), "search: nee");
+        let screen = screen_text(&buf, 20, 101);
+        assert!(screen.contains(" spl "), "got {screen:?}");
+        // Splitting is the only binding whose description or keys carry
+        // "spl"; the rest are filtered out of the list.
+        assert!(!screen.contains("yank"), "got {screen:?}");
     }
 
     #[test]
-    fn the_input_dialogue_lists_every_leader_binding_from_the_table() {
-        let lines = keymap_lines(&Hint::None);
-        assert_eq!(lines[0], "input mode");
-        for (keys, what) in crate::input::leader_keys() {
-            let want = format!("  {keys:<4}  {what}");
-            assert!(lines.contains(&want), "missing {want:?} in {lines:?}");
-        }
+    fn the_picker_marks_the_selected_line_with_the_accent() {
+        let panes = panes();
+        let picker = crate::input::Picker::new();
+        let buf = draw_keys(
+            101,
+            20,
+            &panes,
+            1,
+            Hint::None,
+            &[],
+            &[],
+            None,
+            Some(&picker),
+        );
+        // The prompt line ` {query} ` carries the cursor background. Scan
+        // every column on every row for it; the box is centered so no
+        // single column is guaranteed to be inside it.
+        let theme = test_theme();
+        let prompt = (0..20u16)
+            .find_map(|y| {
+                (0..101u16)
+                    .find(|&x| buf[(x, y)].bg == theme.palette.cursor_bg)
+                    .map(|_| y)
+            })
+            .expect("prompt row with the query background");
+        // One row below the prompt, the first match sits in the accent.
+        assert!(
+            (0..101u16).any(|x| buf[(x, prompt + 1)].bg == theme.palette.focused_gutter),
+            "the selected row is in the accent"
+        );
     }
 
     #[test]
-    fn the_select_dialogue_lists_the_two_selection_keys() {
-        let lines = keymap_lines(&Hint::Select);
-        assert_eq!(lines[0], "copy mode select");
-        assert!(lines.iter().any(|l| l.contains("yank")), "got {lines:?}");
-        assert!(lines.iter().any(|l| l.contains("cancel")), "got {lines:?}");
-    }
-
-    #[test]
-    fn the_keymap_shortcut_leaves_the_bar_alone_and_opens_the_dialogue() {
+    fn the_picker_shortcut_leaves_the_bar_alone_and_opens_the_picker() {
         let mut panes = panes();
         panes[0].pwd = "/tmp/project".into();
         // Closed: the bar reports the mode and the directory, and there
         // is no box.
-        let buf = draw_keys(101, 20, &panes, 1, Hint::Copy(None), &[], &[], None, false);
+        let buf = draw_keys(101, 20, &panes, 1, Hint::Copy(None), &[], &[], None, None);
         let closed = row(&buf, 19, 101);
-        assert!(closed.contains("[copy] /t/project"), "got {closed:?}");
         assert!(
-            !screen_text(&buf, 20, 101).contains("yank"),
-            "no dialogue while it is closed"
+            !screen_text(&buf, 20, 101).contains("corral keys"),
+            "no picker while it is closed"
         );
         // Open: the same bar, with the box over the panes.
-        let buf = draw_keys(101, 20, &panes, 1, Hint::Copy(None), &[], &[], None, true);
+        let picker = crate::input::Picker::new();
+        let buf = draw_keys(
+            101,
+            20,
+            &panes,
+            1,
+            Hint::Copy(None),
+            &[],
+            &[],
+            None,
+            Some(&picker),
+        );
         assert_eq!(row(&buf, 19, 101), closed, "the bar does not change");
         assert!(
-            screen_text(&buf, 20, 101).contains("yank"),
-            "the dialogue lists the keys"
+            screen_text(&buf, 20, 101).contains("corral keys"),
+            "the picker opens over the panes"
         );
         // The status row is reserved either way, never reclaimed:
         // reclaiming it would resize every pane and reflow their PTYs.
@@ -1091,25 +1145,72 @@ mod tests {
     }
 
     #[test]
-    fn a_typed_search_needle_stays_on_the_bar_while_the_dialogue_is_open() {
+    fn a_typed_search_needle_stays_on_the_bar_while_the_picker_is_open() {
         let panes = panes();
-        for keymaps in [false, true] {
-            let buf = draw_keys(
-                101,
-                10,
-                &panes,
-                1,
-                Hint::Search("needle".into()),
-                &[],
-                &[],
-                None,
-                keymaps,
-            );
+        let picker = crate::input::Picker::new();
+        let buf = draw_keys(
+            101,
+            10,
+            &panes,
+            1,
+            Hint::Search("needle".into()),
+            &[],
+            &[],
+            None,
+            Some(&picker),
+        );
+        assert!(
+            row(&buf, 9, 101).contains("search: needle"),
+            "got {:?}",
+            row(&buf, 9, 101)
+        );
+    }
+
+    #[test]
+    fn the_mode_block_names_the_mode_in_hand() {
+        assert_eq!(mode_block(&Hint::None), " NORMAL ");
+        assert_eq!(mode_block(&Hint::Copy(None)), " COPY ");
+        assert_eq!(mode_block(&Hint::Copy(Some((12, 96)))), " COPY 12/96 ");
+        assert_eq!(mode_block(&Hint::Select), " SELECT ");
+        assert_eq!(mode_block(&Hint::Search("nee".into())), " SEARCH ");
+    }
+
+    #[test]
+    fn the_statusline_leads_with_the_mode_block() {
+        let panes = panes();
+        for (hint, block) in [
+            (Hint::None, " NORMAL "),
+            (Hint::Copy(Some((3, 9))), " COPY 3/9 "),
+            (Hint::Select, " SELECT "),
+        ] {
+            let buf = draw_keys(101, 10, &panes, 1, hint.clone(), &[], &[], None, None);
             assert!(
-                row(&buf, 9, 101).contains("search: needle"),
-                "keymaps {keymaps}"
+                row(&buf, 9, 101).starts_with(block),
+                "got {:?}",
+                row(&buf, 9, 101)
             );
         }
+    }
+
+    #[test]
+    fn the_mode_block_paints_in_the_accent() {
+        let panes = panes();
+        let buf = draw_at(101, 10, &panes, 1);
+        let theme = test_theme();
+        assert_eq!(buf[(0, 9)].bg, theme.palette.focused_gutter);
+        assert_eq!(buf[(0, 9)].fg, theme.palette.cursor_fg);
+        // The block is bold; the rest of the bar is not.
+        assert!(
+            buf[(0, 9)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        let after = " NORMAL ".chars().count() as u16;
+        assert!(
+            !buf[(after, 9)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -1132,7 +1233,7 @@ mod tests {
                 .contains(ratatui::style::Modifier::REVERSED)
         );
         // The select hint renders too.
-        assert!(row(&buf, 9, 101).contains("select"));
+        assert!(row(&buf, 9, 101).contains("SELECT"));
     }
 
     #[test]
@@ -1321,7 +1422,7 @@ mod tests {
                 &panes,
                 1,
                 Hint::None,
-                false,
+                None,
                 &[],
                 &[(1, hit_spans)],
                 &[(1, current)],
