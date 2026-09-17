@@ -69,6 +69,208 @@ pub enum Action {
     PromptNext,
     /// Leader `o`: move focus to the next pane, wrapping.
     FocusNext,
+    /// Leader `t`: open the keymap dialogue.
+    ToggleHint,
+}
+
+/// One entry in the leader table: the key after Ctrl+a, its description
+/// for the keymap dialogue, and the action it dispatches. A single table
+/// backs both, so the dialogue can never list a binding `leader_action`
+/// does not also produce. A description is `<keys> <what>`: the dialogue
+/// reads the first word as the key to press and the rest as its effect.
+struct LeaderEntry {
+    code: KeyCode,
+    description: &'static str,
+    action: fn() -> Action,
+}
+
+const LEADER_TABLE: &[LeaderEntry] = &[
+    LeaderEntry {
+        code: KeyCode::Char('h'),
+        description: "h/l focus",
+        action: || Action::Focus(Dir::Horizontal),
+    },
+    LeaderEntry {
+        code: KeyCode::Char('l'),
+        description: "h/l focus",
+        action: || Action::Focus(Dir::Horizontal),
+    },
+    LeaderEntry {
+        code: KeyCode::Char('j'),
+        description: "j/k focus",
+        action: || Action::Focus(Dir::Vertical),
+    },
+    LeaderEntry {
+        code: KeyCode::Char('k'),
+        description: "j/k focus",
+        action: || Action::Focus(Dir::Vertical),
+    },
+    // tmux geometry: % splits right (side by side, cut in width =
+    // Dir::Horizontal here), " splits below (stacked = Dir::Vertical).
+    LeaderEntry {
+        code: KeyCode::Char('%'),
+        description: "% split right",
+        action: || Action::Split(Dir::Horizontal),
+    },
+    LeaderEntry {
+        code: KeyCode::Char('"'),
+        description: "\" split down",
+        action: || Action::Split(Dir::Vertical),
+    },
+    LeaderEntry {
+        code: KeyCode::Char('o'),
+        description: "o next pane",
+        action: || Action::FocusNext,
+    },
+    LeaderEntry {
+        code: KeyCode::Left,
+        description: "h/l focus",
+        action: || Action::Focus(Dir::Horizontal),
+    },
+    LeaderEntry {
+        code: KeyCode::Right,
+        description: "h/l focus",
+        action: || Action::Focus(Dir::Horizontal),
+    },
+    LeaderEntry {
+        code: KeyCode::Up,
+        description: "j/k focus",
+        action: || Action::Focus(Dir::Vertical),
+    },
+    LeaderEntry {
+        code: KeyCode::Down,
+        description: "j/k focus",
+        action: || Action::Focus(Dir::Vertical),
+    },
+    LeaderEntry {
+        code: KeyCode::Char('['),
+        description: "[ copy mode",
+        action: || Action::EnterCopy,
+    },
+    LeaderEntry {
+        code: KeyCode::Char('c'),
+        description: "c clear history",
+        action: || Action::ClearHistory,
+    },
+    LeaderEntry {
+        code: KeyCode::Char('d'),
+        description: "d quit",
+        action: || Action::Quit,
+    },
+    LeaderEntry {
+        code: KeyCode::Char('t'),
+        description: "t keymaps",
+        action: || Action::ToggleHint,
+    },
+];
+
+/// One picker row: the keys shown, what the binding does, and the action
+/// it dispatches.
+pub type Binding = (&'static str, &'static str, fn() -> Action);
+
+/// Every leader binding as `(keys, what, run)`, in table order, with
+/// duplicates (h/l and the arrows both focus) folded into one entry.
+/// `keys` is what the user presses after Ctrl+a, `what` the rest of the
+/// description, `run` the action the binding dispatches. The picker lists
+/// these and runs the selected one, so a binding added to the table shows
+/// up there without a second edit.
+pub fn leader_bindings() -> Vec<Binding> {
+    let mut out: Vec<Binding> = Vec::new();
+    for entry in LEADER_TABLE {
+        let (keys, what) = entry
+            .description
+            .split_once(' ')
+            .unwrap_or((entry.description, ""));
+        if !out.iter().any(|(k, _, _)| *k == keys) {
+            out.push((keys, what, entry.action));
+        }
+    }
+    out
+}
+
+/// The binding picker behind `ctrl+a t`: an fzf-style floating list where
+/// typing filters the leader bindings and enter runs the selected one.
+/// State only; the filtered list is derived from the query on demand.
+pub struct Picker {
+    pub query: String,
+    pub selected: usize,
+}
+
+impl Picker {
+    pub fn new() -> Self {
+        Self {
+            query: String::new(),
+            selected: 0,
+        }
+    }
+}
+
+/// What one key does while the picker is open.
+#[derive(Debug, PartialEq)]
+pub enum PickerOutcome {
+    /// Close without acting.
+    Close,
+    /// Run the selected binding's action; the caller closes the picker.
+    Run(Action),
+    /// State changed or the key was ignored; the picker stays open.
+    Stay,
+}
+
+/// Case-insensitive subsequence match: every needle char appears in the
+/// haystack in order. fzf's core filter, minus its scoring.
+fn fuzzy(hay: &str, needle: &str) -> bool {
+    let hay = hay.to_lowercase();
+    let mut hay = hay.chars();
+    needle
+        .chars()
+        .flat_map(char::to_lowercase)
+        .all(|n| hay.any(|h| h == n))
+}
+
+/// Indices into `leader_bindings` whose `keys what` text fuzzy-matches
+/// the query. An empty query matches everything, in table order.
+pub fn picker_matches(query: &str) -> Vec<usize> {
+    leader_bindings()
+        .iter()
+        .enumerate()
+        .filter(|(_, (keys, what, _))| fuzzy(&format!("{keys} {what}"), query))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+pub fn handle_picker(ev: KeyEvent, picker: &mut Picker) -> PickerOutcome {
+    let count = picker_matches(&picker.query).len();
+    match (ev.code, ev.modifiers) {
+        (KeyCode::Esc, _) => PickerOutcome::Close,
+        (KeyCode::Enter, _) => {
+            let matches = picker_matches(&picker.query);
+            match matches.get(picker.selected) {
+                Some(&idx) => PickerOutcome::Run((leader_bindings()[idx].2)()),
+                None => PickerOutcome::Stay,
+            }
+        }
+        // The selection resets whenever the query changes: the list under
+        // the cursor is a different list.
+        (KeyCode::Backspace, _) => {
+            picker.query.pop();
+            picker.selected = 0;
+            PickerOutcome::Stay
+        }
+        (KeyCode::Up, _) => {
+            picker.selected = picker.selected.saturating_sub(1);
+            PickerOutcome::Stay
+        }
+        (KeyCode::Down, _) => {
+            picker.selected = (picker.selected + 1).min(count.saturating_sub(1));
+            PickerOutcome::Stay
+        }
+        (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
+            picker.query.push(c);
+            picker.selected = 0;
+            PickerOutcome::Stay
+        }
+        _ => PickerOutcome::Stay,
+    }
 }
 
 // The Ctrl+a leader is the only key corral consumes in input mode. In
@@ -80,27 +282,11 @@ pub enum Action {
 
 /// The shared leader table: the key after Ctrl+a. Used by input mode
 /// and, since the leader arms there too, by copy mode.
-fn leader_action(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
-    match (code, mods) {
-        (KeyCode::Char('h'), _) => Some(Action::Focus(Dir::Horizontal)),
-        (KeyCode::Char('l'), _) => Some(Action::Focus(Dir::Horizontal)),
-        (KeyCode::Char('j'), _) => Some(Action::Focus(Dir::Vertical)),
-        (KeyCode::Char('k'), _) => Some(Action::Focus(Dir::Vertical)),
-        // tmux geometry: % splits right (side by side, cut in width =
-        // Dir::Horizontal here), " splits below (stacked =
-        // Dir::Vertical).
-        (KeyCode::Char('%'), _) => Some(Action::Split(Dir::Horizontal)),
-        (KeyCode::Char('"'), _) => Some(Action::Split(Dir::Vertical)),
-        (KeyCode::Char('o'), _) => Some(Action::FocusNext),
-        (KeyCode::Left, _) => Some(Action::Focus(Dir::Horizontal)),
-        (KeyCode::Right, _) => Some(Action::Focus(Dir::Horizontal)),
-        (KeyCode::Up, _) => Some(Action::Focus(Dir::Vertical)),
-        (KeyCode::Down, _) => Some(Action::Focus(Dir::Vertical)),
-        (KeyCode::Char('['), _) => Some(Action::EnterCopy),
-        (KeyCode::Char('c'), _) => Some(Action::ClearHistory),
-        (KeyCode::Char('d'), _) => Some(Action::Quit),
-        _ => None,
-    }
+fn leader_action(code: KeyCode, _mods: KeyModifiers) -> Option<Action> {
+    LEADER_TABLE
+        .iter()
+        .find(|entry| entry.code == code)
+        .map(|entry| (entry.action)())
 }
 
 pub fn handle(
@@ -259,6 +445,207 @@ pub fn handle(
     }
 }
 
+/// One thing a mouse event asks for. Distinct from `Action` because a
+/// wheel tick in input mode does two things at once (enter copy mode,
+/// then scroll it), which a single `Action` cannot carry.
+#[derive(Debug, PartialEq)]
+pub enum MouseAction {
+    FocusPane(corral_core::tree::PaneId),
+    SetSplitRatio {
+        at: corral_core::tree::PaneId,
+        ratio: f32,
+    },
+    Scroll {
+        pane: corral_core::tree::PaneId,
+        delta: isize,
+    },
+    EnterCopyThenScroll {
+        pane: corral_core::tree::PaneId,
+        delta: isize,
+    },
+}
+
+const WHEEL_DELTA: isize = 3;
+
+/// The pane whose rect contains (col, row), if any.
+fn pane_at(
+    panes: &[corrald::protocol::PaneState],
+    col: u16,
+    row: u16,
+) -> Option<corral_core::tree::PaneId> {
+    panes
+        .iter()
+        .find(|p| {
+            col >= p.rect.x
+                && col < p.rect.x + p.rect.w
+                && row >= p.rect.y
+                && row < p.rect.y + p.rect.h
+        })
+        .map(|p| p.id)
+}
+
+/// Hit-tests a gutter cell: not inside any pane, but bordered by panes on
+/// both sides along one axis. Returns the bordering pane nearest the
+/// origin (the "at" pane the daemon resizes relative to, via
+/// `Node::set_ratio_near`), the split's axis, and the combined rect the
+/// two sides span (used to turn a later drag position into a ratio).
+fn gutter_at(
+    panes: &[corrald::protocol::PaneState],
+    col: u16,
+    row: u16,
+) -> Option<(corral_core::tree::PaneId, Dir, corral_core::tree::Rect)> {
+    let shares_row =
+        |p: &&corrald::protocol::PaneState| row >= p.rect.y && row < p.rect.y + p.rect.h;
+    let left = panes
+        .iter()
+        .filter(shares_row)
+        .find(|p| p.rect.x + p.rect.w == col);
+    let right = panes
+        .iter()
+        .filter(shares_row)
+        .find(|p| p.rect.x == col + 1);
+    if let (Some(l), Some(r)) = (left, right) {
+        let x0 = panes
+            .iter()
+            .filter(|p| p.rect.x + p.rect.w == col)
+            .map(|p| p.rect.x)
+            .min()
+            .unwrap_or(l.rect.x);
+        let x1 = panes
+            .iter()
+            .filter(|p| p.rect.x == col + 1)
+            .map(|p| p.rect.x + p.rect.w)
+            .max()
+            .unwrap_or(r.rect.x + r.rect.w);
+        let y0 = l.rect.y.min(r.rect.y);
+        let y1 = (l.rect.y + l.rect.h).max(r.rect.y + r.rect.h);
+        return Some((
+            l.id,
+            Dir::Horizontal,
+            corral_core::tree::Rect {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            },
+        ));
+    }
+    let shares_col =
+        |p: &&corrald::protocol::PaneState| col >= p.rect.x && col < p.rect.x + p.rect.w;
+    let top = panes
+        .iter()
+        .filter(shares_col)
+        .find(|p| p.rect.y + p.rect.h == row);
+    let bottom = panes
+        .iter()
+        .filter(shares_col)
+        .find(|p| p.rect.y == row + 1);
+    if let (Some(t), Some(b)) = (top, bottom) {
+        let y0 = panes
+            .iter()
+            .filter(|p| p.rect.y + p.rect.h == row)
+            .map(|p| p.rect.y)
+            .min()
+            .unwrap_or(t.rect.y);
+        let y1 = panes
+            .iter()
+            .filter(|p| p.rect.y == row + 1)
+            .map(|p| p.rect.y + p.rect.h)
+            .max()
+            .unwrap_or(b.rect.y + b.rect.h);
+        let x0 = t.rect.x.min(b.rect.x);
+        let x1 = (t.rect.x + t.rect.w).max(b.rect.x + b.rect.w);
+        return Some((
+            t.id,
+            Dir::Vertical,
+            corral_core::tree::Rect {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            },
+        ));
+    }
+    None
+}
+
+/// Dispatches a mouse event: a click focuses the pane under it or starts
+/// tracking a gutter drag, a drag on a tracked gutter yields a ratio
+/// change, and wheel ticks scroll the pane under the pointer, opening
+/// copy mode first when they move toward history in the focused pane. A
+/// wheel tick outside every pane (the status bar row, a gutter) does
+/// nothing. `drag` persists the gutter a button-down started tracking
+/// across the following drag events.
+pub fn handle_mouse(
+    ev: crossterm::event::MouseEvent,
+    panes: &[corrald::protocol::PaneState],
+    mode: &Mode,
+    focused: corral_core::tree::PaneId,
+    drag: &mut Option<(corral_core::tree::PaneId, Dir, corral_core::tree::Rect)>,
+) -> Option<MouseAction> {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    match ev.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(id) = pane_at(panes, ev.column, ev.row) {
+                *drag = None;
+                return Some(MouseAction::FocusPane(id));
+            }
+            *drag = gutter_at(panes, ev.column, ev.row);
+            None
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let (at, dir, group) = (*drag)?;
+            let ratio = match dir {
+                Dir::Horizontal => {
+                    (ev.column.saturating_sub(group.x)) as f32 / group.w.max(1) as f32
+                }
+                Dir::Vertical => (ev.row.saturating_sub(group.y)) as f32 / group.h.max(1) as f32,
+            };
+            Some(MouseAction::SetSplitRatio {
+                at,
+                ratio: ratio.clamp(0.0, 1.0),
+            })
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            *drag = None;
+            None
+        }
+        MouseEventKind::ScrollUp => Some(scroll_action(
+            mode,
+            focused,
+            pane_at(panes, ev.column, ev.row)?,
+            -WHEEL_DELTA,
+        )),
+        MouseEventKind::ScrollDown => Some(scroll_action(
+            mode,
+            focused,
+            pane_at(panes, ev.column, ev.row)?,
+            WHEEL_DELTA,
+        )),
+        _ => None,
+    }
+}
+
+/// A wheel tick on `pane`. Scrolling toward history opens copy mode when
+/// the client is not already there, so what the wheel revealed can be
+/// yanked; scrolling back toward the live screen is a plain viewport move
+/// and never opens copy mode. The pane is named on the action because the
+/// pointer picks it, not the daemon's focus. Copy mode only opens for the
+/// focused pane, since the copy cursor and yank read that pane's state,
+/// so a wheel tick on any other pane stays a plain viewport move.
+fn scroll_action(
+    mode: &Mode,
+    focused: corral_core::tree::PaneId,
+    pane: corral_core::tree::PaneId,
+    delta: isize,
+) -> MouseAction {
+    if *mode == Mode::Input && pane == focused && delta < 0 {
+        MouseAction::EnterCopyThenScroll { pane, delta }
+    } else {
+        MouseAction::Scroll { pane, delta }
+    }
+}
+
 // xterm modifier parameter: shift adds 1, alt 2, ctrl 4 (1 = none).
 fn mod_code(m: KeyModifiers) -> u8 {
     1 + u8::from(m.contains(KeyModifiers::SHIFT))
@@ -318,7 +705,7 @@ fn fkey(n: u8, m: KeyModifiers) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEventState};
+    use crossterm::event::{KeyCode, KeyEventState, MouseButton, MouseEventKind};
 
     fn key(code: KeyCode, mods: KeyModifiers) -> crossterm::event::KeyEvent {
         crossterm::event::KeyEvent {
@@ -751,6 +1138,9 @@ mod tests {
                 matches!(a, Action::ClearHistory)
             }),
             (KeyCode::Char('d'), |a: &Action| matches!(a, Action::Quit)),
+            (KeyCode::Char('t'), |a: &Action| {
+                matches!(a, Action::ToggleHint)
+            }),
         ];
         for (code, check) in cases {
             let mut armed = false;
@@ -772,6 +1162,122 @@ mod tests {
             assert!(check(&action), "{code:?} produced {action:?}");
             assert!(!armed, "{code:?} left the leader armed");
         }
+    }
+
+    #[test]
+    fn leader_bindings_lists_every_binding_from_the_table_once() {
+        let keys = leader_bindings();
+        for pair in [
+            ("h/l", "focus"),
+            ("j/k", "focus"),
+            ("%", "split right"),
+            ("\"", "split down"),
+            ("o", "next pane"),
+            ("[", "copy mode"),
+            ("c", "clear history"),
+            ("d", "quit"),
+            ("t", "keymaps"),
+        ] {
+            assert!(
+                keys.iter().any(|(k, w, _)| (*k, *w) == pair),
+                "{pair:?} is missing from {keys:?}"
+            );
+        }
+        assert_eq!(keys.len(), 9, "one entry per binding, got {keys:?}");
+        // h/l and the arrows share one binding; it must not repeat.
+        assert_eq!(
+            keys.iter().filter(|(k, _, _)| *k == "h/l").count(),
+            1,
+            "got {keys:?}"
+        );
+    }
+
+    #[test]
+    fn picker_matches_filters_by_fuzzy_subsequence() {
+        assert_eq!(picker_matches("").len(), 9, "empty query matches all");
+        // Case-insensitive: "SPL" finds the split bindings.
+        let hits = picker_matches("SPL");
+        assert!(hits.iter().any(|&i| leader_bindings()[i].0 == "%"));
+        assert!(hits.iter().any(|&i| leader_bindings()[i].0 == "\""));
+        // A subsequence across keys and description, not a substring:
+        // "c clear history" has the c in the keys and the h in the text.
+        assert!(
+            picker_matches("ch")
+                .iter()
+                .any(|&i| leader_bindings()[i].0 == "c")
+        );
+        assert_eq!(picker_matches("zzz"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn picker_keys_move_select_type_and_reset() {
+        let mut picker = Picker::new();
+        // Typing filters and resets the selection.
+        picker.query.push('s');
+        handle_picker(key(KeyCode::Down, KeyModifiers::NONE), &mut picker);
+        assert_eq!(picker.selected, 1);
+        handle_picker(key(KeyCode::Char('p'), KeyModifiers::NONE), &mut picker);
+        assert_eq!(picker.selected, 0, "typing resets the selection");
+        // Down is clamped at the last match.
+        for _ in 0..50 {
+            handle_picker(key(KeyCode::Down, KeyModifiers::NONE), &mut picker);
+        }
+        let last = picker_matches(&picker.query).len() - 1;
+        assert_eq!(picker.selected, last);
+        // Up walks back to the top and stays there.
+        handle_picker(key(KeyCode::Up, KeyModifiers::NONE), &mut picker);
+        assert_eq!(picker.selected, last - 1);
+        for _ in 0..50 {
+            handle_picker(key(KeyCode::Up, KeyModifiers::NONE), &mut picker);
+        }
+        assert_eq!(picker.selected, 0);
+        // Backspace shortens the query and resets the selection.
+        handle_picker(key(KeyCode::Backspace, KeyModifiers::NONE), &mut picker);
+        assert_eq!(picker.query, "s");
+        assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn picker_esc_closes_and_enter_runs_the_selection() {
+        let mut picker = Picker::new();
+        assert_eq!(
+            handle_picker(key(KeyCode::Esc, KeyModifiers::NONE), &mut picker),
+            PickerOutcome::Close
+        );
+        // Empty query, selection 0: the first binding in the table runs.
+        let first = leader_bindings()[0].2();
+        match handle_picker(key(KeyCode::Enter, KeyModifiers::NONE), &mut picker) {
+            PickerOutcome::Run(action) => assert_eq!(
+                format!("{action:?}"),
+                format!("{first:?}"),
+                "enter must run the selected binding"
+            ),
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // An empty query with the selection beyond the matches stays put.
+        picker.query = "zzz".into();
+        picker.selected = 3;
+        assert_eq!(
+            handle_picker(key(KeyCode::Enter, KeyModifiers::NONE), &mut picker),
+            PickerOutcome::Stay
+        );
+    }
+
+    #[test]
+    fn picker_actions_match_the_leader_dispatch() {
+        // Every binding the picker can run is one the leader dispatches,
+        // because both read the same table.
+        for (_, _, action) in leader_bindings() {
+            let _ = action();
+        }
+    }
+
+    #[test]
+    fn leader_then_t_toggles_the_hint() {
+        assert!(matches!(
+            leader_then(KeyCode::Char('t'), KeyModifiers::NONE),
+            Some(Action::ToggleHint)
+        ));
     }
 
     #[test]
@@ -1161,5 +1667,228 @@ mod tests {
             );
         }
         assert!(!armed, "search mode armed the leader");
+    }
+
+    fn pane_state(
+        id: corral_core::tree::PaneId,
+        rect: corral_core::tree::Rect,
+    ) -> corrald::protocol::PaneState {
+        corrald::protocol::PaneState {
+            id,
+            rect,
+            text: String::new(),
+            cursor: None,
+            app_cursor: false,
+            scroll: None,
+            total_scrollback: 0,
+            lines: vec![],
+            pwd: String::new(),
+        }
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Two panes side by side, split at column 50 (gutter at 50).
+    fn two_panes() -> Vec<corrald::protocol::PaneState> {
+        vec![
+            pane_state(
+                1,
+                corral_core::tree::Rect {
+                    x: 0,
+                    y: 0,
+                    w: 50,
+                    h: 20,
+                },
+            ),
+            pane_state(
+                2,
+                corral_core::tree::Rect {
+                    x: 51,
+                    y: 0,
+                    w: 49,
+                    h: 20,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn left_click_inside_a_pane_focuses_that_pane() {
+        let panes = two_panes();
+        let mut drag = None;
+        let action = handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, 5),
+            &panes,
+            &Mode::Input,
+            1,
+            &mut drag,
+        );
+        assert_eq!(action, Some(MouseAction::FocusPane(1)));
+
+        let action = handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 60, 5),
+            &panes,
+            &Mode::Input,
+            1,
+            &mut drag,
+        );
+        assert_eq!(action, Some(MouseAction::FocusPane(2)));
+    }
+
+    #[test]
+    fn wheel_up_yields_a_scroll_delta_for_the_pane_under_the_pointer() {
+        let panes = two_panes();
+        let mut drag = None;
+        // From input mode, the wheel enters copy mode on its way in, and
+        // the pane it names is the one under the pointer, not pane 1.
+        let action = handle_mouse(
+            mouse(MouseEventKind::ScrollUp, 60, 5),
+            &panes,
+            &Mode::Input,
+            2, // focused
+            &mut drag,
+        );
+        assert_eq!(
+            action,
+            Some(MouseAction::EnterCopyThenScroll {
+                pane: 2,
+                delta: -WHEEL_DELTA,
+            })
+        );
+
+        // Already in copy mode, it just scrolls.
+        let action = handle_mouse(
+            mouse(MouseEventKind::ScrollDown, 10, 5),
+            &panes,
+            &Mode::Copy,
+            2, // focused
+            &mut drag,
+        );
+        assert_eq!(
+            action,
+            Some(MouseAction::Scroll {
+                pane: 1,
+                delta: WHEEL_DELTA,
+            })
+        );
+    }
+
+    #[test]
+    fn wheel_up_on_an_unfocused_pane_scrolls_it_without_opening_copy_mode() {
+        // Copy mode belongs to the focused pane: its cursor and its yank
+        // read that pane's state. Scrolling a different pane is therefore
+        // a plain viewport move, not a mode change.
+        let panes = two_panes();
+        let mut drag = None;
+        let action = handle_mouse(
+            mouse(MouseEventKind::ScrollUp, 60, 5),
+            &panes,
+            &Mode::Input,
+            1, // focused
+            &mut drag,
+        );
+        assert_eq!(
+            action,
+            Some(MouseAction::Scroll {
+                pane: 2,
+                delta: -WHEEL_DELTA,
+            })
+        );
+    }
+
+    #[test]
+    fn wheel_down_in_input_mode_never_opens_copy_mode() {
+        // The viewport is already live in input mode, so a wheel-down has
+        // nothing to reveal. Opening copy mode here is what left the
+        // client stuck in it with the bar still reading copy mode.
+        let panes = two_panes();
+        let mut drag = None;
+        let action = handle_mouse(
+            mouse(MouseEventKind::ScrollDown, 10, 5),
+            &panes,
+            &Mode::Input,
+            2, // focused
+            &mut drag,
+        );
+        assert_eq!(
+            action,
+            Some(MouseAction::Scroll {
+                pane: 1,
+                delta: WHEEL_DELTA,
+            })
+        );
+    }
+
+    #[test]
+    fn a_wheel_tick_outside_every_pane_does_nothing() {
+        // The last row of the screen is the status bar, and the gutter is
+        // between panes. Neither belongs to a pane, so there is nothing
+        // to scroll.
+        let panes = two_panes();
+        let mut drag = None;
+        for (kind, col, row) in [
+            (MouseEventKind::ScrollUp, 10, 20),
+            (MouseEventKind::ScrollDown, 10, 20),
+            (MouseEventKind::ScrollUp, 50, 5),
+        ] {
+            let action = handle_mouse(mouse(kind, col, row), &panes, &Mode::Input, 1, &mut drag);
+            assert_eq!(action, None, "wheel at ({col}, {row}) must do nothing");
+        }
+    }
+
+    #[test]
+    fn drag_on_a_gutter_between_two_panes_yields_a_ratio_change() {
+        let panes = two_panes();
+        let mut drag = None;
+        // Mouse-down on the gutter column (50) starts tracking it.
+        let down = handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 50, 5),
+            &panes,
+            &Mode::Input,
+            2, // focused
+            &mut drag,
+        );
+        assert_eq!(down, None, "a gutter press only arms the drag");
+        assert!(drag.is_some());
+
+        let action = handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 25, 5),
+            &panes,
+            &Mode::Input,
+            2, // focused
+            &mut drag,
+        );
+        match action {
+            Some(MouseAction::SetSplitRatio { at, ratio }) => {
+                assert_eq!(at, 1, "the ratio setter targets the left pane");
+                assert!(ratio < 0.5, "dragging left of center shrinks the ratio");
+            }
+            other => panic!("expected a SetSplitRatio action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_events_map_the_same_with_mouse_capture_on() {
+        // Mouse support only widens the event match in main.rs's poll
+        // loop; `handle` itself takes no mouse state, so a key event
+        // maps exactly as it did before this task.
+        let mut armed = false;
+        assert_eq!(
+            handle(
+                key(KeyCode::Char('x'), KeyModifiers::NONE),
+                &mut armed,
+                &Mode::Input,
+                false,
+                0
+            ),
+            Some(Action::Send(b"x".to_vec()))
+        );
     }
 }

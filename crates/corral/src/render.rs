@@ -1,3 +1,4 @@
+use crate::theme::Theme;
 use corral_core::emulation::CellColor;
 use corral_core::tree::PaneId;
 use corrald::protocol::PaneState;
@@ -5,24 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect as RRect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-
-// Gutters between panes render as thin line characters. Adjacent to the
-// focused pane they light up so focus is visible.
-const GUTTER: Color = Color::Indexed(238);
-const FOCUSED_GUTTER: Color = Color::Indexed(245);
-// The copy-mode cursor: a light block over the cell, visible on both
-// dark and light text.
-const CURSOR_BG: Color = Color::Indexed(245);
-// Search matches: yellow on black, distinct from the reversed
-// selection highlight. Indexed 11 (bright) rather than 3: dark
-// 256-color themes like Catppuccin render the base 8 as muted tones,
-// so the highlight sank into the surrounding text.
-const SEARCH_BG: Color = Color::Indexed(11);
-// The current search match: magenta on white, visibly distinct from
-// the yellow so the n/N walk is readable. Indexed 13 (bright) for the
-// same reason as SEARCH_BG.
-const CURRENT_HIT_BG: Color = Color::Indexed(13);
+use ratatui::widgets::{Block, Paragraph};
 
 /// Selection highlight spans for one pane: (row, first col, last col
 /// inclusive) in text-grid coordinates.
@@ -46,10 +30,15 @@ pub fn draw(
     panes: &[PaneState],
     focused: PaneId,
     hint: Hint,
+    picker: Option<&crate::input::Picker>,
     spans: &[(PaneId, SpanList)],
     search: &[(PaneId, SpanList)],
     current: &[(PaneId, SpanList)],
     cursor: Option<(usize, usize)>,
+    workspace: &str,
+    home: &str,
+    clock: &str,
+    theme: &Theme,
 ) {
     for pane in panes {
         let rr = RRect {
@@ -83,14 +72,13 @@ pub fn draw(
             frame,
             p,
             hit_spans,
-            Style::new().fg(Color::Black).bg(SEARCH_BG),
+            Style::new()
+                .fg(theme.palette.search_fg)
+                .bg(theme.palette.search_bg),
         );
     }
-    // The current match paints over the yellow with its own color so
-    // the user can tell which hit the cursor is on. Black text, not
-    // white: bright magenta is a light background, so white on it is
-    // about 3:1 and the black is about 7:1. This also keeps the two
-    // styles to the same foreground.
+    // The current match paints over the search style with its own color
+    // so the user can tell which hit the cursor is on.
     for (pane_id, hit_spans) in current {
         let Some(p) = panes.iter().find(|p| p.id == *pane_id) else {
             continue;
@@ -99,14 +87,92 @@ pub fn draw(
             frame,
             p,
             hit_spans,
-            Style::new().fg(Color::Black).bg(CURRENT_HIT_BG),
+            Style::new()
+                .fg(theme.palette.current_hit_fg)
+                .bg(theme.palette.current_hit_bg),
         );
     }
     if let Some(p) = panes.iter().find(|p| p.id == focused) {
-        paint_cursor(frame, p, cursor);
+        paint_cursor(frame, p, cursor, theme);
     }
-    paint_gutters(frame, panes, focused);
-    draw_hint(frame, hint);
+    paint_gutters(frame, panes, focused, theme);
+    let dir = pane_dir(panes.iter().find(|p| p.id == focused));
+    draw_status(
+        frame, workspace, dir, &hint, panes, focused, home, clock, theme,
+    );
+    // The picker paints last, over the panes and the status row both.
+    if let Some(picker) = picker {
+        draw_picker(frame, picker, theme);
+    }
+}
+
+/// The directory the status bar shows: the focused pane's OSC 7 working
+/// directory, empty when the pane has not reported one.
+fn pane_dir(pane: Option<&PaneState>) -> &str {
+    pane.map(|p| p.pwd.as_str()).unwrap_or("")
+}
+
+// What divides the bar's zones. The clock carries it too, so the bar
+// reads as `name | directory | panes | clock`.
+const SEPARATOR: &str = " | ";
+
+/// The directory as the bar shows it: `$HOME` collapses to `~` and every
+/// component but the last is cut to its first character, so a deep path
+/// fits without losing the part that says where we are. Only absolute
+/// paths are shortened; anything else passes through.
+fn shorten_path(path: &str, home: &str) -> String {
+    if !path.starts_with('/') {
+        return path.to_string();
+    }
+    // Matched per component, so `/Users/sushantho` is not read as living
+    // under `/Users/sushanth`.
+    let under_home = if home.is_empty() {
+        None
+    } else {
+        path.strip_prefix(home)
+            .filter(|tail| tail.is_empty() || tail.starts_with('/'))
+    };
+    let parts: Vec<&str> = under_home
+        .unwrap_or(path)
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut out = if under_home.is_some() {
+        "~".to_string()
+    } else {
+        String::new()
+    };
+    if parts.is_empty() {
+        // Home itself, or the root.
+        if out.is_empty() {
+            out.push('/');
+        }
+        return out;
+    }
+    let last = parts.len() - 1;
+    for (i, part) in parts.iter().enumerate() {
+        out.push('/');
+        if i == last {
+            out.push_str(part);
+        } else {
+            out.push_str(&first_char(part));
+        }
+    }
+    out
+}
+
+/// The one character a shortened component keeps. A dotfile keeps its
+/// dot, since a bare `.` would read as the `..` entry.
+fn first_char(part: &str) -> String {
+    let mut chars = part.chars();
+    match chars.next() {
+        None => String::new(),
+        Some('.') => match chars.next() {
+            Some(c) => format!(".{c}"),
+            None => ".".to_string(),
+        },
+        Some(c) => c.to_string(),
+    }
 }
 
 /// The pane's visible rows as styled ratatui lines. Falls back to plain
@@ -166,7 +232,12 @@ fn run_style(run: &corral_core::emulation::StyledRun) -> Style {
 
 // The copy-mode cursor paints one viewport cell. The pane rect maps
 // the viewport coordinates to screen cells.
-fn paint_cursor(frame: &mut Frame, pane: &PaneState, cursor: Option<(usize, usize)>) {
+fn paint_cursor(
+    frame: &mut Frame,
+    pane: &PaneState,
+    cursor: Option<(usize, usize)>,
+    theme: &Theme,
+) {
     let Some((row, col)) = cursor else {
         return;
     };
@@ -176,8 +247,8 @@ fn paint_cursor(frame: &mut Frame, pane: &PaneState, cursor: Option<(usize, usiz
         return;
     }
     let cell = &mut frame.buffer_mut()[(x, y)];
-    cell.set_bg(CURSOR_BG);
-    cell.set_fg(Color::Black);
+    cell.set_bg(theme.palette.cursor_bg);
+    cell.set_fg(theme.palette.cursor_fg);
 }
 
 /// Every occurrence of `needle` in `text` as highlight spans: one
@@ -249,31 +320,40 @@ fn paint_spans(frame: &mut Frame, pane: &PaneState, spans: &SpanList, style: Sty
     }
 }
 
-// Key hints shown alongside "copy mode": the client reserves the last
-// terminal row for this bar (see the client's initial Resize), so it
-// always has somewhere to draw and never gets overwritten by pane
-// content.
-const COPY_KEYS: &str = "hjkl move | { } prompt | ctrl+o yank cmd | v select | q exit";
-
-// One status row on the last screen line, over everything else. Always
-// on, with the active mode leftmost so it is never the part that gets
-// cut off; in copy mode it also carries the scroll position and the
-// key hints above (including ctrl+o, which has no other affordance).
-fn draw_hint(frame: &mut Frame, hint: Hint) {
+/// The status row on the last screen line, over everything else, always
+/// present. Four zones: the workspace on the left, then the focused
+/// pane's directory and its place in the frame, then the clock flush
+/// right. Only the directory gives way when the row is narrow.
+#[allow(clippy::too_many_arguments)]
+fn draw_status(
+    frame: &mut Frame,
+    workspace: &str,
+    dir: &str,
+    hint: &Hint,
+    panes: &[PaneState],
+    focused: PaneId,
+    home: &str,
+    clock: &str,
+    theme: &Theme,
+) {
     let area = frame.area();
     let row = area.height.saturating_sub(1);
-    let text = match hint {
-        Hint::None => " input mode  ctrl+a leader ".to_string(),
-        Hint::Copy(None) => format!(" copy mode  {COPY_KEYS} "),
-        Hint::Copy(Some((offset, total))) => {
-            format!(" copy mode {offset}/{total}  {COPY_KEYS} ")
-        }
-        Hint::Select => " copy mode select  y yank | esc cancel ".to_string(),
-        Hint::Search(needle) => format!(" search: {needle} "),
-    };
-    let style = Style::new().fg(Color::Black).bg(Color::Indexed(245));
-    let line = Line::from(vec![Span::styled(text, style)]);
-    let para = Paragraph::new(line).style(style);
+    let panes_zone = pane_zone(panes, focused);
+    let spans = status_row(
+        area.width as usize,
+        workspace,
+        dir,
+        hint,
+        &panes_zone,
+        home,
+        clock,
+        theme,
+    );
+    let para = Paragraph::new(Line::from(spans)).style(
+        Style::new()
+            .fg(theme.palette.bar_fg)
+            .bg(theme.palette.bar_bg),
+    );
     frame.render_widget(
         para,
         RRect {
@@ -285,11 +365,212 @@ fn draw_hint(frame: &mut Frame, hint: Hint) {
     );
 }
 
+/// The mode's name as the statusline's leftmost block shows it, Neovim
+/// style: a colored block that says the mode in words. Copy carries its
+/// viewport position, since that is the mode's whole state.
+fn mode_block(hint: &Hint) -> String {
+    match hint {
+        Hint::None => " NORMAL ".to_string(),
+        Hint::Copy(None) => " COPY ".to_string(),
+        Hint::Copy(Some((offset, total))) => format!(" COPY {offset}/{total} "),
+        Hint::Select => " SELECT ".to_string(),
+        Hint::Search(_) => " SEARCH ".to_string(),
+    }
+}
+
+/// Compose one status row, lualine style: a mode block in its own
+/// background at the left edge, then the name, the directory, the pane
+/// index and the clock as segments on the bar's own background, the
+/// clock flush right. The mode block's background is the theme's accent,
+/// which is what makes the mode readable at a glance; the name keeps the
+/// same accent as its foreground.
+#[allow(clippy::too_many_arguments)]
+fn status_row(
+    width: usize,
+    workspace: &str,
+    dir: &str,
+    hint: &Hint,
+    panes_zone: &str,
+    home: &str,
+    clock: &str,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    // A needle is typed from its front, so it gives way at the right; a
+    // path reads from its last component, so it gives way at the left.
+    // The directory zone is the only one that shrinks: everything else
+    // on the row is fixed-width.
+    let block = mode_block(hint);
+    let dir_full = match hint {
+        Hint::Search(needle) => format!("search: {needle}"),
+        _ => shorten_path(dir, home),
+    };
+    let mut rest = String::new();
+    for zone in [dir_full.as_str(), panes_zone] {
+        if zone.is_empty() {
+            continue;
+        }
+        rest.push_str(SEPARATOR);
+        rest.push_str(zone);
+    }
+    let fixed = block.chars().count()
+        + workspace.chars().count()
+        + SEPARATOR.chars().count()
+        + clock.chars().count();
+    let dir_room = width
+        .saturating_sub(fixed)
+        .saturating_sub(rest.chars().count() - dir_full.chars().count());
+    let dir_zone = match hint {
+        Hint::Search(_) => truncate_right(&dir_full, dir_room),
+        _ => truncate_left(&dir_full, dir_room),
+    };
+    let mut rest = String::new();
+    for zone in [dir_zone.as_str(), panes_zone] {
+        if zone.is_empty() {
+            continue;
+        }
+        rest.push_str(SEPARATOR);
+        rest.push_str(zone);
+    }
+    let used = block.chars().count()
+        + workspace.chars().count()
+        + 1
+        + rest.chars().count()
+        + SEPARATOR.chars().count()
+        + clock.chars().count();
+    vec![
+        Span::styled(
+            block,
+            Style::new()
+                .fg(theme.palette.mode_fg)
+                .bg(theme.palette.mode_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        // One cell of the bar's own background between the block and the
+        // name; the block's trailing padding is highlighted, so without
+        // this the two read as glued together.
+        Span::raw(" "),
+        Span::styled(
+            workspace.to_string(),
+            Style::new().fg(theme.palette.mode_bg),
+        ),
+        Span::raw(rest),
+        Span::raw(" ".repeat(width.saturating_sub(used))),
+        Span::raw(format!("{SEPARATOR}{clock}")),
+    ]
+}
+
+/// The focused pane's place in the frame, `3/3`, counted in the frame's
+/// own order, which is layout order. Empty when the focused pane is not
+/// in the frame.
+fn pane_zone(panes: &[PaneState], focused: PaneId) -> String {
+    panes
+        .iter()
+        .position(|p| p.id == focused)
+        .map(|i| format!("{}/{}", i + 1, panes.len()))
+        .unwrap_or_default()
+}
+
+/// The binding picker over the panes, fzf style: a centered floating
+/// window with the query as a prompt line, the filtered bindings below,
+/// and the selected line in the accent. Enter runs it, esc closes; the
+/// footer says so. The list comes from the same table the leader
+/// dispatches through, so the two can never disagree.
+fn draw_picker(frame: &mut Frame, picker: &crate::input::Picker, theme: &Theme) {
+    let area = frame.area();
+    let matches = crate::input::picker_matches(&picker.query);
+    let bindings = crate::input::leader_bindings();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!(" {} ", picker.query),
+        Style::new()
+            .fg(theme.palette.mode_fg)
+            .bg(theme.palette.mode_bg),
+    )));
+    for (row, idx) in matches.iter().enumerate() {
+        let (keys, what, _) = bindings[*idx];
+        let text = format!("  {keys:<4}  {what}");
+        let line = if row == picker.selected {
+            Line::from(Span::styled(
+                text,
+                Style::new()
+                    .fg(theme.palette.hint_fg)
+                    .bg(theme.palette.picker_selected_bg),
+            ))
+        } else {
+            Line::from(Span::raw(text))
+        };
+        lines.push(line);
+    }
+    if matches.is_empty() {
+        lines.push(Line::from(Span::raw("  no match")));
+    }
+    lines.push(Line::from(Span::raw(String::new())));
+    lines.push(Line::from(Span::styled(
+        "  type filters | enter runs | esc closes",
+        Style::new().fg(theme.palette.muted),
+    )));
+    // Sized to the content, capped to the screen minus the status row.
+    let body = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(0)
+        .max(" corral keys ".len());
+    let width = (body as u16 + 2).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(1));
+    let style = Style::new()
+        .fg(theme.palette.bar_fg)
+        .bg(theme.palette.picker_bg);
+    let block = Block::bordered()
+        .title(Span::styled(
+            " corral keys ",
+            Style::new().fg(theme.palette.mode_bg),
+        ))
+        .border_style(Style::new().fg(theme.palette.muted));
+    frame.render_widget(
+        Paragraph::new(lines).style(style).block(block),
+        RRect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        },
+    );
+}
+
+/// Trim `text` to `room` characters, cutting from the left behind a
+/// leading ellipsis, so the end of a long path survives. `room` of 0
+/// leaves nothing.
+fn truncate_left(text: &str, room: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= room {
+        return text.to_string();
+    }
+    if room == 0 {
+        return String::new();
+    }
+    let tail: String = chars[chars.len() - (room - 1)..].iter().collect();
+    format!("…{tail}")
+}
+
+/// Trim `text` to `room` characters, cutting from the right behind a
+/// trailing ellipsis, so the start of a long needle survives.
+fn truncate_right(text: &str, room: usize) -> String {
+    if text.chars().count() <= room {
+        return text.to_string();
+    }
+    if room == 0 {
+        return String::new();
+    }
+    let head: String = text.chars().take(room - 1).collect();
+    format!("{head}…")
+}
+
 // tree.rects leaves a 1-cell gutter between siblings that no pane rect
 // covers. Paint it as a vertical or horizontal line character spanning
 // the overlap of the two adjacent panes; it lights when either side is
 // focused. Overlap, not exact alignment, so nested layouts work.
-fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
+fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId, theme: &Theme) {
     for (i, a) in panes.iter().enumerate() {
         for b in &panes[i + 1..] {
             let (ra, rb) = (a.rect, b.rect);
@@ -307,7 +588,11 @@ fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
                 let y1 = (l.y + l.h).min(r.y + r.h);
                 if y1 > y0 && r.x - (l.x + l.w) == 1 {
                     let hot = left.id == focused || right.id == focused;
-                    let style = Style::new().fg(if hot { FOCUSED_GUTTER } else { GUTTER });
+                    let style = Style::new().fg(if hot {
+                        theme.palette.focused_gutter
+                    } else {
+                        theme.palette.gutter
+                    });
                     for y in y0..y1 {
                         frame.buffer_mut()[(gx, y)].set_symbol("│").set_style(style);
                     }
@@ -328,7 +613,11 @@ fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
                 let x1 = (t.x + t.w).min(bo.x + bo.w);
                 if x1 > x0 && bo.y - (t.y + t.h) == 1 {
                     let hot = top.id == focused || bottom.id == focused;
-                    let style = Style::new().fg(if hot { FOCUSED_GUTTER } else { GUTTER });
+                    let style = Style::new().fg(if hot {
+                        theme.palette.focused_gutter
+                    } else {
+                        theme.palette.gutter
+                    });
                     for x in x0..x1 {
                         frame.buffer_mut()[(x, gy)].set_symbol("─").set_style(style);
                     }
@@ -341,6 +630,7 @@ fn paint_gutters(frame: &mut Frame, panes: &[PaneState], focused: PaneId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Palette;
     use corral_core::tree;
     use ratatui::{Terminal as TuiTerminal, backend::TestBackend};
 
@@ -352,7 +642,9 @@ mod tests {
             cursor: None,
             app_cursor: false,
             scroll: None,
+            total_scrollback: 0,
             lines: vec![],
+            pwd: String::new(),
         }
     }
 
@@ -362,6 +654,44 @@ mod tests {
             pane(2, 51, 0, 50, 10, "pane-two"),
         ]
     }
+
+    // A sentinel per surface, distinct from the bundled theme's real
+    // colors: render tests assert against these fields, not the palette a
+    // theme file happens to carry, so a Catppuccin tweak cannot silently
+    // break a rendering test.
+    fn test_theme() -> Theme {
+        Theme {
+            name: "test".into(),
+            palette: Palette {
+                gutter: Color::Rgb(1, 1, 1),
+                focused_gutter: Color::Rgb(2, 2, 2),
+                cursor_bg: Color::Rgb(3, 3, 3),
+                cursor_fg: Color::Rgb(4, 4, 4),
+                search_bg: Color::Rgb(5, 5, 5),
+                search_fg: Color::Rgb(6, 6, 6),
+                current_hit_bg: Color::Rgb(7, 7, 7),
+                current_hit_fg: Color::Rgb(8, 8, 8),
+                hint_bg: Color::Rgb(9, 9, 9),
+                hint_fg: Color::Rgb(10, 10, 10),
+                bar_bg: Color::Rgb(11, 11, 11),
+                bar_fg: Color::Rgb(12, 12, 12),
+                mode_bg: Color::Rgb(13, 13, 13),
+                mode_fg: Color::Rgb(14, 14, 14),
+                muted: Color::Rgb(15, 15, 15),
+                picker_bg: Color::Rgb(16, 16, 16),
+                picker_selected_bg: Color::Rgb(17, 17, 17),
+            },
+        }
+    }
+
+    // The bar's outer zones are fixed for every test that is not about
+    // them, so the assertions read the parts under test rather than the
+    // clock's minute. Home is a parameter of `draw`, not read from the
+    // environment, so these tests do not depend on whose machine runs
+    // them.
+    const WORKSPACE: &str = "corral-test";
+    const HOME: &str = "/Users/example";
+    const CLOCK: &str = "14:23 16-Sep-26";
 
     fn draw_at(
         width: u16,
@@ -394,15 +724,58 @@ mod tests {
         search: &[(u32, SpanList)],
         cursor: Option<(usize, usize)>,
     ) -> ratatui::buffer::Buffer {
-        let backend = TestBackend::new(width, height);
-        let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, panes, focused, hint, spans, search, &[], cursor))
-            .unwrap();
-        term.backend().buffer().clone()
+        draw_keys(
+            width, height, panes, focused, hint, spans, search, cursor, None,
+        )
     }
 
+    // `draw_full` with the `t` picker open.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_keys(
+        width: u16,
+        height: u16,
+        panes: &[PaneState],
+        focused: u32,
+        hint: Hint,
+        spans: &[(u32, SpanList)],
+        search: &[(u32, SpanList)],
+        cursor: Option<(usize, usize)>,
+        picker: Option<&crate::input::Picker>,
+    ) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut term = TuiTerminal::new(backend).unwrap();
+        let theme = test_theme();
+        term.draw(|f| {
+            draw(
+                f,
+                panes,
+                focused,
+                hint,
+                picker,
+                spans,
+                search,
+                &[],
+                cursor,
+                WORKSPACE,
+                HOME,
+                CLOCK,
+                &theme,
+            )
+        })
+        .unwrap();
+        term.backend().buffer().clone()
+    }
     fn row(buf: &ratatui::buffer::Buffer, y: u16, w: u16) -> String {
         (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect()
+    }
+
+    // The whole screen as text, for the assertions that care where a
+    // string sits rather than which row it is on.
+    fn screen_text(buf: &ratatui::buffer::Buffer, height: u16, width: u16) -> String {
+        (0..height)
+            .map(|y| row(buf, y, width))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -422,7 +795,7 @@ mod tests {
         let panes = panes();
         for focused in [1, 2] {
             let buf = draw_at(101, 10, &panes, focused);
-            assert_eq!(buf[(50, 0)].fg, ratatui::style::Color::Indexed(245));
+            assert_eq!(buf[(50, 0)].fg, test_theme().palette.focused_gutter);
         }
     }
 
@@ -437,8 +810,8 @@ mod tests {
             pane(3, 51, 5, 50, 5, "three"),
         ];
         let buf = draw_at(101, 10, &panes, 3);
-        assert_eq!(buf[(50, 0)].fg, ratatui::style::Color::Indexed(238));
-        assert_eq!(buf[(60, 4)].fg, ratatui::style::Color::Indexed(245));
+        assert_eq!(buf[(50, 0)].fg, test_theme().palette.gutter);
+        assert_eq!(buf[(60, 4)].fg, test_theme().palette.focused_gutter);
         assert_eq!(buf[(60, 4)].symbol(), "─");
     }
 
@@ -453,10 +826,146 @@ mod tests {
             let got = buf[(x, 5)].fg;
             assert_ne!(
                 got,
-                ratatui::style::Color::Indexed(245),
+                test_theme().palette.focused_gutter,
                 "cell ({x},5) fg {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_workspace_the_focused_panes_directory_and_the_clock() {
+        let mut panes = panes();
+        panes[0].pwd = format!("{HOME}/Dev/app");
+        let buf = draw_at(101, 10, &panes, 1);
+        let bar = row(&buf, 9, 101);
+        assert!(bar.starts_with(" NORMAL  corral-test | "), "got {bar:?}");
+        assert!(bar.contains("~/D/app"), "got {bar:?}");
+        assert!(bar.ends_with(" | 14:23 16-Sep-26"), "got {bar:?}");
+    }
+
+    #[test]
+    fn the_bar_shows_the_focused_panes_directory_and_no_other() {
+        let mut panes = panes();
+        panes[0].pwd = "/one".into();
+        panes[1].pwd = "/two".into();
+        let buf = draw_at(101, 10, &panes, 2);
+        let bar = row(&buf, 9, 101);
+        assert!(bar.contains("/two"), "focused pane's dir, got {bar:?}");
+        assert!(!bar.contains("/one"), "unfocused pane's dir, got {bar:?}");
+        // The pane's top-left corner carries its own text, not a label.
+        assert_eq!(row(&buf, 0, 5), "pane-");
+    }
+
+    #[test]
+    fn a_directory_too_long_for_the_bar_keeps_its_tail() {
+        let mut panes = panes();
+        panes[0].pwd = format!("/long/{}", "d".repeat(120));
+        let buf = draw_at(60, 10, &panes, 1);
+        let bar = row(&buf, 9, 60);
+        assert!(bar.contains('…'), "the cut must be marked, got {bar:?}");
+        assert!(
+            bar.contains(&"d".repeat(10)),
+            "the tail must survive the cut, got {bar:?}"
+        );
+    }
+
+    #[test]
+    fn the_bar_shows_its_outer_zones_when_the_pane_reports_no_directory() {
+        let panes = vec![pane(1, 0, 0, 10, 3, "pane-content")];
+        // Wide enough for every zone: at 40 the mode block would crowd the
+        // clock off the right edge.
+        let buf = draw_at(50, 4, &panes, 1);
+        let bar = row(&buf, 3, 50);
+        assert_eq!(bar, " NORMAL  corral-test | 1/1       | 14:23 16-Sep-26");
+        assert!(!bar.contains("pane-content"), "the bar owns the last row");
+    }
+
+    #[test]
+    fn the_bar_paints_the_session_name_in_the_accent_color() {
+        let panes = panes();
+        let buf = draw_at(101, 10, &panes, 1);
+        let theme = test_theme();
+        let offset = " NORMAL  ".chars().count() as u16;
+        for x in offset..offset + WORKSPACE.chars().count() as u16 {
+            assert_eq!(buf[(x, 9)].fg, theme.palette.mode_bg, "name cell {x}");
+        }
+        // The zones after the name keep the bar's own surface.
+        let after = offset + WORKSPACE.chars().count() as u16 + 1;
+        assert_eq!(buf[(after, 9)].fg, theme.palette.bar_fg, "cell {after}");
+        assert_eq!(buf[(after, 9)].bg, theme.palette.bar_bg, "cell {after}");
+    }
+
+    #[test]
+    fn the_bar_reports_the_focused_panes_index_in_layout_order() {
+        let panes = vec![
+            pane(1, 0, 0, 50, 10, "one"),
+            pane(2, 51, 0, 50, 4, "two"),
+            pane(3, 51, 5, 50, 5, "three"),
+        ];
+        let buf = draw_at(101, 10, &panes, 3);
+        assert!(
+            row(&buf, 9, 101).contains("3/3"),
+            "got {:?}",
+            row(&buf, 9, 101)
+        );
+        let buf = draw_at(101, 10, &panes, 1);
+        assert!(
+            row(&buf, 9, 101).contains("1/3"),
+            "got {:?}",
+            row(&buf, 9, 101)
+        );
+    }
+
+    #[test]
+    fn the_bar_reports_no_index_for_a_pane_that_is_not_in_the_frame() {
+        let panes = panes();
+        let buf = draw_at(101, 10, &panes, 99);
+        let bar = row(&buf, 9, 101);
+        assert!(!bar.contains('/'), "got {bar:?}");
+    }
+
+    #[test]
+    fn a_path_under_home_collapses_to_a_tilde_and_first_letters() {
+        assert_eq!(shorten_path("/Users/example/Dev/app", HOME), "~/D/app");
+        assert_eq!(
+            shorten_path("/Users/example/.config/corral", HOME),
+            "~/.c/corral"
+        );
+        assert_eq!(shorten_path("/Users/example", HOME), "~");
+        assert_eq!(shorten_path("/Users/example/", HOME), "~");
+    }
+
+    #[test]
+    fn a_path_outside_home_keeps_its_own_first_letters() {
+        assert_eq!(shorten_path("/tmp/project", HOME), "/t/project");
+        assert_eq!(shorten_path("/", HOME), "/");
+        // A sibling that merely starts with the same characters is not
+        // under home.
+        assert_eq!(shorten_path("/Users/example2/x", HOME), "/U/e/x");
+    }
+
+    #[test]
+    fn the_last_component_is_never_abbreviated() {
+        assert_eq!(
+            shorten_path("/Users/example/agent-mux", HOME),
+            "~/agent-mux"
+        );
+        assert_eq!(shorten_path("/a/b", HOME), "/a/b");
+    }
+
+    #[test]
+    fn a_dotfile_component_keeps_its_dot() {
+        assert_eq!(first_char(".config"), ".c");
+        assert_eq!(first_char(".."), "..");
+        assert_eq!(first_char("."), ".");
+        assert_eq!(first_char(""), "");
+        assert_eq!(first_char("src"), "s");
+    }
+
+    #[test]
+    fn a_relative_path_passes_through_untouched() {
+        assert_eq!(shorten_path("src/main.rs", HOME), "src/main.rs");
+        assert_eq!(shorten_path("", HOME), "");
     }
 
     #[test]
@@ -465,6 +974,25 @@ mod tests {
         let buf = draw_at(101, 10, &panes, 1);
         assert!(row(&buf, 0, 101).contains("pane-one"));
         assert!(row(&buf, 1, 101).contains("second line"));
+    }
+
+    #[test]
+    fn pane_text_is_clipped_to_its_rect() {
+        // A client that is not the sizing client is handed rects narrower
+        // than the width the panes reflow at, so a pane's text can be wider
+        // than its rect. The surplus has to be cut at the rect edge rather
+        // than painted over the neighbour.
+        let panes = vec![
+            pane(1, 0, 0, 10, 3, "AAAAAAAAAAAAAAAAAAAAAAAA"),
+            pane(2, 11, 0, 9, 3, "BBBBBBBBB\nBBBBBBBBB\nBBBBBBBBB"),
+        ];
+        // Two rows taller than the panes: the status row always owns the
+        // last screen line.
+        let buf = draw_at(20, 5, &panes, 1);
+        assert_eq!(row(&buf, 0, 20), "AAAAAAAAAA│BBBBBBBBB");
+        assert_eq!(row(&buf, 1, 20), "          │BBBBBBBBB");
+        assert_eq!(row(&buf, 2, 20), "          │BBBBBBBBB");
+        assert_eq!(row(&buf, 3, 20), "                    ");
     }
 
     #[test]
@@ -505,45 +1033,193 @@ mod tests {
         // pane or gutter is ever expected to draw there.
         for y in 0..9u16 {
             assert_eq!(buf[(50, y)].symbol(), "│");
-            assert_eq!(buf[(50, y)].fg, ratatui::style::Color::Indexed(245));
+            assert_eq!(buf[(50, y)].fg, test_theme().palette.focused_gutter);
         }
     }
 
     #[test]
-    fn copy_mode_hint_renders_on_the_last_row() {
+    fn the_picker_lists_the_leader_bindings_over_the_panes() {
         let panes = panes();
-        let backend = TestBackend::new(101, 10);
-        let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| {
-            draw(
-                f,
-                &panes,
-                1,
-                Hint::Copy(Some((12, 96))),
-                &[],
-                &[],
-                &[],
-                None,
-            )
-        })
-        .unwrap();
-        let buf = term.backend().buffer().clone();
-        assert!(row(&buf, 9, 101).contains("copy mode"));
-        assert!(row(&buf, 9, 101).contains("12/96"));
-        // Content rows stay untouched.
-        assert!(row(&buf, 0, 101).contains("pane-one"));
+        let picker = crate::input::Picker::new();
+        let buf = draw_keys(
+            101,
+            20,
+            &panes,
+            1,
+            Hint::Copy(Some((12, 96))),
+            &[],
+            &[],
+            None,
+            Some(&picker),
+        );
+        let screen = screen_text(&buf, 20, 101);
+        assert!(screen.contains(" COPY 12/96"), "got {screen:?}");
+        assert!(screen.contains("h/l"), "got {screen:?}");
+        assert!(screen.contains("type filters"), "got {screen:?}");
+        // The box sits over the panes: this cell is inside pane one and
+        // inside the box, on an unselected row, and it carries the box's
+        // background. (Row 5 is the selected binding, in the selection.)
+        assert_eq!(buf[(40, 6)].bg, test_theme().palette.picker_bg);
     }
 
     #[test]
-    fn copy_mode_hint_without_position_shows_mode_only() {
+    fn the_picker_prompt_shows_the_query() {
         let panes = panes();
-        let backend = TestBackend::new(101, 10);
-        let mut term = TuiTerminal::new(backend).unwrap();
-        term.draw(|f| draw(f, &panes, 1, Hint::Copy(None), &[], &[], &[], None))
-            .unwrap();
-        let buf = term.backend().buffer().clone();
-        assert!(row(&buf, 9, 101).contains("copy mode"));
-        assert!(!row(&buf, 9, 101).contains("/"));
+        let mut picker = crate::input::Picker::new();
+        picker.query = "spl".into();
+        let buf = draw_keys(
+            101,
+            20,
+            &panes,
+            1,
+            Hint::None,
+            &[],
+            &[],
+            None,
+            Some(&picker),
+        );
+        let screen = screen_text(&buf, 20, 101);
+        assert!(screen.contains(" spl "), "got {screen:?}");
+        // Splitting is the only binding whose description or keys carry
+        // "spl"; the rest are filtered out of the list.
+        assert!(!screen.contains("yank"), "got {screen:?}");
+    }
+
+    #[test]
+    fn the_picker_marks_the_selected_line_with_the_accent() {
+        let panes = panes();
+        let picker = crate::input::Picker::new();
+        let buf = draw_keys(
+            101,
+            20,
+            &panes,
+            1,
+            Hint::None,
+            &[],
+            &[],
+            None,
+            Some(&picker),
+        );
+        // The prompt line ` {query} ` carries the prompt background. Scan
+        // every column on every row for it; the box is centered so no
+        // single column is guaranteed to be inside it.
+        let theme = test_theme();
+        let prompt = (0..20u16)
+            .find_map(|y| {
+                (0..101u16)
+                    .find(|&x| buf[(x, y)].bg == theme.palette.mode_bg)
+                    .map(|_| y)
+            })
+            .expect("prompt row with the query background");
+        // One row below the prompt, the first match sits in the selection.
+        assert!(
+            (0..101u16).any(|x| buf[(x, prompt + 1)].bg == theme.palette.picker_selected_bg),
+            "the selected row is in the selection"
+        );
+    }
+
+    #[test]
+    fn the_picker_shortcut_leaves_the_bar_alone_and_opens_the_picker() {
+        let mut panes = panes();
+        panes[0].pwd = "/tmp/project".into();
+        // Closed: the bar reports the mode and the directory, and there
+        // is no box.
+        let buf = draw_keys(101, 20, &panes, 1, Hint::Copy(None), &[], &[], None, None);
+        let closed = row(&buf, 19, 101);
+        assert!(
+            !screen_text(&buf, 20, 101).contains("corral keys"),
+            "no picker while it is closed"
+        );
+        // Open: the same bar, with the box over the panes.
+        let picker = crate::input::Picker::new();
+        let buf = draw_keys(
+            101,
+            20,
+            &panes,
+            1,
+            Hint::Copy(None),
+            &[],
+            &[],
+            None,
+            Some(&picker),
+        );
+        assert_eq!(row(&buf, 19, 101), closed, "the bar does not change");
+        assert!(
+            screen_text(&buf, 20, 101).contains("corral keys"),
+            "the picker opens over the panes"
+        );
+        // The status row is reserved either way, never reclaimed:
+        // reclaiming it would resize every pane and reflow their PTYs.
+        assert_eq!(buf.area.height, 20);
+    }
+
+    #[test]
+    fn a_typed_search_needle_stays_on_the_bar_while_the_picker_is_open() {
+        let panes = panes();
+        let picker = crate::input::Picker::new();
+        let buf = draw_keys(
+            101,
+            10,
+            &panes,
+            1,
+            Hint::Search("needle".into()),
+            &[],
+            &[],
+            None,
+            Some(&picker),
+        );
+        assert!(
+            row(&buf, 9, 101).contains("search: needle"),
+            "got {:?}",
+            row(&buf, 9, 101)
+        );
+    }
+
+    #[test]
+    fn the_mode_block_names_the_mode_in_hand() {
+        assert_eq!(mode_block(&Hint::None), " NORMAL ");
+        assert_eq!(mode_block(&Hint::Copy(None)), " COPY ");
+        assert_eq!(mode_block(&Hint::Copy(Some((12, 96)))), " COPY 12/96 ");
+        assert_eq!(mode_block(&Hint::Select), " SELECT ");
+        assert_eq!(mode_block(&Hint::Search("nee".into())), " SEARCH ");
+    }
+
+    #[test]
+    fn the_statusline_leads_with_the_mode_block() {
+        let panes = panes();
+        for (hint, block) in [
+            (Hint::None, " NORMAL "),
+            (Hint::Copy(Some((3, 9))), " COPY 3/9 "),
+            (Hint::Select, " SELECT "),
+        ] {
+            let buf = draw_keys(101, 10, &panes, 1, hint.clone(), &[], &[], None, None);
+            assert!(
+                row(&buf, 9, 101).starts_with(block),
+                "got {:?}",
+                row(&buf, 9, 101)
+            );
+        }
+    }
+
+    #[test]
+    fn the_mode_block_paints_in_the_accent() {
+        let panes = panes();
+        let buf = draw_at(101, 10, &panes, 1);
+        let theme = test_theme();
+        assert_eq!(buf[(0, 9)].bg, theme.palette.mode_bg);
+        assert_eq!(buf[(0, 9)].fg, theme.palette.mode_fg);
+        // The block is bold; the rest of the bar is not.
+        assert!(
+            buf[(0, 9)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        let after = " NORMAL ".chars().count() as u16;
+        assert!(
+            !buf[(after, 9)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -566,7 +1242,7 @@ mod tests {
                 .contains(ratatui::style::Modifier::REVERSED)
         );
         // The select hint renders too.
-        assert!(row(&buf, 9, 101).contains("select"));
+        assert!(row(&buf, 9, 101).contains("SELECT"));
     }
 
     #[test]
@@ -647,7 +1323,11 @@ mod tests {
     fn copy_mode_cursor_paints_one_cell() {
         let panes = panes();
         let buf = draw_full(101, 10, &panes, 1, Hint::Copy(None), &[], &[], Some((2, 4)));
-        assert_eq!(buf[(4, 2)].bg, CURSOR_BG, "cursor cell carries its bg");
+        assert_eq!(
+            buf[(4, 2)].bg,
+            test_theme().palette.cursor_bg,
+            "cursor cell carries its bg"
+        );
         assert_eq!(buf[(5, 2)].bg, Color::Reset, "neighbor cells untouched");
     }
 
@@ -716,14 +1396,17 @@ mod tests {
     }
 
     #[test]
-    fn search_spans_paint_yellow_in_the_client_style() {
-        // The dedicated search style: bright yellow bg, not reversed.
-        // Pin the index literally: the point of the constant is that
-        // themes remap the base 8, so a symbolic assertion here would
-        // pass whatever value the constant held (S3-5).
-        let style = Style::new().fg(Color::Black).bg(SEARCH_BG);
-        assert_eq!(style.bg, Some(Color::Indexed(11)));
-        assert!(!style.add_modifier.contains(Modifier::REVERSED));
+    fn search_hits_render_in_the_theme_search_color() {
+        // The dedicated search style paints the theme's colors, not
+        // reversed: distinct from a selection span (S3-5, now theme-driven
+        // per S4-5).
+        let panes = panes();
+        let hit_spans = search_spans(&panes[0].text, "pane");
+        let buf = draw_full(101, 10, &panes, 1, Hint::None, &[], &[(1, hit_spans)], None);
+        let theme = test_theme();
+        assert_eq!(buf[(0, 0)].bg, theme.palette.search_bg);
+        assert_eq!(buf[(0, 0)].fg, theme.palette.search_fg);
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -735,33 +1418,39 @@ mod tests {
     }
 
     #[test]
-    fn current_hit_paints_magenta_over_the_search_yellow() {
+    fn current_hit_paints_the_theme_color_over_the_search_color() {
         let panes = panes();
         let hit_spans = search_spans(&panes[0].text, "pane");
         let current = current_hit_spans(&panes[0].text, "pane", 0);
         let backend = TestBackend::new(101, 10);
         let mut term = TuiTerminal::new(backend).unwrap();
+        let theme = test_theme();
         term.draw(|f| {
             draw(
                 f,
                 &panes,
                 1,
                 Hint::None,
+                None,
                 &[],
                 &[(1, hit_spans)],
                 &[(1, current)],
                 None,
+                WORKSPACE,
+                HOME,
+                CLOCK,
+                &theme,
             )
         })
         .unwrap();
         assert_eq!(
             term.backend().buffer()[(0, 0)].bg,
-            Color::Indexed(13),
-            "the hit the user is on paints bright magenta over the plain search yellow"
+            theme.palette.current_hit_bg,
+            "the hit the user is on paints over the plain search color"
         );
-        // Black, not white: bright magenta is a light background, so
-        // white text on it reads at about 3:1, below the 4.5:1 the
-        // general hit style clears by a wide margin (S3-5).
-        assert_eq!(term.backend().buffer()[(0, 0)].fg, Color::Black);
+        assert_eq!(
+            term.backend().buffer()[(0, 0)].fg,
+            theme.palette.current_hit_fg
+        );
     }
 }

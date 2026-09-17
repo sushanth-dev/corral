@@ -4,7 +4,8 @@
 //! routing tree and the latest snapshot per pane.
 
 use crate::pty::{PtyEvent, PtyHandle};
-use corral_core::emulation::{Emulator, ScrollTarget};
+use crate::server::SessionId;
+use corral_core::emulation::{Emulator, StyledLine};
 use corral_core::tree::{PaneId, Rect};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
@@ -19,22 +20,38 @@ pub enum PaneCmd {
     Key(Vec<u8>),
     /// Resize the PTY and the emulator to the pane's new rect size.
     Resize(u16, u16),
-    /// Move the pane's viewport inside scrollback (S3-2).
-    Scroll(ScrollTarget),
+    /// Render one client session's window of screen-space rows, without
+    /// moving the emulator's own viewport (S4-1b). `offset` is a
+    /// screen-space row, so it may sit above the live screen; `rows` is
+    /// how many rows that client can show. The session is echoed in the
+    /// reply so the daemon can route the render to the client that asked
+    /// instead of broadcasting it.
+    Window {
+        session: SessionId,
+        offset: usize,
+        rows: u16,
+    },
     /// Find rows containing a needle (S3-5). The reply rides PaneOut as
-    /// a SearchResult the daemon core forwards to the client.
+    /// a SearchResult the daemon core answers the asking session with.
     Search {
+        session: SessionId,
         needle: String,
         from: Option<usize>,
         reverse: bool,
     },
     /// Erase the pane's scrollback (S3-6).
     ClearHistory,
-    /// Jump the viewport to the previous (up) or next (down) OSC133
-    /// prompt row (S3-8). `cursor_row` anchors the walk at the copy
-    /// cursor inside the viewport; `None` anchors at the viewport
-    /// bottom.
-    PromptJump { up: bool, cursor_row: Option<usize> },
+    /// Resolve the previous (up) or next (down) OSC133 prompt row
+    /// (S3-8) against one session's viewport. `cursor_row` anchors the
+    /// walk at the copy cursor inside that session's viewport; `None`
+    /// anchors at its bottom. `top` is that viewport's top row, so a
+    /// jump continues from where this client is looking.
+    PromptJump {
+        session: SessionId,
+        up: bool,
+        cursor_row: Option<usize>,
+        top: usize,
+    },
     /// Rebuild and resend the snapshot even if nothing changed.
     #[allow(dead_code)]
     Render,
@@ -45,25 +62,39 @@ pub enum PaneOut {
         pane: PaneId,
         state: crate::protocol::PaneState,
     },
-    /// Reply to PaneCmd::Search; rows are screen-space row indexes, top
-    /// is the viewport top after scrolling to the current hit.
+    /// Reply to PaneCmd::Window: the requested rows as plain text plus
+    /// styled runs, with the emulator geometry they were rendered at so
+    /// the daemon can tell a window the pane has since reflowed out from
+    /// under it. `cols` and `rows` are the emulator's own size, not the
+    /// window height that was asked for.
+    Window {
+        session: SessionId,
+        pane: PaneId,
+        offset: usize,
+        cols: u16,
+        rows: u16,
+        text: String,
+        lines: Vec<StyledLine>,
+    },
+    /// Reply to PaneCmd::Search: rows are screen-space row indexes. The
+    /// viewport did not move, so which window shows the hit is the
+    /// asking session's offset, applied by the daemon.
     SearchResult {
+        session: SessionId,
         pane: PaneId,
         rows: Vec<usize>,
-        top: usize,
     },
-    /// Reply to PaneCmd::PromptJump: the prompt's command text landed
-    /// at this row and column inside the viewport.
+    /// Reply to PaneCmd::PromptJump: where the client's copy cursor
+    /// goes, as a row inside the window the daemon is about to show it,
+    /// plus the window top to show, `None` meaning follow the live
+    /// screen. The "up" walk with no prompts in the pane at all parks at
+    /// the very top, which the row alone cannot express.
     PromptLanded {
+        session: SessionId,
         pane: PaneId,
         row: usize,
         col: usize,
-    },
-    /// Reply to PaneCmd::Scroll: how far the viewport actually moved,
-    /// signed like ScrollTarget::Delta. A clamped scroll moves less.
-    ScrollLanded {
-        pane: PaneId,
-        moved: isize,
+        top: Option<usize>,
     },
     Exited {
         pane: PaneId,
@@ -95,8 +126,8 @@ impl PaneWorker {
 fn run_worker(
     id: PaneId,
     mut pty: PtyHandle,
-    cols: u16,
-    rows: u16,
+    mut cols: u16,
+    mut rows: u16,
     out: Sender<PaneOut>,
     rx: Receiver<PaneCmd>,
 ) {
@@ -128,46 +159,52 @@ fn run_worker(
                 PaneCmd::Resize(w, h) => {
                     let _ = pty.resize(w, h);
                     if emu.resize(w, h).is_ok() {
-                        push_snapshot(id, &mut emu, w, h, &out);
+                        // The dims every later snapshot is stamped with
+                        // have to track the emulator's: the daemon decides
+                        // whether a client's window still describes its
+                        // pane by comparing the two, so a stale rect makes
+                        // every scroll into a pane that has been resized
+                        // look outdated and get thrown away.
+                        cols = w;
+                        rows = h;
+                        push_snapshot(id, &mut emu, cols, rows, &out);
                     }
                 }
-                PaneCmd::Scroll(target) => {
-                    // Measure the shift with viewport_offset(), which
-                    // reports the real top even when the viewport is
-                    // pinned to the bottom; scroll_position() collapses
-                    // that case to None, so the client cannot recover
-                    // the movement from the frame alone (S3-3).
-                    let before = emu.viewport_offset().unwrap_or(0) as isize;
-                    emu.scroll(target);
-                    let after = emu.viewport_offset().unwrap_or(0) as isize;
-                    let _ = out.send(PaneOut::ScrollLanded {
+                PaneCmd::Window {
+                    session,
+                    offset,
+                    rows: height,
+                } => {
+                    // Read the rows straight out of the grid. The
+                    // emulator's own viewport stays where it is, so one
+                    // session's scroll cannot move what another session
+                    // or the live screen shows.
+                    let (text, lines) = emu.window_at(offset, height).unwrap_or_default();
+                    let _ = out.send(PaneOut::Window {
+                        session,
                         pane: id,
-                        moved: after - before,
+                        offset,
+                        cols: emu.cols().unwrap_or(cols),
+                        rows: emu.rows().unwrap_or(rows),
+                        text,
+                        lines,
                     });
-                    push_snapshot(id, &mut emu, cols, rows, &out);
                 }
                 PaneCmd::Search {
+                    session,
                     needle,
                     from,
                     reverse,
                 } => {
+                    // Report the hits and leave the viewport alone: the
+                    // daemon shows the first hit in the asking session's
+                    // window, so a search in one client does not move
+                    // another client's viewport.
                     let hits = emu.search(&needle, from, reverse).unwrap_or_default();
-                    // Jump to the first hit so the match is on screen;
-                    // the client's n/N walk keeps its own resume offset.
-                    if let Some(&row) = hits.first() {
-                        emu.scroll(ScrollTarget::Row(row));
-                        push_snapshot(id, &mut emu, cols, rows, &out);
-                    }
-                    // Report the true viewport top alongside the hits:
-                    // scroll_position() returns None when the viewport
-                    // is pinned to the bottom, which the client can't
-                    // tell apart from "viewport top is 0".
-                    // viewport_offset() always reflects the real top.
-                    let top = emu.viewport_offset().unwrap_or(0);
                     let _ = out.send(PaneOut::SearchResult {
+                        session,
                         pane: id,
                         rows: hits,
-                        top,
                     });
                 }
                 PaneCmd::ClearHistory => {
@@ -177,7 +214,12 @@ fn run_worker(
                     emu.clear_history();
                     push_snapshot(id, &mut emu, cols, rows, &out);
                 }
-                PaneCmd::PromptJump { up, cursor_row } => {
+                PaneCmd::PromptJump {
+                    session,
+                    up,
+                    cursor_row,
+                    top,
+                } => {
                     // Command input positions, not raw OSC 133;A marker
                     // rows: a shell theme (Tide) draws a decorative box
                     // around the marker row, so jumping to the marker
@@ -185,61 +227,49 @@ fn run_worker(
                     // prompt_input_positions resolves the exact
                     // (row, col) of each command via OSC 133;B.
                     let prompts = emu.prompt_input_positions().unwrap_or_default();
-                    // Anchor at the copy cursor, not the viewport top:
-                    // a Row scroll to a prompt inside the visible
-                    // screen clamps to the bottom, so a viewport-top
-                    // anchor re-finds the same prompt forever.
-                    // Screen-space anchor = viewport top + cursor row;
-                    // when pinned to the bottom the viewport top is
-                    // total minus the screen height.
-                    let total = emu
-                        .scroll_position()
-                        .unwrap_or(None)
-                        .map(|p| p.total)
-                        .unwrap_or(rows as usize);
-                    let top = emu
-                        .viewport_offset()
-                        .unwrap_or(total.saturating_sub(rows as usize));
+                    // Anchor at the copy cursor, not this session's
+                    // viewport top: a jump to a prompt inside the
+                    // visible screen clamps to the bottom, so a
+                    // viewport-top anchor re-finds the same prompt
+                    // forever. Screen space: session top + cursor row.
                     let anchor = top + cursor_row.unwrap_or(rows as usize - 1);
-                    let target = resolve_prompt_jump(&prompts, anchor, up);
-                    let landed = match target {
-                        Some((row, col)) => {
-                            emu.scroll(ScrollTarget::Row(row));
-                            Some((row, col))
-                        }
-                        None if up => match prompts.first() {
-                            // Already on the first command: stay put
+                    let total = emu.scrollback_rows().unwrap_or(0);
+                    // `None` for the window top means follow the live
+                    // screen; `Some(row)` pins this session there. A
+                    // target inside the visible screen clamps to the
+                    // live bottom, which is what `min(total)` is.
+                    let (target, top) = match resolve_prompt_jump(&prompts, anchor, up) {
+                        Some(prompt) => (Some(prompt), Some(prompt.0.min(total))),
+                        None if up => match prompts.first().copied() {
+                            // Already on the first command: land on it
                             // rather than overshooting into blank space
-                            // above it.
-                            Some(&(row, col)) => {
-                                emu.scroll(ScrollTarget::Row(row));
-                                Some((row, col))
-                            }
-                            None => {
-                                emu.scroll(ScrollTarget::Top);
-                                None
-                            }
+                            // above.
+                            Some(prompt) => (Some(prompt), Some(prompt.0.min(total))),
+                            // No prompts in the pane at all: the very
+                            // top is as far as "up" goes.
+                            None => (None, Some(0)),
                         },
-                        None => {
-                            // No prompt below: back to the bottom (live).
-                            emu.scroll(ScrollTarget::Bottom);
-                            None
-                        }
+                        // No prompt below: back to the live screen.
+                        None => (None, None),
                     };
-                    push_snapshot(id, &mut emu, cols, rows, &out);
-                    // Report where the prompt landed relative to the
-                    // new viewport top so the client puts its copy
-                    // cursor on the command's row and column.
-                    let (row, col) = match landed {
-                        Some((prompt_row, prompt_col)) => {
-                            let top_after = emu
-                                .viewport_offset()
-                                .unwrap_or(total.saturating_sub(rows as usize));
-                            (prompt_row.saturating_sub(top_after), prompt_col as usize)
-                        }
+                    // The landing row is relative to the window the
+                    // daemon will show, so the client can put its copy
+                    // cursor on it; with no prompt to land on, the
+                    // cursor's row stays put and the column resets.
+                    let (row, col) = match target {
+                        Some((prompt_row, prompt_col)) => (
+                            prompt_row.saturating_sub(top.unwrap_or(0)),
+                            prompt_col as usize,
+                        ),
                         None => (cursor_row.unwrap_or(rows as usize - 1), 0),
                     };
-                    let _ = out.send(PaneOut::PromptLanded { pane: id, row, col });
+                    let _ = out.send(PaneOut::PromptLanded {
+                        session,
+                        pane: id,
+                        row,
+                        col,
+                        top,
+                    });
                 }
                 PaneCmd::Render => {
                     push_snapshot(id, &mut emu, cols, rows, &out);
@@ -282,13 +312,10 @@ fn resolve_prompt_jump(prompts: &[(usize, u16)], anchor: usize, up: bool) -> Opt
 }
 
 fn push_snapshot(id: PaneId, emu: &mut Emulator, cols: u16, rows: u16, out: &Sender<PaneOut>) {
-    let scroll = emu
-        .scroll_position()
-        .unwrap_or(None)
-        .map(|p| crate::protocol::ScrollPos {
-            offset: p.offset,
-            total: p.total,
-        });
+    // The snapshot is always the live screen: the viewport belongs to
+    // each client session, so the pane's own viewport never leaves the
+    // bottom. The daemon fills `scroll` per session when it builds a
+    // frame, from each session's offset.
     let state = crate::protocol::PaneState {
         id,
         rect: Rect {
@@ -300,8 +327,10 @@ fn push_snapshot(id: PaneId, emu: &mut Emulator, cols: u16, rows: u16, out: &Sen
         text: emu.screen_text().unwrap_or_default(),
         cursor: emu.cursor().unwrap_or(None),
         app_cursor: emu.app_cursor().unwrap_or(false),
-        scroll,
+        scroll: None,
+        total_scrollback: emu.scrollback_rows().unwrap_or(0),
         lines: emu.screen_lines().unwrap_or_default(),
+        pwd: emu.pwd().unwrap_or_default(),
     };
     let _ = out.send(PaneOut::Snapshot { pane: id, state });
 }
@@ -327,7 +356,7 @@ mod tests {
             match out_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(PaneOut::SearchResult { .. }) => {}
                 Ok(PaneOut::PromptLanded { .. }) => {}
-                Ok(PaneOut::ScrollLanded { .. }) => {}
+                Ok(PaneOut::Window { .. }) => {}
                 Ok(PaneOut::Snapshot { pane, state }) => {
                     assert!(pane == 7 || pane == 9, "unknown pane id {pane}");
                     if state.text.contains("hello") {

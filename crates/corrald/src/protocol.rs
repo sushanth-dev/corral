@@ -34,7 +34,11 @@ pub enum ClientMsg {
     },
     /// Move focus to the next pane in tree order, wrapping.
     FocusNext,
+    /// Scroll one pane's viewport. The pane is named rather than taken
+    /// from the daemon's focus: the wheel scrolls the pane under the
+    /// pointer, which is not always the focused one.
     Scroll {
+        pane: PaneId,
         target: ScrollTarget,
     },
     Search {
@@ -55,6 +59,33 @@ pub enum ClientMsg {
         up: bool,
         cursor_row: Option<usize>,
     },
+    /// Ask what is running here. Answers `ServerMsg::WorkspaceList`.
+    ListWorkspaces,
+    /// A mouse click landed on this pane; focus it directly, rather than
+    /// stepping there through `Focus`'s direction search.
+    FocusPane {
+        pane: PaneId,
+    },
+    /// A gutter drag moved to this position; set the ratio of the split
+    /// whose immediate child is `at` (see `Node::set_ratio_near`).
+    SetSplitRatio {
+        at: PaneId,
+        ratio: f32,
+    },
+}
+
+/// One attachable workspace, as the picker shows it.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct WorkspaceInfo {
+    /// Stable for the daemon's lifetime. Derived from the socket the
+    /// daemon serves, so the id the user reads back names the daemon
+    /// they connected to.
+    pub id: String,
+    pub panes: usize,
+    /// How many clients are attached right now, the asking one included
+    /// when it has attached. A connection that only reads a listing is
+    /// not one, so the attach picker never counts itself.
+    pub clients: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -96,6 +127,11 @@ pub enum ServerMsg {
         pane: PaneId,
         moved: isize,
     },
+    /// Reply to `ClientMsg::ListWorkspaces`. One entry per workspace the
+    /// daemon serves, which is one today.
+    WorkspaceList {
+        workspaces: Vec<WorkspaceInfo>,
+    },
 }
 
 /// One pane's render state. The cursor is None while a full-screen
@@ -110,22 +146,37 @@ pub struct PaneState {
     /// The pane requested application cursor keys (DECCKM); the client
     /// then sends arrows as ESC O A..D instead of ESC [ A..D.
     pub app_cursor: bool,
-    /// The viewport's position inside scrollback, `None` when pinned to
-    /// the bottom (live follow). The client shows a position indicator
-    /// from this and stops forwarding arrow keys to the PTY while set.
+    /// This session's viewport position inside scrollback, `None` when
+    /// pinned to the bottom (live follow). The viewport belongs to the
+    /// client, not the daemon: one client scrolling into history leaves
+    /// every other client following the live screen. The client shows a
+    /// position indicator from this and stops forwarding arrow keys to
+    /// the PTY while set.
     pub scroll: Option<ScrollPos>,
+    /// Total scrollback rows in the pane. The daemon clamps a session's
+    /// scroll against this without a round trip to the pane worker, and
+    /// it is also the screen-space row the live screen starts at. Present
+    /// even while live, where `scroll` is `None` and the client still
+    /// needs the range.
+    pub total_scrollback: usize,
     /// The visible screen as styled runs (colors, attributes). Same row
     /// count as `text`; empty means "fall back to plain `text`".
     pub lines: Vec<StyledLine>,
+    /// The pane's working directory as reported by OSC 7, decoded to a
+    /// plain path, empty if never reported. The status bar shows this
+    /// for the focused pane, the way tmux shows the active pane's path.
+    pub pwd: String,
 }
 
-/// Scroll position of one pane's viewport, mirrored from
+/// Scroll position of one session's viewport in one pane, mirrored from
 /// `corral_core::emulation::ScrollPos`.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
 pub struct ScrollPos {
-    /// Rows the viewport top is above the bottom of the active screen.
+    /// The viewport's top row in screen space, `0..=total`. `total` is
+    /// the first row of the live screen.
     pub offset: usize,
-    /// Total scrollback rows.
+    /// Total scrollback rows; the same value as
+    /// `PaneState::total_scrollback`.
     pub total: usize,
 }
 
@@ -153,12 +204,15 @@ mod tests {
             },
             ClientMsg::FocusNext,
             ClientMsg::Scroll {
+                pane: 1,
                 target: ScrollTarget::Delta(-10),
             },
             ClientMsg::Scroll {
+                pane: 2,
                 target: ScrollTarget::Top,
             },
             ClientMsg::Scroll {
+                pane: 2,
                 target: ScrollTarget::Bottom,
             },
             ClientMsg::Search {
@@ -180,6 +234,8 @@ mod tests {
                 up: false,
                 cursor_row: Some(11),
             },
+            ClientMsg::FocusPane { pane: 3 },
+            ClientMsg::SetSplitRatio { at: 2, ratio: 0.3 },
         ];
         for msg in msgs {
             let line = serde_json::to_string(&msg).unwrap();
@@ -206,7 +262,9 @@ mod tests {
                     offset: 12,
                     total: 96,
                 }),
+                total_scrollback: 96,
                 lines: vec![],
+                pwd: String::new(),
             }],
             focused: 1,
         };
@@ -273,6 +331,38 @@ mod tests {
     }
 
     #[test]
+    fn list_workspaces_round_trips_with_pane_and_client_counts() {
+        let msg = ClientMsg::ListWorkspaces;
+        let line = serde_json::to_string(&msg).unwrap();
+        let back: ClientMsg = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, msg);
+
+        let reply = ServerMsg::WorkspaceList {
+            workspaces: vec![
+                WorkspaceInfo {
+                    id: "corrald-4821".into(),
+                    panes: 3,
+                    clients: 2,
+                },
+                WorkspaceInfo {
+                    id: "corrald-4822".into(),
+                    panes: 0,
+                    clients: 0,
+                },
+            ],
+        };
+        let line = serde_json::to_string(&reply).unwrap();
+        let back: ServerMsg = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, reply);
+
+        // An empty list has to be a list, not an absent field: the picker
+        // reads it to decide whether it has anything to show.
+        let empty =
+            serde_json::to_string(&ServerMsg::WorkspaceList { workspaces: vec![] }).unwrap();
+        assert!(empty.contains("\"workspaces\":[]"), "got {empty}");
+    }
+
+    #[test]
     fn pane_lines_carry_styled_runs_through_json() {
         use corral_core::emulation::{CellAttrs, CellColor, StyledLine, StyledRun};
         let msg = ServerMsg::Frame {
@@ -288,6 +378,7 @@ mod tests {
                 cursor: None,
                 app_cursor: false,
                 scroll: None,
+                total_scrollback: 0,
                 lines: vec![StyledLine {
                     runs: vec![
                         StyledRun {
@@ -307,6 +398,7 @@ mod tests {
                         },
                     ],
                 }],
+                pwd: String::new(),
             }],
             focused: 1,
         };
@@ -389,7 +481,9 @@ mod tests {
                 cursor: None,
                 app_cursor: true,
                 scroll: None,
+                total_scrollback: 3,
                 lines: vec![],
+                pwd: String::new(),
             }],
             focused: 1,
         };

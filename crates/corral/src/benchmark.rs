@@ -17,6 +17,7 @@ mod bench {
     use ratatui::backend::TestBackend;
 
     use crate::render;
+    use crate::theme::Theme;
 
     const PANES: usize = 30;
     const LINES_PER_PANE: usize = 500;
@@ -75,13 +76,16 @@ mod bench {
                 cursor: None,
                 app_cursor: false,
                 scroll: None,
+                total_scrollback: 0,
                 lines: vec![],
+                pwd: String::new(),
             });
         }
 
         let backend = TestBackend::new(WIDTH, HEIGHT);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let focused = 0;
+        let theme = Theme::bundled();
 
         let mut times: Vec<u128> = Vec::with_capacity(DRAWS);
         for _ in 0..DRAWS {
@@ -99,10 +103,17 @@ mod bench {
                         &snapshot,
                         focused,
                         render::Hint::None,
+                        None,
                         &[],
                         &[],
                         &[],
                         None,
+                        "bench",
+                        // No pane reports a directory here, so the bar's
+                        // shortening has nothing to work against.
+                        "",
+                        "00:00 01-Jan-70",
+                        &theme,
                     )
                 })
                 .expect("draw");

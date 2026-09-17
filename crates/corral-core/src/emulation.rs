@@ -1,9 +1,9 @@
 use anyhow::Result;
 use libghostty_vt::render::{CellIterator, RowIterator};
-use libghostty_vt::style::{StyleColor, Underline};
+use libghostty_vt::style::{Style, StyleColor, Underline};
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::terminal::{
-    ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
+    ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Point, PointCoordinate,
     PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
 };
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
@@ -179,6 +179,23 @@ impl Emulator {
         Ok(self.terminal.mode(libghostty_vt::terminal::Mode::DECCKM)?)
     }
 
+    /// The pane's current grid width in columns.
+    pub fn cols(&self) -> Result<u16> {
+        Ok(self.terminal.cols()?)
+    }
+
+    /// The pane's current grid height in rows.
+    pub fn rows(&self) -> Result<u16> {
+        Ok(self.terminal.rows()?)
+    }
+
+    /// Scrollback rows above the live screen. The daemon publishes this
+    /// so a client can clamp its own scroll range without asking the
+    /// pane worker where the bottom is.
+    pub fn scrollback_rows(&self) -> Result<usize> {
+        Ok(self.terminal.scrollback_rows()?)
+    }
+
     /// Erase every scrollback line (CSI 3 J) and, since real terminal
     /// semantics never touch the visible grid, also clear the visible
     /// screen of content that scrolled onto it just before the clear
@@ -274,43 +291,154 @@ impl Emulator {
             let mut cell_iter = cells.update(row)?;
             while let Some(cell) = cell_iter.next() {
                 let style = cell.style()?;
-                let fg = cell_color(style.fg_color);
-                let bg = cell_color(style.bg_color);
-                let attrs = CellAttrs {
-                    bold: style.bold,
-                    italic: style.italic,
-                    underline: !matches!(style.underline, Underline::None),
-                    strikethrough: style.strikethrough,
-                    inverse: style.inverse,
-                };
                 let text: String = cell.graphemes()?.iter().collect();
-                match line.runs.last_mut() {
-                    Some(run) if run.fg == fg && run.bg == bg && run.attrs == attrs => {
-                        run.text.push_str(&text);
-                    }
-                    _ => line.runs.push(StyledRun {
-                        text,
-                        fg,
-                        bg,
-                        attrs,
-                    }),
-                }
+                push_run(&mut line, &style, &text);
             }
-            // Trailing default-styled whitespace carries no information.
-            while let Some(last) = line.runs.last() {
-                if last.fg == CellColor::Default
-                    && last.bg == CellColor::Default
-                    && last.attrs == CellAttrs::default()
-                    && last.text.chars().all(|c| c == ' ' || c == '\0')
-                {
-                    line.runs.pop();
-                } else {
-                    break;
-                }
-            }
+            trim_trailing_default(&mut line);
             out.push(line);
         }
         Ok(out)
+    }
+
+    /// Rows `[offset, offset + rows)` in screen space as plain text plus
+    /// styled runs, one `StyledLine` per row.
+    ///
+    /// Screen space is the whole grid: scrollback rows first, the visible
+    /// screen last, so `offset` may point above the viewport. This is the
+    /// walk `screen_lines` uses - `grid_ref` per cell with a
+    /// `Point::Screen` - and it reads the grid without moving the
+    /// emulator's own viewport. That is the point: one client's scroll is
+    /// that client's view, and must not move another client's. The
+    /// client's row-to-cell mapping (`text` line N is screen row
+    /// `offset + N`) depends on it.
+    ///
+    /// `rows` is clamped to what the grid holds above and including
+    /// `offset`: a client taller than the pane gets the rows that exist,
+    /// not an error. The crate docs warn `grid_ref` is not built for
+    /// render loops; this is one render per client scroll, not a frame.
+    pub fn window_at(&mut self, offset: usize, rows: u16) -> Result<(String, Vec<StyledLine>)> {
+        let cols = self.terminal.cols()?;
+        let total = self.terminal.scrollback_rows()? + self.terminal.rows()? as usize;
+        let rows = (rows as usize).min(total.saturating_sub(offset));
+        let mut text = String::new();
+        let mut out = Vec::with_capacity(rows);
+        let mut graphemes = [0 as char; 8];
+        for row in offset..offset + rows {
+            let mut line = StyledLine { runs: Vec::new() };
+            let mut plain = String::new();
+            for col in 0..cols {
+                let cell = self.terminal.grid_ref(Point::Screen(PointCoordinate {
+                    x: col,
+                    y: row as u32,
+                }))?;
+                let style = cell.style()?;
+                let n = cell.graphemes(&mut graphemes)?;
+                let text: String = graphemes[..n].iter().collect();
+                plain.push_str(&text);
+                push_run(&mut line, &style, &text);
+            }
+            trim_trailing_default(&mut line);
+            text.push_str(plain.trim_end());
+            text.push('\n');
+            out.push(line);
+        }
+        Ok((text, out))
+    }
+
+    /// The pane's working directory as reported by OSC 7, decoded to a
+    /// plain path. libghostty hands back the raw `file://host/path` URI, so
+    /// the scheme and authority are stripped and percent-escapes decoded.
+    /// Empty when the pane never reported one, or reported something that
+    /// is not a `file://` URI.
+    pub fn pwd(&mut self) -> Result<String> {
+        Ok(pwd_path(self.terminal.pwd()?).unwrap_or_default())
+    }
+}
+
+/// Strip the `file://` scheme and authority from an OSC 7 report, leaving
+/// the path. Returns `None` for any other URI scheme.
+fn pwd_path(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let at = rest.find('/')?;
+    Some(percent_decode(&rest[at..]))
+}
+
+/// Decode `%XX` escapes, leaving anything malformed as literal text.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
+            (b'%', Some(&hi), Some(&lo)) => match (hex_digit(hi), hex_digit(lo)) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi * 16 + lo);
+                    i += 3;
+                }
+                _ => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
+            _ => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Append one cell to `line`, merging into the previous run when the
+/// styling matches so uniform cells collapse into one run.
+fn push_run(line: &mut StyledLine, style: &Style, text: &str) {
+    let fg = cell_color(style.fg_color);
+    let bg = cell_color(style.bg_color);
+    let attrs = cell_attrs(style);
+    match line.runs.last_mut() {
+        Some(run) if run.fg == fg && run.bg == bg && run.attrs == attrs => {
+            run.text.push_str(text);
+        }
+        _ => line.runs.push(StyledRun {
+            text: text.to_string(),
+            fg,
+            bg,
+            attrs,
+        }),
+    }
+}
+
+/// Drop trailing default-styled whitespace: it carries no information.
+fn trim_trailing_default(line: &mut StyledLine) {
+    while let Some(last) = line.runs.last() {
+        if last.fg == CellColor::Default
+            && last.bg == CellColor::Default
+            && last.attrs == CellAttrs::default()
+            && last.text.chars().all(|c| c == ' ' || c == '\0')
+        {
+            line.runs.pop();
+        } else {
+            break;
+        }
+    }
+}
+
+fn cell_attrs(style: &Style) -> CellAttrs {
+    CellAttrs {
+        bold: style.bold,
+        italic: style.italic,
+        underline: !matches!(style.underline, Underline::None),
+        strikethrough: style.strikethrough,
+        inverse: style.inverse,
     }
 }
 
@@ -713,6 +841,55 @@ mod tests {
     }
 
     #[test]
+    fn window_at_renders_any_row_range_without_moving_the_viewport() {
+        // A per-client viewport means the daemon asks a worker for an
+        // arbitrary window of screen-space rows instead of scrolling the
+        // emulator. The window has to carry styling, because the client
+        // has no other source for it, and it must leave the emulator's own
+        // viewport exactly where it was, or one client's scroll would move
+        // every other client's.
+        let mut emu = Emulator::new(80, 5).unwrap();
+        for i in 0..100 {
+            emu.feed(format!("\x1b[31mline{i:03}\x1b[0m\r\n").as_bytes());
+        }
+        let before = emu.viewport_offset().unwrap();
+
+        let (text, lines) = emu.window_at(10, 3).unwrap();
+        assert_eq!(
+            emu.viewport_offset().unwrap(),
+            before,
+            "window_at must not scroll the emulator"
+        );
+        assert_eq!(lines.len(), 3, "one line per requested row");
+        let joined: Vec<String> = lines
+            .iter()
+            .map(|l| l.runs.iter().map(|r| r.text.as_str()).collect())
+            .collect();
+        assert_eq!(joined, vec!["line010", "line011", "line012"]);
+        assert_eq!(text, "line010\nline011\nline012\n");
+        for line in &lines {
+            assert_eq!(
+                line.runs.first().map(|r| r.fg),
+                Some(CellColor::Indexed(1)),
+                "each row carries its styling, got {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn window_at_the_live_offset_matches_screen_text() {
+        // At the bottom the window render and the viewport render describe
+        // the same rows, so they must agree row for row.
+        let mut emu = Emulator::new(80, 5).unwrap();
+        for i in 0..100 {
+            emu.feed(format!("line{i:03}\r\n").as_bytes());
+        }
+        let offset = emu.viewport_offset().unwrap();
+        let (text, _) = emu.window_at(offset, 5).unwrap();
+        assert_eq!(text, emu.screen_text().unwrap());
+    }
+
+    #[test]
     fn sgr_colors_and_attributes_land_in_runs() {
         let mut emu = Emulator::new(80, 5).unwrap();
         emu.feed(b"\x1b[1;31mred-bold\x1b[0m plain \x1b[4munder\x1b[0m\r\n");
@@ -769,5 +946,54 @@ mod tests {
             .find(|r| r.text.contains("blue"))
             .unwrap();
         assert_eq!(run.bg, CellColor::Indexed(4), "got {:?}", run.bg);
+    }
+
+    #[test]
+    fn a_pane_that_never_reported_a_pwd_returns_empty() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        assert_eq!(emu.pwd().unwrap(), "");
+    }
+
+    #[test]
+    fn an_osc_7_sequence_sets_the_pwd_without_the_uri_parts() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]7;file://localhost/tmp/project\x1b\\");
+        assert_eq!(emu.pwd().unwrap(), "/tmp/project");
+    }
+
+    #[test]
+    fn a_later_pwd_replaces_the_earlier_one() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]7;file://localhost/tmp/one\x1b\\");
+        emu.feed(b"\x1b]7;file://localhost/tmp/two\x1b\\");
+        assert_eq!(emu.pwd().unwrap(), "/tmp/two");
+    }
+
+    #[test]
+    fn a_pwd_with_escapes_is_decoded() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]7;file://localhost/tmp/with%20space\x1b\\");
+        assert_eq!(emu.pwd().unwrap(), "/tmp/with space");
+    }
+
+    #[test]
+    fn a_pwd_report_without_a_host_is_still_a_path() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]7;file:///tmp/bare\x1b\\");
+        assert_eq!(emu.pwd().unwrap(), "/tmp/bare");
+    }
+
+    #[test]
+    fn a_non_file_uri_reports_no_pwd() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]7;ssh://host/tmp/project\x1b\\");
+        assert_eq!(emu.pwd().unwrap(), "");
+    }
+
+    #[test]
+    fn a_truncated_escape_is_left_literal() {
+        let mut emu = Emulator::new(80, 24).unwrap();
+        emu.feed(b"\x1b]7;file://localhost/tmp/a%2\x1b\\");
+        assert_eq!(emu.pwd().unwrap(), "/tmp/a%2");
     }
 }
