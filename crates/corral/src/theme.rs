@@ -1,4 +1,5 @@
-//! Chrome theming: gutters, cursor, search highlights, and the hint line.
+//! Chrome theming: the statusline, gutters, cursor, search highlights,
+//! and the binding picker.
 //!
 //! Pane content is not themed here. It keeps resolving `CellColor` through
 //! the terminal's own palette, which is the correct behavior for a terminal
@@ -24,6 +25,49 @@ struct RawPalette {
     current_hit_fg: String,
     hint_bg: String,
     hint_fg: String,
+    // The statusline and picker colors landed after the first theme files
+    // shipped. Serde defaults (the bundled Mocha values) keep an older
+    // theme file loading unchanged; the ten fields above stay required, so
+    // a genuinely malformed file still fails to parse.
+    #[serde(default = "default_bar_bg")]
+    bar_bg: String,
+    #[serde(default = "default_bar_fg")]
+    bar_fg: String,
+    #[serde(default = "default_mode_bg")]
+    mode_bg: String,
+    #[serde(default = "default_mode_fg")]
+    mode_fg: String,
+    #[serde(default = "default_muted")]
+    muted: String,
+    #[serde(default = "default_picker_bg")]
+    picker_bg: String,
+    #[serde(default = "default_picker_selected_bg")]
+    picker_selected_bg: String,
+}
+
+// Defaults mirror the bundled Catppuccin Mocha chrome: mantle for the bar
+// and picker, blue for the mode block, overlay0 for what the eye passes
+// over.
+fn default_bar_bg() -> String {
+    "#181825".into()
+}
+fn default_bar_fg() -> String {
+    "#a6adc8".into()
+}
+fn default_mode_bg() -> String {
+    "#89b4fa".into()
+}
+fn default_mode_fg() -> String {
+    "#11111b".into()
+}
+fn default_muted() -> String {
+    "#7f849c".into()
+}
+fn default_picker_bg() -> String {
+    "#181825".into()
+}
+fn default_picker_selected_bg() -> String {
+    "#313244".into()
 }
 
 #[derive(Deserialize)]
@@ -47,6 +91,21 @@ pub struct Palette {
     pub current_hit_fg: Color,
     pub hint_bg: Color,
     pub hint_fg: Color,
+    /// The statusline's surface, darker than the terminal's base so the
+    /// bar reads as chrome and not as a pane.
+    pub bar_bg: Color,
+    /// Ordinary statusline text.
+    pub bar_fg: Color,
+    /// The mode block's background and the accent the chrome points with.
+    pub mode_bg: Color,
+    /// Text on the mode block and the prompt.
+    pub mode_fg: Color,
+    /// Separators, footers, anything the eye can pass over.
+    pub muted: Color,
+    /// The picker window's surface.
+    pub picker_bg: Color,
+    /// The picker's selected row.
+    pub picker_selected_bg: Color,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +142,13 @@ impl Palette {
             current_hit_fg: parse_hex("current_hit_fg", &raw.current_hit_fg)?,
             hint_bg: parse_hex("hint_bg", &raw.hint_bg)?,
             hint_fg: parse_hex("hint_fg", &raw.hint_fg)?,
+            bar_bg: parse_hex("bar_bg", &raw.bar_bg)?,
+            bar_fg: parse_hex("bar_fg", &raw.bar_fg)?,
+            mode_bg: parse_hex("mode_bg", &raw.mode_bg)?,
+            mode_fg: parse_hex("mode_fg", &raw.mode_fg)?,
+            muted: parse_hex("muted", &raw.muted)?,
+            picker_bg: parse_hex("picker_bg", &raw.picker_bg)?,
+            picker_selected_bg: parse_hex("picker_selected_bg", &raw.picker_selected_bg)?,
         })
     }
 }
@@ -155,6 +221,42 @@ mod tests {
         assert_eq!(theme.palette.focused_gutter, Color::Rgb(0x89, 0xb4, 0xfa));
         assert_eq!(theme.palette.search_bg, Color::Rgb(0xf9, 0xe2, 0xaf));
         assert_eq!(theme.palette.current_hit_bg, Color::Rgb(0xcb, 0xa6, 0xf7));
+        assert_eq!(theme.palette.bar_bg, Color::Rgb(0x18, 0x18, 0x25));
+        assert_eq!(theme.palette.bar_fg, Color::Rgb(0xa6, 0xad, 0xc8));
+        assert_eq!(theme.palette.mode_bg, Color::Rgb(0x89, 0xb4, 0xfa));
+        assert_eq!(theme.palette.mode_fg, Color::Rgb(0x11, 0x11, 0x1b));
+        assert_eq!(theme.palette.muted, Color::Rgb(0x7f, 0x84, 0x9c));
+        assert_eq!(theme.palette.picker_bg, Color::Rgb(0x18, 0x18, 0x25));
+        assert_eq!(
+            theme.palette.picker_selected_bg,
+            Color::Rgb(0x31, 0x32, 0x44)
+        );
+    }
+
+    #[test]
+    fn a_theme_written_before_the_chrome_fields_still_loads_with_defaults() {
+        let legacy = r##"{
+            "name": "Legacy",
+            "palette": {
+                "gutter": "#45475a", "focused_gutter": "#89b4fa",
+                "cursor_bg": "#7f849c", "cursor_fg": "#11111b",
+                "search_bg": "#f9e2af", "search_fg": "#11111b",
+                "current_hit_bg": "#cba6f7", "current_hit_fg": "#11111b",
+                "hint_bg": "#585b70", "hint_fg": "#cdd6f4"
+            }
+        }"##;
+        let theme = Theme::from_json(legacy).expect("legacy theme must parse");
+        assert_eq!(theme.name, "Legacy");
+        assert_eq!(theme.palette.bar_bg, Color::Rgb(0x18, 0x18, 0x25));
+        assert_eq!(
+            theme.palette.picker_selected_bg,
+            Color::Rgb(0x31, 0x32, 0x44)
+        );
+        // Explicit values still win over the defaults.
+        let mut json: serde_json::Value = serde_json::from_str(BUNDLED_JSON).unwrap();
+        json["palette"]["bar_bg"] = "#ff0000".into();
+        let themed = Theme::from_json(&serde_json::to_string(&json).unwrap()).unwrap();
+        assert_eq!(themed.palette.bar_bg, Color::Rgb(0xff, 0, 0));
     }
 
     #[test]

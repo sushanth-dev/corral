@@ -10,6 +10,13 @@
     "current_hit_bg": "#cba6f7",
     "current_hit_fg": "#11111b",
     "hint_bg": "#585b70",
-    "hint_fg": "#cdd6f4"
+    "hint_fg": "#cdd6f4",
+    "bar_bg": "#181825",
+    "bar_fg": "#a6adc8",
+    "mode_bg": "#89b4fa",
+    "mode_fg": "#11111b",
+    "muted": "#7f849c",
+    "picker_bg": "#181825",
+    "picker_selected_bg": "#313244"
   }
 }

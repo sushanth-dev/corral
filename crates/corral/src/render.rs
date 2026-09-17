@@ -351,8 +351,8 @@ fn draw_status(
     );
     let para = Paragraph::new(Line::from(spans)).style(
         Style::new()
-            .fg(theme.palette.hint_fg)
-            .bg(theme.palette.hint_bg),
+            .fg(theme.palette.bar_fg)
+            .bg(theme.palette.bar_bg),
     );
     frame.render_widget(
         para,
@@ -440,13 +440,13 @@ fn status_row(
         Span::styled(
             block,
             Style::new()
-                .fg(theme.palette.cursor_fg)
-                .bg(theme.palette.focused_gutter)
+                .fg(theme.palette.mode_fg)
+                .bg(theme.palette.mode_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             workspace.to_string(),
-            Style::new().fg(theme.palette.focused_gutter),
+            Style::new().fg(theme.palette.mode_bg),
         ),
         Span::raw(rest),
         Span::raw(" ".repeat(width.saturating_sub(used))),
@@ -478,8 +478,8 @@ fn draw_picker(frame: &mut Frame, picker: &crate::input::Picker, theme: &Theme) 
     lines.push(Line::from(Span::styled(
         format!(" {} ", picker.query),
         Style::new()
-            .fg(theme.palette.cursor_fg)
-            .bg(theme.palette.cursor_bg),
+            .fg(theme.palette.mode_fg)
+            .bg(theme.palette.mode_bg),
     )));
     for (row, idx) in matches.iter().enumerate() {
         let (keys, what, _) = bindings[*idx];
@@ -488,8 +488,8 @@ fn draw_picker(frame: &mut Frame, picker: &crate::input::Picker, theme: &Theme) 
             Line::from(Span::styled(
                 text,
                 Style::new()
-                    .fg(theme.palette.cursor_fg)
-                    .bg(theme.palette.focused_gutter),
+                    .fg(theme.palette.hint_fg)
+                    .bg(theme.palette.picker_selected_bg),
             ))
         } else {
             Line::from(Span::raw(text))
@@ -500,8 +500,9 @@ fn draw_picker(frame: &mut Frame, picker: &crate::input::Picker, theme: &Theme) 
         lines.push(Line::from(Span::raw("  no match")));
     }
     lines.push(Line::from(Span::raw(String::new())));
-    lines.push(Line::from(Span::raw(
+    lines.push(Line::from(Span::styled(
         "  type filters | enter runs | esc closes",
+        Style::new().fg(theme.palette.muted),
     )));
     // Sized to the content, capped to the screen minus the status row.
     let body = lines
@@ -513,14 +514,14 @@ fn draw_picker(frame: &mut Frame, picker: &crate::input::Picker, theme: &Theme) 
     let width = (body as u16 + 2).min(area.width);
     let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(1));
     let style = Style::new()
-        .fg(theme.palette.hint_fg)
-        .bg(theme.palette.hint_bg);
+        .fg(theme.palette.bar_fg)
+        .bg(theme.palette.picker_bg);
     let block = Block::bordered()
         .title(Span::styled(
             " corral keys ",
-            Style::new().fg(theme.palette.focused_gutter),
+            Style::new().fg(theme.palette.mode_bg),
         ))
-        .border_style(style);
+        .border_style(Style::new().fg(theme.palette.muted));
     frame.render_widget(
         Paragraph::new(lines).style(style).block(block),
         RRect {
@@ -667,6 +668,13 @@ mod tests {
                 current_hit_fg: Color::Rgb(8, 8, 8),
                 hint_bg: Color::Rgb(9, 9, 9),
                 hint_fg: Color::Rgb(10, 10, 10),
+                bar_bg: Color::Rgb(11, 11, 11),
+                bar_fg: Color::Rgb(12, 12, 12),
+                mode_bg: Color::Rgb(13, 13, 13),
+                mode_fg: Color::Rgb(14, 14, 14),
+                muted: Color::Rgb(15, 15, 15),
+                picker_bg: Color::Rgb(16, 16, 16),
+                picker_selected_bg: Color::Rgb(17, 17, 17),
             },
         }
     }
@@ -874,16 +882,12 @@ mod tests {
         let theme = test_theme();
         let offset = " NORMAL ".chars().count() as u16;
         for x in offset..offset + WORKSPACE.chars().count() as u16 {
-            assert_eq!(
-                buf[(x, 9)].fg,
-                theme.palette.focused_gutter,
-                "name cell {x}"
-            );
+            assert_eq!(buf[(x, 9)].fg, theme.palette.mode_bg, "name cell {x}");
         }
-        // The zones after the name keep the bar's own foreground.
+        // The zones after the name keep the bar's own surface.
         let after = offset + WORKSPACE.chars().count() as u16 + 1;
-        assert_eq!(buf[(after, 9)].fg, theme.palette.hint_fg, "cell {after}");
-        assert_eq!(buf[(after, 9)].bg, theme.palette.hint_bg, "cell {after}");
+        assert_eq!(buf[(after, 9)].fg, theme.palette.bar_fg, "cell {after}");
+        assert_eq!(buf[(after, 9)].bg, theme.palette.bar_bg, "cell {after}");
     }
 
     #[test]
@@ -1049,8 +1053,8 @@ mod tests {
         assert!(screen.contains("type filters"), "got {screen:?}");
         // The box sits over the panes: this cell is inside pane one and
         // inside the box, on an unselected row, and it carries the box's
-        // background. (Row 5 is the selected binding, in the accent.)
-        assert_eq!(buf[(40, 6)].bg, test_theme().palette.hint_bg);
+        // background. (Row 5 is the selected binding, in the selection.)
+        assert_eq!(buf[(40, 6)].bg, test_theme().palette.picker_bg);
     }
 
     #[test]
@@ -1091,21 +1095,21 @@ mod tests {
             None,
             Some(&picker),
         );
-        // The prompt line ` {query} ` carries the cursor background. Scan
+        // The prompt line ` {query} ` carries the prompt background. Scan
         // every column on every row for it; the box is centered so no
         // single column is guaranteed to be inside it.
         let theme = test_theme();
         let prompt = (0..20u16)
             .find_map(|y| {
                 (0..101u16)
-                    .find(|&x| buf[(x, y)].bg == theme.palette.cursor_bg)
+                    .find(|&x| buf[(x, y)].bg == theme.palette.mode_bg)
                     .map(|_| y)
             })
             .expect("prompt row with the query background");
-        // One row below the prompt, the first match sits in the accent.
+        // One row below the prompt, the first match sits in the selection.
         assert!(
-            (0..101u16).any(|x| buf[(x, prompt + 1)].bg == theme.palette.focused_gutter),
-            "the selected row is in the accent"
+            (0..101u16).any(|x| buf[(x, prompt + 1)].bg == theme.palette.picker_selected_bg),
+            "the selected row is in the selection"
         );
     }
 
@@ -1197,8 +1201,8 @@ mod tests {
         let panes = panes();
         let buf = draw_at(101, 10, &panes, 1);
         let theme = test_theme();
-        assert_eq!(buf[(0, 9)].bg, theme.palette.focused_gutter);
-        assert_eq!(buf[(0, 9)].fg, theme.palette.cursor_fg);
+        assert_eq!(buf[(0, 9)].bg, theme.palette.mode_bg);
+        assert_eq!(buf[(0, 9)].fg, theme.palette.mode_fg);
         // The block is bold; the rest of the bar is not.
         assert!(
             buf[(0, 9)]
